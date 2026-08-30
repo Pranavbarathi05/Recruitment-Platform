@@ -1,0 +1,114 @@
+language: "en-US"
+tone_instructions: "Friendly and constructive. Focus on correctness over style. Explain WHY for key issues. Use 'Consider...' Balance helping newbies with trusting experts."
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  path_instructions:
+    - path: "**/.env*"
+      instructions: |
+        Check that sensitive data is not committed.
+        If found, explain the security risk briefly and suggest using environment variables.
+    
+    - path: "apps/frontend/src/components/**"
+      instructions: |
+        Review for functional correctness and maintainability.
+        Priorities:
+        1. User-visible correctness (rendering, state, interactions)
+        2. Component logic and data flow
+        3. Accessibility basics (keyboard navigation, ARIA when needed)
+        4. Clear component boundaries
+        
+        Guidelines:
+        - Skip styling/formatting nitpicks unless they break functionality
+        - Don't suggest refactors unless there's a clear bug or maintainability issue
+        - For new devs: explain common React patterns when relevant
+        - For experienced devs: trust their judgment on implementation details
+        - Mark nice-to-haves as "Optional:"
+        - Provide brief examples for critical issues
+    
+    - path: "apps/frontend/src/pages/**"
+      instructions: |
+        Review for user experience and correctness.
+        Priorities:
+        1. Routing and navigation work correctly
+        2. Data fetching and error states are handled
+        3. Loading states provide feedback
+        4. Page-level accessibility (headings, focus management)
+        
+        Focus on what affects users directly.
+        Skip minor style preferences.
+        Explain impact when suggesting changes.
+    
+    - path: "apps/frontend/src/**/*.{jsx,js}"
+      instructions: |
+        General frontend review guidelines.
+        - Check for obvious bugs or logic errors
+        - Ensure hooks are used correctly (dependencies, order)
+        - Verify event handlers won't cause unexpected behavior
+        - Skip naming/formatting unless confusing
+        - Be concise - assume developer competence
+    
+    - path: "apps/backend/**/*.py"
+      instructions: |
+        Review FastAPI backend for correctness and maintainability.
+        Priorities:
+        1. API endpoints return correct responses and status codes
+        2. Request/response models are properly typed (Pydantic)
+        3. Error handling prevents crashes (HTTPException usage)
+        4. Database operations are safe (async patterns, proper transactions)
+        5. Authentication/authorization is secure (dependencies)
+        6. Business logic is sound
+        
+        FastAPI-specific:
+        - Check dependency injection is used correctly
+        - Verify async/await patterns are appropriate
+        - Ensure route parameters and query params are validated
+        - Check background tasks are used for long operations
+        
+        Guidelines:
+        - Focus on security and correctness
+        - Skip PEP8 formatting unless it impacts readability significantly
+        - For new devs: explain common pitfalls (e.g., mutable defaults, blocking I/O)
+        - Check for obvious performance issues but don't over-optimize
+        - Mark architectural suggestions as "Optional:"
+    
+    - path: "apps/backend/test_*.py"
+      instructions: |
+        Review tests for coverage and correctness.
+        - Ensure tests actually test the intended behavior
+        - Check for edge cases
+        - Keep feedback brief unless tests are clearly inadequate
+        - Don't nitpick test naming unless confusing
+    
+    - path: "apps/frontend/*.config.{js,ts}"
+      instructions: |
+        Review configuration for correctness.
+        - Check for common misconfigurations
+        - Ensure no secrets are exposed
+        - Keep feedback brief for standard setups
+    
+    - path: "apps/backend/requirements*.txt"
+      instructions: |
+        Review dependencies for known issues.
+        - Check for obviously outdated packages with security issues
+        - Avoid suggesting upgrades unless there's a clear reason
+        - Keep feedback minimal for standard dependencies
+    
+    - path: "apps/frontend/package.json"
+      instructions: |
+        Review for dependency and script correctness.
+        - Check for known vulnerabilities in major versions
+        - Ensure scripts make sense
+        - Don't nitpick version choices unless problematic
+  auto_review:
+    enabled: true
+    drafts: false
+
+chat:
+  auto_reply: true

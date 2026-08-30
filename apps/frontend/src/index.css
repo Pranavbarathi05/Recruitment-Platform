@@ -1,0 +1,150 @@
+@import "tailwindcss";
+
+/* Custom CSS Variables for theming */
+:root {
+  --bg-primary: 17 24 39;       /* gray-900 */
+  --bg-secondary: 31 41 55;     /* gray-800 */
+  --bg-tertiary: 55 65 81;      /* gray-700 */
+  --bg-input: 55 65 81;         /* gray-700 */
+  --text-primary: 255 255 255;  /* white */
+  --text-secondary: 156 163 175; /* gray-400 */
+  --text-muted: 209 213 219;    /* gray-300 */
+  --border-primary: 55 65 81;   /* gray-700 */
+  --border-secondary: 75 85 99; /* gray-600 */
+  
+  font-family: 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Light mode variables */
+.light {
+  --bg-primary: 249 250 251;    /* gray-50 */
+  --bg-secondary: 243 244 246;  /* gray-100 */
+  --bg-tertiary: 229 231 235;   /* gray-200 */
+  --bg-input: 255 255 255;      /* white */
+  --text-primary: 17 24 39;     /* gray-900 */
+  --text-secondary: 107 114 128; /* gray-500 */
+  --text-muted: 55 65 81;       /* gray-700 */
+  --border-primary: 209 213 219; /* gray-300 */
+  --border-secondary: 229 231 235; /* gray-200 */
+}
+
+/* Dark mode */
+.dark {
+  --bg-primary: 17 24 39;       /* gray-900 */
+  --bg-secondary: 31 41 55;     /* gray-800 */
+  --bg-tertiary: 55 65 81;      /* gray-700 */
+  --bg-input: 55 65 81;         /* gray-700 */
+  --text-primary: 255 255 255;  /* white */
+  --text-secondary: 156 163 175; /* gray-400 */
+  --text-muted: 209 213 219;    /* gray-300 */
+  --border-primary: 55 65 81;   /* gray-700 */
+  --border-secondary: 75 85 99; /* gray-600 */
+}
+
+/* Theme-aware utility classes using @utility for Tailwind v4 */
+@utility bg-theme-primary {
+  background-color: rgb(var(--bg-primary));
+}
+@utility bg-theme-secondary {
+  background-color: rgb(var(--bg-secondary));
+}
+@utility bg-theme-tertiary {
+  background-color: rgb(var(--bg-tertiary));
+}
+@utility bg-theme-input {
+  background-color: rgb(var(--bg-input));
+}
+@utility text-theme-primary {
+  color: rgb(var(--text-primary));
+}
+@utility text-theme-secondary {
+  color: rgb(var(--text-secondary));
+}
+@utility text-theme-muted {
+  color: rgb(var(--text-muted));
+}
+@utility border-theme-primary {
+  border-color: rgb(var(--border-primary));
+}
+@utility border-theme-secondary {
+  border-color: rgb(var(--border-secondary));
+}
+@utility placeholder-theme {
+  &::placeholder {
+    color: rgb(var(--text-secondary));
+  }
+}
+
+/* Base styles */
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: rgb(var(--bg-primary));
+  color: rgb(var(--text-primary));
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Custom animations */
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-20px);
+  }
+}
+
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Focus styles for accessibility */
+*:focus-visible {
+  outline: 2px solid rgb(59, 130, 246);
+  outline-offset: 2px;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgb(var(--bg-secondary));
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--bg-tertiary));
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(107, 114, 128);
+}
+
+/* Smooth theme transitions for key elements */
+*, *::before, *::after {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Exclude transition on elements that shouldn't animate (e.g. code editor, animations) */
+.code-editor-container, .code-editor-container *,
+.animate-spin, .animate-pulse, .animate-float {
+  transition: none !important;
+}

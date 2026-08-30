@@ -1,0 +1,14 @@
+# Web Framework
+fastapi
+uvicorn
+python-dotenv
+
+# Supabase & Auth
+supabase
+PyJWT[crypto]
+
+# Testing & Linting
+black       # The Formatter
+flake8      # The Linter
+pytest      # The Test Runner
+httpx       # Needed to test FastAPI endpoints

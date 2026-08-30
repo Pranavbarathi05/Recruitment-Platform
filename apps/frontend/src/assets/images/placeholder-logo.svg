@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 60" width="200" height="60">
+  <!-- DSC Logo Placeholder -->
+  <rect width="200" height="60" fill="transparent"/>
+  <!-- Red bracket -->
+  <text x="10" y="42" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#EA4335">&lt;|</text>
+  <!-- Blue bracket -->
+  <text x="45" y="42" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#4285F4">)</text>
+  <!-- Yellow bracket -->
+  <text x="65" y="42" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#FBBC05">5</text>
+  <!-- Green bracket -->
+  <text x="95" y="42" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#34A853">{</text>
+  <!-- Closing bracket -->
+  <text x="125" y="42" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#4285F4">}</text>
+</svg>
