@@ -352,12 +352,11 @@ def list_submissions(
         # 1. Fetch submitted/scored attempts
         attempts_resp = (
             supabase_client.table("assessment_attempts")
-            .select("id, profile_id, domain_ids, total_questions, score, max_score, started_at, submitted_at, status")
-            .in_("status", ["submitted", "scored"])
+            .select("id, profile_id, domain_ids, total_questions, score, max_score, mcq_score, mcq_max_score, coding_score, coding_max_score, total_coding_problems, started_at, submitted_at, status")
+            .in_("status", ["submitted", "scored", "reset"])
             .execute()
         )
         attempts = attempts_resp.data or []
-        logger.warning(f"SUBMISSIONS DEBUG: Found {len(attempts)} attempts with status in (submitted, scored)")
 
         if not attempts:
             logger.warning("SUBMISSIONS DEBUG: No attempts found, returning empty list")
@@ -399,8 +398,12 @@ def list_submissions(
 )
 
             score_val = attempt.get("score") or 0
-            max_score_val = attempt.get("max_score") or attempt["total_questions"]
+            max_score_val = attempt.get("max_score") or 1
             percentage = round((score_val / max_score_val) * 100) if max_score_val > 0 else 0
+            mcq_score = attempt.get("mcq_score") or 0
+            mcq_max = attempt.get("mcq_max_score") or 0
+            coding_score = attempt.get("coding_score") or 0
+            coding_max = attempt.get("coding_max_score") or 0
 
             records.append({
                 "attempt_id": attempt["id"],
@@ -414,7 +417,13 @@ def list_submissions(
                 "score": score_val,
                 "max_score": max_score_val,
                 "percentage": percentage,
-                "total_questions": attempt["total_questions"],
+                "mcq_score": mcq_score,
+                "mcq_max_score": mcq_max,
+                "coding_score": coding_score,
+                "coding_max_score": coding_max,
+                "total_mcq_questions": attempt["total_questions"],
+                "total_coding_problems": attempt.get("total_coding_problems") or 0,
+                "status": attempt.get("status"),
                 "started_at": attempt.get("started_at"),
                 "submitted_at": attempt.get("submitted_at"),
             })
@@ -554,9 +563,49 @@ def get_assessment_results(
                 "domainName": domain_map.get(q.get("domain_id"), ""),
             })
 
-        max_score = attempt["max_score"] if attempt.get("max_score") else attempt["total_questions"]
+        max_score = attempt["max_score"] if attempt.get("max_score") else 1
         score = attempt.get("score", 0) if attempt.get("score") is not None else 0
         percentage = round((score / max_score) * 100) if max_score > 0 else 0
+        mcq_score = attempt.get("mcq_score") or 0
+        mcq_max = attempt.get("mcq_max_score") or 0
+        coding_score = attempt.get("coding_score") or 0
+        coding_max = attempt.get("coding_max_score") or 0
+
+        # Fetch coding submissions for this attempt
+        coding_subs_resp = (
+            supabase_client.table("coding_submissions")
+            .select("problem_id, language, source_code, status, score, max_score, tests_passed, tests_total, execution_time_ms")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        )
+        coding_subs = coding_subs_resp.data or []
+
+        # Fetch coding problem details for each submission
+        coding_problem_ids = list({s["problem_id"] for s in coding_subs})
+        coding_problems_map = {}
+        if coding_problem_ids:
+            cp_resp = (
+                supabase_client.table("coding_problems")
+                .select("id, title, domain_id")
+                .in_("id", coding_problem_ids)
+                .execute()
+            )
+            coding_problems_map = {p["id"]: p for p in (cp_resp.data or [])}
+
+        coding_results = []
+        for sub in coding_subs:
+            cp = coding_problems_map.get(sub["problem_id"], {})
+            coding_results.append({
+                "problem_title": cp.get("title", ""),
+                "language": sub["language"],
+                "source_code": sub["source_code"],
+                "status": sub["status"],
+                "score": sub.get("score", 0),
+                "max_score": sub.get("max_score", 0),
+                "tests_passed": sub.get("tests_passed", 0),
+                "tests_total": sub.get("tests_total", 0),
+                "execution_time_ms": sub.get("execution_time_ms"),
+            })
 
         return {
             "attempt_id": attempt_id,
@@ -572,7 +621,8 @@ def get_assessment_results(
             },
             "domain_ids": attempt["domain_ids"],
             "domain_names": [domain_map.get(did, "") for did in attempt["domain_ids"]],
-            "total_questions": attempt["total_questions"],
+            "total_mcq_questions": attempt["total_questions"],
+            "total_coding_problems": attempt.get("total_coding_problems") or 0,
             "duration_minutes": attempt["duration_minutes"],
             "started_at": attempt["started_at"],
             "submitted_at": attempt.get("submitted_at"),
@@ -580,10 +630,15 @@ def get_assessment_results(
             "score": score,
             "max_score": max_score,
             "percentage": percentage,
+            "mcq_score": mcq_score,
+            "mcq_max_score": mcq_max,
+            "coding_score": coding_score,
+            "coding_max_score": coding_max,
             "correct_count": correct_count,
             "incorrect_count": incorrect_count,
             "unanswered_count": unanswered_count,
-            "questions": questions_with_answers,
+            "mcq_questions": questions_with_answers,
+            "coding_results": coding_results,
         }
     except HTTPException:
         raise
@@ -632,32 +687,29 @@ def update_config(
             raise HTTPException(status_code=400, detail="No fields to update")
 
         # Validate configuration consistency
-        if "total_questions" in updates or "max_domains" in updates:
-            # Fetch current values to fill in any missing updates
+        if any(k in updates for k in ("total_questions", "coding_problem_count", "max_domains")):
             current = (
                 supabase_client.table("assessment_config")
-                .select("total_questions, max_domains")
+                .select("total_questions, coding_problem_count, max_domains")
                 .eq("id", config_id)
                 .execute()
             )
             if current.data:
                 cur = current.data[0]
                 tq = updates.get("total_questions", cur["total_questions"])
+                cc = updates.get("coding_problem_count", cur.get("coding_problem_count", 0))
                 md = updates.get("max_domains", cur["max_domains"])
-                # max_domains must not exceed 2
                 if md > 2:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="max_domains cannot exceed 2",
-                    )
-                # When 2 domains are selected, total_questions must be even
+                    raise HTTPException(status_code=400, detail="max_domains cannot exceed 2")
                 if md == 2 and tq % 2 != 0:
                     raise HTTPException(
                         status_code=400,
-                        detail=(
-                            f"total_questions ({tq}) must be even "
-                            f"when max_domains is 2 for an equal 50/50 split."
-                        ),
+                        detail=f"total_questions ({tq}) must be even when max_domains is 2",
+                    )
+                if md == 2 and cc % 2 != 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"coding_problem_count ({cc}) must be even when max_domains is 2",
                     )
 
         # If this config is being activated, deactivate all other configs first.
@@ -679,6 +731,67 @@ def update_config(
             .execute()
         )
         return result.data[0] if result.data else {"status": "updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment reset (admin only)
+# ---------------------------------------------------------------------------
+
+@router.post("/assessments/{attempt_id}/reset")
+def reset_assessment(
+    attempt_id: str,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Reset a candidate's assessment so they can retake.
+
+    Does NOT delete the previous attempt — it remains as historical data.
+    If the candidate has an active in_progress attempt, it is cancelled (scored).
+    After reset, the candidate can start a new assessment.
+    """
+    try:
+        attempt_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id, profile_id, status")
+            .eq("id", attempt_id)
+            .execute()
+        )
+        if not attempt_resp.data:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        attempt = attempt_resp.data[0]
+        profile_id = attempt["profile_id"]
+
+        # Cancel any active in_progress attempt for this candidate
+        active = (
+            supabase_client.table("assessment_attempts")
+            .select("id")
+            .eq("profile_id", profile_id)
+            .eq("status", "in_progress")
+            .execute()
+        )
+        if active.data:
+            from routers.assessment import _score_attempt
+            for act in active.data:
+                _score_attempt(act["id"])
+
+        # Mark the submitted attempt as "reset" so it's historical but not blocking
+        # We keep the original status but add a note via the submitted_at timestamp
+        # The key insight: we just need the candidate to be able to start a new one.
+        # The simplest approach: change status to "reset" for the specific attempt.
+        supabase_client.table("assessment_attempts").update(
+            {"status": "reset"}
+        ).eq("id", attempt_id).execute()
+
+        return {
+            "status": "reset",
+            "attempt_id": attempt_id,
+            "candidate_profile_id": profile_id,
+            "message": "Candidate can now start a new assessment. Previous attempt preserved.",
+        }
     except HTTPException:
         raise
     except Exception as e:

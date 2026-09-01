@@ -93,18 +93,25 @@ const AdminResults = () => {
   const {
     candidate,
     domain_names,
-    total_questions,
+    total_mcq_questions,
+    total_coding_problems,
     duration_minutes,
     started_at,
     submitted_at,
     score,
     max_score,
     percentage,
+    mcq_score,
+    mcq_max_score,
+    coding_score,
+    coding_max_score,
     correct_count,
     incorrect_count,
     unanswered_count,
-    questions,
+    mcq_questions,
+    coding_results,
   } = results;
+  const questions = mcq_questions || [];
 
   const formatTime = (iso) => {
     if (!iso) return '—';
@@ -163,8 +170,12 @@ const AdminResults = () => {
               <span className="text-theme-primary font-medium">{duration_minutes} min</span>
             </div>
             <div>
-              <span className="text-theme-muted block">Total Questions</span>
-              <span className="text-theme-primary font-medium">{total_questions}</span>
+              <span className="text-theme-muted block">MCQ Questions</span>
+              <span className="text-theme-primary font-medium">{total_mcq_questions}</span>
+            </div>
+            <div>
+              <span className="text-theme-muted block">Coding Problems</span>
+              <span className="text-theme-primary font-medium">{total_coding_problems}</span>
             </div>
           </div>
           <div className="grid grid-cols-2 gap-4 mt-4 text-sm">
@@ -182,29 +193,63 @@ const AdminResults = () => {
         {/* Performance Summary */}
         <div className="bg-theme-secondary rounded-lg p-6 mb-6">
           <h2 className="text-xl font-bold text-theme-primary mb-4">Performance</h2>
-          <div className="flex flex-wrap items-center gap-8">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* Overall */}
             <div className="text-center">
               <div className="text-4xl font-bold text-blue-400">{score} / {max_score}</div>
-              <div className="text-sm text-theme-muted mt-1">{percentage}% Correct</div>
+              <div className="text-sm text-theme-muted mt-1">{percentage}% Overall</div>
             </div>
-            <div className="flex gap-6 text-sm">
-              <div className="text-center">
-                <div className="text-2xl font-bold text-green-400">{correct_count}</div>
-                <div className="text-theme-muted">Correct</div>
+            {/* MCQ */}
+            <div className="text-center">
+              <div className="text-2xl font-bold text-green-400">{mcq_score} / {mcq_max_score}</div>
+              <div className="text-sm text-theme-muted mt-1">MCQ Score</div>
+              <div className="flex justify-center gap-3 text-xs mt-2">
+                <span className="text-green-400">✓ {correct_count} correct</span>
+                <span className="text-red-400">✗ {incorrect_count} wrong</span>
+                <span className="text-yellow-400">— {unanswered_count} skipped</span>
               </div>
-              <div className="text-center">
-                <div className="text-2xl font-bold text-red-400">{incorrect_count}</div>
-                <div className="text-theme-muted">Incorrect</div>
-              </div>
-              <div className="text-center">
-                <div className="text-2xl font-bold text-yellow-400">{unanswered_count}</div>
-                <div className="text-theme-muted">Unanswered</div>
-              </div>
+            </div>
+            {/* Coding */}
+            <div className="text-center">
+              <div className="text-2xl font-bold text-purple-400">{coding_score} / {coding_max_score}</div>
+              <div className="text-sm text-theme-muted mt-1">Coding Score</div>
             </div>
           </div>
         </div>
 
-        {/* Question-by-question review */}
+        {/* Coding Submissions */}
+        {coding_results && coding_results.length > 0 && (
+          <div className="bg-theme-secondary rounded-lg p-6 mb-6">
+            <h2 className="text-xl font-bold text-theme-primary mb-6">Coding Submissions</h2>
+            <div className="space-y-4">
+              {coding_results.map((cr, idx) => (
+                <div key={idx} className="bg-theme-primary rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="font-semibold text-theme-primary">{cr.problem_title}</h3>
+                    <span className={`text-xs px-2 py-1 rounded font-bold ${
+                      cr.status === 'passed' ? 'bg-green-900/50 text-green-300'
+                      : cr.status === 'failed' ? 'bg-red-900/50 text-red-300'
+                      : 'bg-yellow-900/50 text-yellow-300'
+                    }`}>{cr.status}</span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-4 text-xs text-theme-muted mb-3">
+                    <span>Language: {cr.language}</span>
+                    <span>Score: {cr.score}/{cr.max_score}</span>
+                    <span>Tests: {cr.tests_passed}/{cr.tests_total}</span>
+                    {cr.execution_time_ms && <span>Time: {cr.execution_time_ms}ms</span>}
+                  </div>
+                  <details>
+                    <summary className="text-xs text-blue-400 cursor-pointer">View Source Code</summary>
+                    <pre className="mt-2 bg-theme-secondary rounded p-3 text-xs text-theme-secondary overflow-x-auto max-h-64 overflow-y-auto font-mono whitespace-pre-wrap">{cr.source_code}</pre>
+                  </details>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* MCQ Question-by-question review */}
+        {questions.length > 0 && (
         <div className="bg-theme-secondary rounded-lg p-6">
           <h2 className="text-xl font-bold text-theme-primary mb-6">Question Review</h2>
           <div className="space-y-6">
@@ -276,6 +321,7 @@ const AdminResults = () => {
             })}
           </div>
         </div>
+        )}
       </div>
     </div>
   );

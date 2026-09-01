@@ -74,12 +74,14 @@ const Domains = () => {
         body: JSON.stringify({ domain_ids: selectedDomains }),
       });
 
+      // Read the body ONCE, then branch on status.
+      const data = await response.json();
+
       if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.detail || 'Failed to start assessment');
+        throw new Error(data.detail || 'Failed to start assessment');
       }
 
-      const data = await response.json();
+      // If resuming an existing attempt, navigate to it
       navigate(`/assessment/${data.attempt_id}`);
     } catch (err) {
       setError(err.message);
@@ -106,8 +108,9 @@ const Domains = () => {
         <div className="text-center mb-12">
           <h1 className="text-4xl font-bold text-theme-primary mb-4">Choose Your Domain</h1>
           <p className="text-theme-secondary text-lg max-w-2xl mx-auto">
-            Select up to 2 domains for your assessment. Each domain contributes equal questions to your test.
+            Select up to 2 domains for your assessment.
           </p>
+
         </div>
 
         {/* Loading State */}

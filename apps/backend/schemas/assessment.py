@@ -79,6 +79,7 @@ class AssessmentConfigUpdate(BaseModel):
     """Schema for admin updating assessment configuration."""
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     total_questions: Optional[int] = Field(None, gt=0)
+    coding_problem_count: Optional[int] = Field(None, ge=0)
     duration_minutes: Optional[int] = Field(None, gt=0)
     max_domains: Optional[int] = Field(None, ge=1, le=2)
     is_active: Optional[bool] = None

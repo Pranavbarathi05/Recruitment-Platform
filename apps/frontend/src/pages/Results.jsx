@@ -31,12 +31,13 @@ const Results = () => {
           },
         });
 
+        // Read body ONCE, then branch on status.
+        const data = await response.json();
+
         if (!response.ok) {
-          const errData = await response.json();
-          throw new Error(errData.detail || 'Failed to load results');
+          throw new Error(data.detail || 'Failed to load results');
         }
 
-        const data = await response.json();
         setResults(data);
       } catch (err) {
         setError(err.message);

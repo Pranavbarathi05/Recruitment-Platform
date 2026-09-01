@@ -3,7 +3,7 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import { Navbar } from './components';
 import ProtectedRoute from './components/ProtectedRoute';
-import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, SubmissionConfirmed, AdminPanel, AdminResults } from './pages';
+import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, SubmissionConfirmed, AdminPanel, AdminResults, AdminCoding } from './pages';
 
 /**
  * Main App Component
@@ -33,7 +33,7 @@ function App() {
       <Router>
         <div className="flex flex-col min-h-screen bg-theme-primary text-theme-primary">
           <Navbar />
-          <main className="flex-grow">
+          <main className="flex-1 min-h-0 flex flex-col">
             <Routes>
               <Route path="/" element={<Landing />} />
               <Route path="/login" element={<Login />} />
@@ -78,6 +78,7 @@ function App() {
                   </ProtectedRoute>
                 }
               />
+
               <Route
                 path="/admin"
                 element={
@@ -91,6 +92,14 @@ function App() {
                 element={
                   <ProtectedRoute>
                     <AdminResults />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/admin/coding"
+                element={
+                  <ProtectedRoute>
+                    <AdminCoding />
                   </ProtectedRoute>
                 }
               />

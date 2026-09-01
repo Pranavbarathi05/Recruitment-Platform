@@ -3,38 +3,31 @@ import PropTypes from 'prop-types';
 
 /**
  * CodeEditor Component
- * 
- * A functional code editor powered by Monaco Editor for candidates to write solutions.
- * Supports multiple programming languages with syntax highlighting.
- * 
- * @component
- * @param {string} language - Programming language for the editor (default: 'python')
- * @param {string} theme - Editor theme (default: 'vs-dark')
- * @param {string} defaultValue - Default code in the editor
- * @param {Function} onChange - Callback when code changes
- * @param {string} className - Additional CSS classes
- * @returns {JSX.Element} The CodeEditor component
+ *
+ * A controlled code editor powered by Monaco Editor.
+ * Uses `value` (not `defaultValue`) so the editor updates when the active problem changes.
+ * Parent should use `key={problemId}` on this component to force a fresh Monaco instance per problem.
  */
 function CodeEditor({
   language = 'python',
   theme = 'vs-dark',
-  defaultValue = '# Write your Python code here\n\n',
+  value = '',
   onChange,
-  className = ''
+  className = '',
 }) {
-  const handleChange = (value) => {
+  const handleChange = (val) => {
     if (onChange) {
-      onChange(value);
+      onChange(val);
     }
   };
 
   return (
-    <div className={`code-editor-container ${className}`}>
+    <div className={`code-editor-container h-full ${className}`}>
       <Editor
-        height="500px"
+        height="100%"
         language={language}
         theme={theme}
-        defaultValue={defaultValue}
+        value={value}
         onChange={handleChange}
         options={{
           minimap: { enabled: false },
@@ -55,7 +48,7 @@ function CodeEditor({
 CodeEditor.propTypes = {
   language: PropTypes.string,
   theme: PropTypes.string,
-  defaultValue: PropTypes.string,
+  value: PropTypes.string,
   onChange: PropTypes.func,
   className: PropTypes.string,
 };

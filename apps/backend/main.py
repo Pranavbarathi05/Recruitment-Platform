@@ -9,6 +9,8 @@ from routers import submission
 from routers import domains
 from routers import admin
 from routers import assessment
+from routers import coding
+from routers import coding_admin
 
 app = FastAPI(
     title="DSC Recruitment Platform API",
@@ -33,6 +35,8 @@ app.include_router(submission.router)
 app.include_router(domains.router, tags=["Domains"])
 app.include_router(admin.router)
 app.include_router(assessment.router)
+app.include_router(coding.router)
+app.include_router(coding_admin.router)
 
 
 @app.get("/")

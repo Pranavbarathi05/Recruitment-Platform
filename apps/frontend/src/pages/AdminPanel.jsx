@@ -60,6 +60,9 @@ const AdminPanel = () => {
   const [subSemester, setSubSemester] = useState(null);
   const [subBranch, setSubBranch] = useState('');
 
+  // Reset confirmation state
+  const [resetCandidate, setResetCandidate] = useState(null);
+  const [resetLoading, setResetLoading] = useState(false);
 
   const [message, setMessage] = useState('');
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -135,10 +138,15 @@ const AdminPanel = () => {
 
     // Client-side validation before sending to backend
     const tq = configForm.total_questions;
+    const cc = configForm.coding_problem_count;
     const md = configForm.max_domains;
 
     if (tq !== undefined && tq !== null && tq < 1) {
-      setConfigError('Total questions must be at least 1.');
+      setConfigError('MCQ questions must be at least 1.');
+      return;
+    }
+    if (cc !== undefined && cc !== null && cc < 0) {
+      setConfigError('Coding problems cannot be negative.');
       return;
     }
     if (md !== undefined && md !== null && (md < 1 || md > 2)) {
@@ -146,7 +154,11 @@ const AdminPanel = () => {
       return;
     }
     if (md === 2 && tq !== undefined && tq !== null && tq % 2 !== 0) {
-      setConfigError('Total questions must be even when using 2 domains.');
+      setConfigError('MCQ questions must be even when using 2 domains.');
+      return;
+    }
+    if (md === 2 && cc !== undefined && cc !== null && cc > 0 && cc % 2 !== 0) {
+      setConfigError('Coding problems must be even when using 2 domains.');
       return;
     }
 
@@ -343,6 +355,30 @@ const AdminPanel = () => {
     }
   };
 
+  // Reset assessment handler
+  const handleResetAssessment = async () => {
+    if (!resetCandidate || resetLoading) return;
+    setResetLoading(true);
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessments/${resetCandidate.attempt_id}/reset`, {
+        method: 'POST',
+        headers: authHeaders,
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || 'Reset failed');
+      }
+      setMessage(`Assessment reset for ${resetCandidate.candidate_name}. They can now start a new assessment.`);
+      setResetCandidate(null);
+      fetchSubmissions();
+    } catch (err) {
+      setMessage(`Error: ${err.message}`);
+      setResetCandidate(null);
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-theme-primary flex items-center justify-center">
@@ -356,7 +392,15 @@ const AdminPanel = () => {
   return (
     <div className="min-h-screen bg-theme-primary py-12 px-4">
       <div className="max-w-6xl mx-auto">
-        <h1 className="text-3xl font-bold text-theme-primary mb-8">Admin Panel</h1>
+        <div className="flex items-center justify-between mb-8">
+          <h1 className="text-3xl font-bold text-theme-primary">Admin Panel</h1>
+          <button
+            onClick={() => navigate('/admin/coding')}
+            className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-semibold transition-colors"
+          >
+            💻 Coding Problems
+          </button>
+        </div>
 
         {message && (
           <div className={`mb-4 p-3 rounded-lg text-sm ${message.startsWith('Error') ? 'bg-red-900/30 border border-red-500 text-red-300' : 'bg-green-900/30 border border-green-500 text-green-300'}`}>
@@ -444,7 +488,7 @@ const AdminPanel = () => {
                       />
                       <div className="grid grid-cols-2 gap-3">
                         <div>
-                          <label className="text-xs text-theme-muted mb-1 block">Total Questions</label>
+                          <label className="text-xs text-theme-muted mb-1 block">MCQ Questions</label>
                           <input
                             type="number"
                             min="1"
@@ -452,6 +496,20 @@ const AdminPanel = () => {
                             onChange={(e) => {
                               const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
                               setConfigForm({ ...configForm, total_questions: val });
+                            }}
+                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-theme-muted mb-1 block">Coding Problems</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={configForm.coding_problem_count ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
+                              setConfigForm({ ...configForm, coding_problem_count: val });
                             }}
                             className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
                             required
@@ -507,14 +565,15 @@ const AdminPanel = () => {
                           </span>
                         </div>
                         <button
-                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
+                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, coding_problem_count: cfg.coding_problem_count ?? 0, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
                           className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
                         >
                           Edit
                         </button>
                       </div>
-                      <div className="grid grid-cols-3 gap-2 mt-3 text-xs text-theme-muted">
-                        <span>Questions: {cfg.total_questions}</span>
+                      <div className="grid grid-cols-2 gap-2 mt-3 text-xs text-theme-muted">
+                        <span>MCQ Questions: {cfg.total_questions}</span>
+                        <span>Coding Problems: {cfg.coding_problem_count ?? 0}</span>
                         <span>Duration: {cfg.duration_minutes}m</span>
                         <span>Max Domains: {cfg.max_domains}</span>
                       </div>
@@ -848,12 +907,22 @@ const AdminPanel = () => {
                           }) : '—'}
                         </td>
                         <td className="px-4 py-3 text-right">
-                          <button
-                            onClick={() => navigate(`/admin/assessments/${sub.attempt_id}/results`)}
-                            className="text-xs px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded"
-                          >
-                            View Responses
-                          </button>
+                          <div className="flex gap-1 justify-end">
+                            <button
+                              onClick={() => navigate(`/admin/assessments/${sub.attempt_id}/results`)}
+                              className="text-xs px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded"
+                            >
+                              View Responses
+                            </button>
+                            {(sub.status === 'scored' || sub.status === 'submitted') && (
+                              <button
+                                onClick={() => setResetCandidate(sub)}
+                                className="text-xs px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded"
+                              >
+                                Reset
+                              </button>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -867,6 +936,42 @@ const AdminPanel = () => {
           )}
         </div>
       </div>
+
+      {/* Reset Confirmation Modal */}
+      {resetCandidate && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-theme-secondary rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
+            <h3 className="text-xl font-bold text-theme-primary mb-4">Reset Assessment</h3>
+            <p className="text-theme-muted mb-2">
+              Are you sure you want to reset the assessment for{' '}
+              <span className="font-semibold text-theme-primary">{resetCandidate.candidate_name}</span>?
+            </p>
+            <div className="bg-orange-900/20 border border-orange-500/50 rounded p-3 mb-4">
+              <p className="text-orange-300 text-sm font-medium">⚠️ This will allow the candidate to take a new assessment.</p>
+              <p className="text-orange-200 text-sm mt-1">Their previous assessment results will NOT be deleted.</p>
+            </div>
+            <p className="text-theme-muted text-sm mb-4">
+              Previous score: {resetCandidate.score}/{resetCandidate.max_score} ({resetCandidate.percentage}%) — will be preserved in history.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={handleResetAssessment}
+                disabled={resetLoading}
+                className="flex-1 px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg font-semibold disabled:opacity-50"
+              >
+                {resetLoading ? 'Resetting...' : 'Confirm Reset'}
+              </button>
+              <button
+                onClick={() => setResetCandidate(null)}
+                disabled={resetLoading}
+                className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
