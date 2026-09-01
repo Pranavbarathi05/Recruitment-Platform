@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
-from schemas.assessment import DomainCreate, DomainUpdate, MCQCreate, MCQUpdate, VALID_SEMESTERS
+from schemas.assessment import (
+    DomainCreate, DomainUpdate, MCQCreate, MCQUpdate,
+    AssessmentConfigUpdate, VALID_SEMESTERS, SEMESTER_LABELS,
+)
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -307,6 +310,375 @@ def delete_mcq(mcq_id: str, admin: AuthUser = Depends(require_admin)):
 
         supabase_client.table("mcq_questions").delete().eq("id", mcq_id).execute()
         return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment submissions list (admin only)
+# ---------------------------------------------------------------------------
+
+# Valid sort fields and their database column equivalents
+_VALID_SORTS = {
+    "score": "score",
+    "percentage": "percentage_computed",
+    "submitted_at": "submitted_at",
+    "name": "full_name",
+}
+
+
+@router.get("/assessments/submissions")
+def list_submissions(
+    admin: AuthUser = Depends(require_admin),
+    semester: int = Query(None, description="Filter by semester: 1, 3, 5, or 7"),
+    branch: str = Query(None, description="Filter by branch"),
+    domain_id: str = Query(None, description="Filter by domain UUID"),
+    search: str = Query(None, description="Search by name, email, or USN"),
+    sort: str = Query("score", description="Sort field: score, percentage, submitted_at, name"),
+    order: str = Query("desc", description="Sort order: asc or desc"),
+    limit: int = Query(200, ge=1, le=500, description="Max results"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+):
+    """List all submitted/scored assessment attempts with candidate info.
+
+    Admin only. Returns lightweight records (no question/answer data).
+    Server-side sorting and filtering for 200+ candidate scalability.
+    """
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        # 1. Fetch submitted/scored attempts
+        attempts_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id, profile_id, domain_ids, total_questions, score, max_score, started_at, submitted_at, status")
+            .in_("status", ["submitted", "scored"])
+            .execute()
+        )
+        attempts = attempts_resp.data or []
+        logger.warning(f"SUBMISSIONS DEBUG: Found {len(attempts)} attempts with status in (submitted, scored)")
+
+        if not attempts:
+            logger.warning("SUBMISSIONS DEBUG: No attempts found, returning empty list")
+            return []
+
+        # 2. Batch-fetch profiles and candidates
+        profile_ids = list({a["profile_id"] for a in attempts})
+
+        profiles_resp = (
+            supabase_client.table("profiles")
+            .select("id, full_name, email")
+            .in_("id", profile_ids)
+            .execute()
+        )
+        profile_map = {p["id"]: p for p in (profiles_resp.data or [])}
+
+        candidates_resp = (
+            supabase_client.table("candidates")
+            .select("profile_id, usn, semester, branch")
+            .in_("profile_id", profile_ids)
+            .execute()
+        )
+        candidate_map = {c["profile_id"]: c for c in (candidates_resp.data or [])}
+
+        # 3. Fetch all domain names (small table)
+        domains_resp = (
+            supabase_client.table("domains")
+            .select("id, name")
+            .execute()
+        )
+        domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
+
+        # 4. Assemble records
+        records = []
+        for attempt in attempts:
+            pid = attempt["profile_id"]
+            profile = profile_map.get(pid, {})
+            candidate = candidate_map.get(pid, {}
+)
+
+            score_val = attempt.get("score") or 0
+            max_score_val = attempt.get("max_score") or attempt["total_questions"]
+            percentage = round((score_val / max_score_val) * 100) if max_score_val > 0 else 0
+
+            records.append({
+                "attempt_id": attempt["id"],
+                "candidate_name": profile.get("full_name", ""),
+                "email": profile.get("email", ""),
+                "usn": candidate.get("usn", ""),
+                "branch": candidate.get("branch", ""),
+                "semester": candidate.get("semester"),
+                "domain_ids": attempt.get("domain_ids") or [],
+                "domain_names": [domain_map.get(did, "") for did in (attempt.get("domain_ids") or [])],
+                "score": score_val,
+                "max_score": max_score_val,
+                "percentage": percentage,
+                "total_questions": attempt["total_questions"],
+                "started_at": attempt.get("started_at"),
+                "submitted_at": attempt.get("submitted_at"),
+            })
+
+        # 5. Apply filters
+        if semester is not None:
+            records = [r for r in records if r["semester"] == semester]
+
+        if branch:
+            branch_lower = branch.lower()
+            records = [r for r in records if branch_lower in (r.get("branch") or "").lower()]
+
+        if domain_id:
+            records = [r for r in records if domain_id in (r.get("domain_ids") or [])]
+
+        if search:
+            search_lower = search.lower()
+            records = [
+                r for r in records
+                if search_lower in (r.get("candidate_name") or "").lower()
+                or search_lower in (r.get("email") or "").lower()
+                or search_lower in (r.get("usn") or "").lower()
+            ]
+
+        # 6. Apply sorting
+        sort_key = sort if sort in _VALID_SORTS else "score"
+        reverse = order != "asc"
+
+        if sort_key == "name":
+            records.sort(key=lambda r: (r.get("candidate_name") or "").lower(), reverse=reverse)
+        elif sort_key == "submitted_at":
+            records.sort(key=lambda r: r.get("submitted_at") or "", reverse=reverse)
+        elif sort_key == "percentage":
+            records.sort(key=lambda r: r.get("percentage", 0), reverse=reverse)
+        else:  # score
+            records.sort(key=lambda r: r.get("score", 0), reverse=reverse)
+
+        # 7. Apply pagination
+        return records[offset:offset + limit]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment results (admin only)
+# ---------------------------------------------------------------------------
+
+@router.get("/assessments/{attempt_id}/results")
+def get_assessment_results(
+    attempt_id: str,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Get complete assessment results for an attempt. Admin only."""
+    try:
+        # Fetch attempt
+        attempt_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("*")
+            .eq("id", attempt_id)
+            .execute()
+        )
+
+        if not attempt_resp.data:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        attempt = attempt_resp.data[0]
+
+        # Fetch candidate profile
+        profile_resp = (
+            supabase_client.table("profiles")
+            .select("id, full_name, email")
+            .eq("id", attempt["profile_id"])
+            .execute()
+        )
+        profile = profile_resp.data[0] if profile_resp.data else {}
+
+        # Fetch candidate record for semester
+        candidate_resp = (
+            supabase_client.table("candidates")
+            .select("usn, semester, branch")
+            .eq("profile_id", attempt["profile_id"])
+            .execute()
+        )
+        candidate = candidate_resp.data[0] if candidate_resp.data else {}
+
+        # Fetch answers with correctness
+        answers_resp = (
+            supabase_client.table("assessment_answers")
+            .select("question_id, selected_option, is_correct")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        )
+        answers = answers_resp.data or []
+        answers_map = {a["question_id"]: a for a in answers}
+
+        # Count correct/incorrect/unanswered
+        correct_count = sum(1 for a in answers if a.get("is_correct"))
+        incorrect_count = sum(1 for a in answers if not a.get("is_correct") and a.get("selected_option"))
+        unanswered_count = attempt["total_questions"] - len(answers)
+
+        # Fetch questions with correct answers
+        question_ids = attempt["selected_question_ids"]
+        questions_resp = (
+            supabase_client.table("mcq_questions")
+            .select("id, domain_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation")
+            .in_("id", question_ids)
+            .execute()
+        )
+        q_map = {q["id"]: q for q in (questions_resp.data or [])}
+
+        # Fetch domain names
+        domains_resp = (
+            supabase_client.table("domains")
+            .select("id, name")
+            .in_("id", attempt["domain_ids"])
+            .execute()
+        )
+        domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
+
+        # Build question-by-question results
+        questions_with_answers = []
+        for qid in question_ids:
+            q = q_map.get(qid, {})
+            a = answers_map.get(qid, {})
+            questions_with_answers.append({
+                "question_text": q.get("question_text", ""),
+                "option_a": q.get("option_a", ""),
+                "option_b": q.get("option_b", ""),
+                "option_c": q.get("option_c", ""),
+                "option_d": q.get("option_d", ""),
+                "correct_option": q.get("correct_option", ""),
+                "explanation": q.get("explanation"),
+                "selected_option": a.get("selected_option"),
+                "is_correct": a.get("is_correct", False),
+                "domainName": domain_map.get(q.get("domain_id"), ""),
+            })
+
+        max_score = attempt["max_score"] if attempt.get("max_score") else attempt["total_questions"]
+        score = attempt.get("score", 0) if attempt.get("score") is not None else 0
+        percentage = round((score / max_score) * 100) if max_score > 0 else 0
+
+        return {
+            "attempt_id": attempt_id,
+            "status": attempt["status"],
+            "candidate": {
+                "profile_id": attempt["profile_id"],
+                "full_name": profile.get("full_name", ""),
+                "email": profile.get("email", ""),
+                "usn": candidate.get("usn", ""),
+                "semester": candidate.get("semester"),
+                "semester_label": SEMESTER_LABELS.get(candidate.get("semester"), "Unknown"),
+                "branch": candidate.get("branch", ""),
+            },
+            "domain_ids": attempt["domain_ids"],
+            "domain_names": [domain_map.get(did, "") for did in attempt["domain_ids"]],
+            "total_questions": attempt["total_questions"],
+            "duration_minutes": attempt["duration_minutes"],
+            "started_at": attempt["started_at"],
+            "submitted_at": attempt.get("submitted_at"),
+            "expires_at": attempt.get("expires_at"),
+            "score": score,
+            "max_score": max_score,
+            "percentage": percentage,
+            "correct_count": correct_count,
+            "incorrect_count": incorrect_count,
+            "unanswered_count": unanswered_count,
+            "questions": questions_with_answers,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment configuration management
+# ---------------------------------------------------------------------------
+
+@router.get("/config")
+def list_config(admin: AuthUser = Depends(require_admin)):
+    """List all assessment configurations. Admin only."""
+    try:
+        result = (
+            supabase_client.table("assessment_config")
+            .select("*")
+            .order("created_at")
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/config/{config_id}")
+def update_config(
+    config_id: str,
+    payload: AssessmentConfigUpdate,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Update an assessment configuration. Admin only."""
+    try:
+        existing = (
+            supabase_client.table("assessment_config")
+            .select("id")
+            .eq("id", config_id)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Configuration not found")
+
+        updates = payload.model_dump(exclude_unset=True)
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        # Validate configuration consistency
+        if "total_questions" in updates or "max_domains" in updates:
+            # Fetch current values to fill in any missing updates
+            current = (
+                supabase_client.table("assessment_config")
+                .select("total_questions, max_domains")
+                .eq("id", config_id)
+                .execute()
+            )
+            if current.data:
+                cur = current.data[0]
+                tq = updates.get("total_questions", cur["total_questions"])
+                md = updates.get("max_domains", cur["max_domains"])
+                # max_domains must not exceed 2
+                if md > 2:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="max_domains cannot exceed 2",
+                    )
+                # When 2 domains are selected, total_questions must be even
+                if md == 2 and tq % 2 != 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"total_questions ({tq}) must be even "
+                            f"when max_domains is 2 for an equal 50/50 split."
+                        ),
+                    )
+
+        # If this config is being activated, deactivate all other configs first.
+        # The DB partial unique index enforces at most one active config,
+        # so we must clear others before setting this one active.
+        if updates.get("is_active") is True:
+            (
+                supabase_client.table("assessment_config")
+                .update({"is_active": False})
+                .neq("id", config_id)
+                .eq("is_active", True)
+                .execute()
+            )
+
+        result = (
+            supabase_client.table("assessment_config")
+            .update(updates)
+            .eq("id", config_id)
+            .execute()
+        )
+        return result.data[0] if result.data else {"status": "updated"}
     except HTTPException:
         raise
     except Exception as e:

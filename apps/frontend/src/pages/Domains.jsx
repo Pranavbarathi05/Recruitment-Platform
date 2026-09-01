@@ -131,7 +131,7 @@ const Domains = () => {
             <p className="text-theme-muted">
               {selectedDomains.length === 0
                 ? 'Select 1 or 2 domains to begin'
-                : `${selectedDomains.length} domain${selectedDomains.length > 1 ? 's' : ''} selected — ${selectedDomains.length === 1 ? '20 questions from one domain' : '10 questions from each domain'}`}
+                : `${selectedDomains.length} domain${selectedDomains.length > 1 ? 's' : ''} selected`}
             </p>
           </div>
         )}

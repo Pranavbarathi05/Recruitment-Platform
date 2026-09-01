@@ -6,14 +6,28 @@ router = APIRouter()
 
 @router.get("/questions/domains")
 def get_active_domains():
-    """Get all active domains with question counts."""
+    """Get all active domains with question counts and assessment duration."""
     try:
         response = (
             supabase_client.table("domains")
-            .select("id, name, slug, description, duration_minutes")
+            .select("id, name, slug, description")
             .eq("is_active", True)
             .order("name")
             .execute()
+        )
+
+        # Fetch the active assessment config for the duration
+        config_resp = (
+            supabase_client.table("assessment_config")
+            .select("duration_minutes")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        assessment_duration = (
+            config_resp.data[0]["duration_minutes"]
+            if config_resp.data
+            else 20  # fallback default
         )
 
         domains = []
@@ -33,7 +47,7 @@ def get_active_domains():
                 "name": domain["name"],
                 "description": domain.get("description", ""),
                 "questionCount": len(q_count_resp.data) if q_count_resp.data else 0,
-                "durationMinutes": domain["duration_minutes"],
+                "durationMinutes": assessment_duration,
             })
 
         return domains
@@ -47,7 +61,7 @@ def get_domain_detail(domain_id: str):
     try:
         response = (
             supabase_client.table("domains")
-            .select("id, name, slug, description, duration_minutes, is_active")
+            .select("id, name, slug, description, is_active")
             .eq("id", domain_id)
             .execute()
         )
@@ -65,13 +79,27 @@ def get_domain_detail(domain_id: str):
             .execute()
         )
 
+        # Fetch the active assessment config for the duration
+        config_resp = (
+            supabase_client.table("assessment_config")
+            .select("duration_minutes")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        assessment_duration = (
+            config_resp.data[0]["duration_minutes"]
+            if config_resp.data
+            else 20  # fallback default
+        )
+
         return {
             "id": domain["id"],
             "slug": domain["slug"],
             "name": domain["name"],
             "description": domain.get("description", ""),
             "questionCount": len(q_count_resp.data) if q_count_resp.data else 0,
-            "durationMinutes": domain["duration_minutes"],
+            "durationMinutes": assessment_duration,
             "isActive": domain["is_active"],
         }
     except HTTPException:

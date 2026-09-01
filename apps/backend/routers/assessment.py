@@ -1,5 +1,5 @@
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
 from core.supabase import supabase_client
@@ -7,8 +7,92 @@ from schemas.assessment import AssessmentStartRequest, AnswerSaveRequest
 
 router = APIRouter(prefix="/assessment", tags=["Assessment"])
 
-# Total questions per attempt
-TOTAL_QUESTIONS = 20
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_active_config() -> dict:
+    """Read the active assessment configuration from the database."""
+    result = (
+        supabase_client.table("assessment_config")
+        .select("*")
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(
+            status_code=500,
+            detail="No active assessment configuration found. Contact an admin.",
+        )
+    return result.data[0]
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _is_expired(attempt: dict) -> bool:
+    """Check whether an attempt has expired based on server time."""
+    expires_at = attempt.get("expires_at")
+    if not expires_at:
+        return False
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    return _utcnow() > expires_at
+
+
+def _score_attempt(attempt_id: str) -> dict:
+    """Score an attempt server-side. Returns the scoring result."""
+    # Fetch answers
+    answers_resp = (
+        supabase_client.table("assessment_answers")
+        .select("id, question_id, selected_option")
+        .eq("attempt_id", attempt_id)
+        .execute()
+    )
+    answers = answers_resp.data or []
+
+    # Fetch correct answers from the question bank
+    question_ids = [a["question_id"] for a in answers]
+    if not question_ids:
+        # No answers submitted — score as 0
+        supabase_client.table("assessment_attempts").update({
+            "status": "scored",
+            "submitted_at": _utcnow().isoformat(),
+            "score": 0,
+            "max_score": 0,
+        }).eq("id", attempt_id).execute()
+        return {"score": 0, "max_score": 0}
+
+    questions_resp = (
+        supabase_client.table("mcq_questions")
+        .select("id, correct_option")
+        .in_("id", question_ids)
+        .execute()
+    )
+    correct_map = {q["id"]: q["correct_option"] for q in (questions_resp.data or [])}
+
+    # Score each answer
+    score = 0
+    for answer in answers:
+        is_correct = answer["selected_option"] == correct_map.get(answer["question_id"])
+        if is_correct:
+            score += 1
+        supabase_client.table("assessment_answers").update({
+            "is_correct": is_correct,
+        }).eq("id", answer["id"]).execute()
+
+    # Update attempt
+    supabase_client.table("assessment_attempts").update({
+        "status": "scored",
+        "submitted_at": _utcnow().isoformat(),
+        "score": score,
+        "max_score": len(answers),
+    }).eq("id", attempt_id).execute()
+
+    return {"score": score, "max_score": len(answers)}
 
 
 # ---------------------------------------------------------------------------
@@ -20,26 +104,16 @@ def start_assessment(
     payload: AssessmentStartRequest,
     current_user: AuthUser = Depends(get_current_user),
 ):
-    """Start a new MCQ assessment with 1 or 2 selected domains.
-
-    The candidate's semester is read from their candidate record in the
-    database — it is NEVER trusted from the request body.
-
-    Validates:
-    - Candidate profile and candidate record exist
-    - 1 or 2 domains selected
-    - All domains are active
-    - Each domain has enough questions for (domain, semester)
-    - No existing in_progress attempt
-
-    Randomization:
-    - Questions are selected once and frozen in the attempt
-    - 1 domain: ALL questions from that domain + semester
-    - 2 domains: half from each (first domain gets extra if odd)
-    """
+    """Start a new MCQ assessment with 1 or 2 selected domains."""
     profile_id = current_user.id
 
-    # 1. Verify candidate profile exists
+    # 1. Read active assessment configuration
+    config = _get_active_config()
+    total_questions = config["total_questions"]
+    duration_minutes = config["duration_minutes"]
+    max_domains = config["max_domains"]
+
+    # 2. Verify candidate profile exists
     profile = (
         supabase_client.table("profiles")
         .select("id")
@@ -49,7 +123,7 @@ def start_assessment(
     if not profile.data:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    # 2. Get candidate record (semester comes from here, NOT from request)
+    # 3. Get candidate record (semester comes from here, NOT from request)
     candidate = (
         supabase_client.table("candidates")
         .select("id, semester")
@@ -61,7 +135,7 @@ def start_assessment(
 
     candidate_semester = candidate.data[0]["semester"]
 
-    # 3. Check for existing in_progress attempt
+    # 4. Check for existing in_progress attempt
     existing = (
         supabase_client.table("assessment_attempts")
         .select("id")
@@ -70,15 +144,35 @@ def start_assessment(
         .execute()
     )
     if existing.data:
+        attempt_id = existing.data[0]["id"]
+        # Check if it's expired — if so, auto-submit it
+        attempt_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("*")
+            .eq("id", attempt_id)
+            .execute()
+        )
+        if attempt_resp.data and _is_expired(attempt_resp.data[0]):
+            _score_attempt(attempt_id)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"You have an expired attempt ({attempt_id}) that has been "
+                    "auto-submitted. Check your results."
+                ),
+            )
         raise HTTPException(
             status_code=409,
-            detail=f"You already have an in-progress attempt: {existing.data[0]['id']}",
+            detail=f"You already have an in-progress attempt: {attempt_id}",
         )
 
-    # 4. Validate domains
+    # 5. Validate domains
     domain_ids = payload.domain_ids
-    if len(domain_ids) < 1 or len(domain_ids) > 2:
-        raise HTTPException(status_code=400, detail="Select 1 or 2 domains")
+    if len(domain_ids) < 1 or len(domain_ids) > max_domains:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Select between 1 and {max_domains} domains",
+        )
 
     # Fetch and validate all domains are active
     domains_resp = (
@@ -95,21 +189,27 @@ def start_assessment(
     if len(active_domains) != len(domain_ids):
         raise HTTPException(status_code=400, detail="One or more selected domains are inactive")
 
-    # 5. Determine question distribution
+    # 6. Determine question distribution
     num_domains = len(domain_ids)
+
     if num_domains == 1:
-        per_domain = TOTAL_QUESTIONS
+        per_domain = total_questions
     else:
-        per_domain = TOTAL_QUESTIONS // 2
+        if total_questions % 2 != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Total questions ({total_questions}) must be even "
+                    f"when selecting 2 domains for an equal split."
+                ),
+            )
+        per_domain = total_questions // 2
 
-    extra = TOTAL_QUESTIONS - (per_domain * num_domains)
-
-    # 6. Randomly select questions from each domain + semester
+    # 7. Randomly select questions from each domain + semester
     selected_question_ids = []
 
-    for i, domain in enumerate(active_domains):
-        # First domain gets the extra question if total is odd
-        count = per_domain + (extra if i == 0 else 0)
+    for domain in active_domains:
+        count = per_domain
 
         q_resp = (
             supabase_client.table("mcq_questions")
@@ -130,24 +230,25 @@ def start_assessment(
                 ),
             )
 
-        # Random selection without replacement
         sampled = random.sample(available, count)
         selected_question_ids.extend([q["id"] for q in sampled])
 
-    # Shuffle the combined list for mixed order
     random.shuffle(selected_question_ids)
 
-    # 7. Determine assessment duration (max of selected domains)
-    duration = max(d["duration_minutes"] for d in active_domains)
+    # 8. Calculate timestamps
+    now = _utcnow()
+    expires_at = now + timedelta(minutes=duration_minutes)
 
-    # 8. Create the attempt
+    # 9. Create the attempt
     result = supabase_client.table("assessment_attempts").insert({
         "profile_id": profile_id,
         "status": "in_progress",
         "domain_ids": domain_ids,
         "selected_question_ids": selected_question_ids,
         "total_questions": len(selected_question_ids),
-        "duration_minutes": duration,
+        "duration_minutes": duration_minutes,
+        "started_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
     }).execute()
 
     attempt = result.data[0] if result.data else None
@@ -159,6 +260,7 @@ def start_assessment(
         "total_questions": attempt["total_questions"],
         "duration_minutes": attempt["duration_minutes"],
         "domain_ids": domain_ids,
+        "expires_at": attempt["expires_at"],
     }
 
 
@@ -168,10 +270,13 @@ def start_assessment(
 
 @router.get("/current")
 def get_current_attempt(current_user: AuthUser = Depends(get_current_user)):
-    """Get the candidate's most recent in-progress attempt."""
+    """Get the candidate's most recent in-progress attempt.
+
+    Does NOT return score, max_score, or any scoring information.
+    """
     result = (
         supabase_client.table("assessment_attempts")
-        .select("*")
+        .select("id, profile_id, status, domain_ids, selected_question_ids, total_questions, duration_minutes, started_at, expires_at, submitted_at, created_at")
         .eq("profile_id", current_user.id)
         .eq("status", "in_progress")
         .order("started_at", desc=True)
@@ -182,19 +287,28 @@ def get_current_attempt(current_user: AuthUser = Depends(get_current_user)):
     if not result.data:
         raise HTTPException(status_code=404, detail="No active attempt")
 
-    return result.data[0]
+    attempt = result.data[0]
+
+    if _is_expired(attempt):
+        _score_attempt(attempt["id"])
+        attempt["status"] = "scored"
+
+    return attempt
 
 
 # ---------------------------------------------------------------------------
-# Get attempt details
+# Get attempt details (no scoring data for candidates)
 # ---------------------------------------------------------------------------
 
 @router.get("/attempt/{attempt_id}")
 def get_attempt(attempt_id: str, current_user: AuthUser = Depends(get_current_user)):
-    """Get attempt details. Only the owner can access their attempt."""
+    """Get attempt details. Only the owner can access their attempt.
+
+    Does NOT return score, max_score, or any scoring information.
+    """
     result = (
         supabase_client.table("assessment_attempts")
-        .select("*")
+        .select("id, profile_id, status, domain_ids, selected_question_ids, total_questions, duration_minutes, started_at, expires_at, submitted_at, created_at")
         .eq("id", attempt_id)
         .execute()
     )
@@ -206,6 +320,11 @@ def get_attempt(attempt_id: str, current_user: AuthUser = Depends(get_current_us
 
     if attempt["profile_id"] != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
+
+    # Auto-submit if expired
+    if attempt["status"] == "in_progress" and _is_expired(attempt):
+        _score_attempt(attempt_id)
+        attempt["status"] = "scored"
 
     return attempt
 
@@ -219,92 +338,7 @@ def get_attempt_questions(
     attempt_id: str,
     current_user: AuthUser = Depends(get_current_user),
 ):
-    """Get the questions for an attempt. Correct answers are NEVER sent.
-
-    Returns questions in the frozen order from the attempt.
-    """
-    # Fetch attempt
-    attempt_resp = (
-        supabase_client.table("assessment_attempts")
-        .select("*")
-        .eq("id", attempt_id)
-        .execute()
-    )
-
-    if not attempt_resp.data:
-        raise HTTPException(status_code=404, detail="Attempt not found")
-
-    attempt = attempt_resp.data[0]
-
-    # Security check
-    if attempt["profile_id"] != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if attempt["status"] not in ("in_progress",):
-        raise HTTPException(status_code=400, detail="Attempt is not in progress")
-
-    # Fetch questions (without correct_option, explanation)
-    question_ids = attempt["selected_question_ids"]
-    if not question_ids:
-        return []
-
-    questions_resp = (
-        supabase_client.table("mcq_questions")
-        .select("id, domain_id, question_text, option_a, option_b, option_c, option_d")
-        .in_("id", question_ids)
-        .execute()
-    )
-
-    # Preserve the frozen order
-    q_map = {q["id"]: q for q in (questions_resp.data or [])}
-    ordered_questions = [q_map[qid] for qid in question_ids if qid in q_map]
-
-    # Fetch domain names for display
-    domain_ids = attempt["domain_ids"]
-    domains_resp = (
-        supabase_client.table("domains")
-        .select("id, name")
-        .in_("id", domain_ids)
-        .execute()
-    )
-    domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
-
-    for q in ordered_questions:
-        q["domainName"] = domain_map.get(q.get("domain_id"), "")
-
-    # Fetch existing answers for this attempt
-    answers_resp = (
-        supabase_client.table("assessment_answers")
-        .select("question_id, selected_option")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
-    answers_map = {
-        a["question_id"]: a["selected_option"]
-        for a in (answers_resp.data or [])
-    }
-
-    return {
-        "attempt_id": attempt_id,
-        "total_questions": attempt["total_questions"],
-        "duration_minutes": attempt["duration_minutes"],
-        "questions": ordered_questions,
-        "answers": answers_map,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Save/update an answer
-# ---------------------------------------------------------------------------
-
-@router.put("/attempt/{attempt_id}/answers")
-def save_answer(
-    attempt_id: str,
-    payload: AnswerSaveRequest,
-    current_user: AuthUser = Depends(get_current_user),
-):
-    """Save or update a single answer. Only on in_progress attempts."""
-    # Fetch attempt
+    """Get the questions for an attempt. Correct answers are NEVER sent."""
     attempt_resp = (
         supabase_client.table("assessment_attempts")
         .select("*")
@@ -323,11 +357,93 @@ def save_answer(
     if attempt["status"] != "in_progress":
         raise HTTPException(status_code=400, detail="Attempt is not in progress")
 
-    # Validate question belongs to this attempt
+    if _is_expired(attempt):
+        _score_attempt(attempt_id)
+        raise HTTPException(status_code=400, detail="Assessment time has expired")
+
+    question_ids = attempt["selected_question_ids"]
+    if not question_ids:
+        return []
+
+    questions_resp = (
+        supabase_client.table("mcq_questions")
+        .select("id, domain_id, question_text, option_a, option_b, option_c, option_d")
+        .in_("id", question_ids)
+        .execute()
+    )
+
+    q_map = {q["id"]: q for q in (questions_resp.data or [])}
+    ordered_questions = [q_map[qid] for qid in question_ids if qid in q_map]
+
+    domain_ids = attempt["domain_ids"]
+    domains_resp = (
+        supabase_client.table("domains")
+        .select("id, name")
+        .in_("id", domain_ids)
+        .execute()
+    )
+    domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
+
+    for q in ordered_questions:
+        q["domainName"] = domain_map.get(q.get("domain_id"), "")
+
+    answers_resp = (
+        supabase_client.table("assessment_answers")
+        .select("question_id, selected_option")
+        .eq("attempt_id", attempt_id)
+        .execute()
+    )
+    answers_map = {
+        a["question_id"]: a["selected_option"]
+        for a in (answers_resp.data or [])
+    }
+
+    return {
+        "attempt_id": attempt_id,
+        "total_questions": attempt["total_questions"],
+        "duration_minutes": attempt["duration_minutes"],
+        "expires_at": attempt.get("expires_at"),
+        "questions": ordered_questions,
+        "answers": answers_map,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Save/update an answer
+# ---------------------------------------------------------------------------
+
+@router.put("/attempt/{attempt_id}/answers")
+def save_answer(
+    attempt_id: str,
+    payload: AnswerSaveRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Save or update a single answer. Only on in_progress, non-expired attempts."""
+    attempt_resp = (
+        supabase_client.table("assessment_attempts")
+        .select("*")
+        .eq("id", attempt_id)
+        .execute()
+    )
+
+    if not attempt_resp.data:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    attempt = attempt_resp.data[0]
+
+    if attempt["profile_id"] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if attempt["status"] != "in_progress":
+        raise HTTPException(status_code=400, detail="Attempt is not in progress")
+
+    if _is_expired(attempt):
+        _score_attempt(attempt_id)
+        raise HTTPException(status_code=400, detail="Assessment time has expired")
+
     if payload.question_id not in attempt["selected_question_ids"]:
         raise HTTPException(status_code=400, detail="Question not part of this attempt")
 
-    # Upsert the answer
     existing = (
         supabase_client.table("assessment_answers")
         .select("id")
@@ -336,7 +452,7 @@ def save_answer(
         .execute()
     )
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = _utcnow().isoformat()
 
     if existing.data:
         supabase_client.table("assessment_answers").update({
@@ -363,8 +479,10 @@ def submit_attempt(
     attempt_id: str,
     current_user: AuthUser = Depends(get_current_user),
 ):
-    """Submit and score the attempt. Locks the attempt permanently."""
-    # Fetch attempt
+    """Submit and score the attempt. Locks the attempt permanently.
+
+    Does NOT return score or scoring data to the candidate.
+    """
     attempt_resp = (
         supabase_client.table("assessment_attempts")
         .select("*")
@@ -383,143 +501,10 @@ def submit_attempt(
     if attempt["status"] != "in_progress":
         raise HTTPException(status_code=400, detail="Attempt already submitted")
 
-    # Server-side time enforcement
-    started = datetime.fromisoformat(attempt["started_at"].replace("Z", "+00:00"))
-    duration_sec = attempt["duration_minutes"] * 60
-    now = datetime.now(timezone.utc)
-    if (now - started).total_seconds() > duration_sec + 60:
-        # Allow 60s grace period for network latency
-        pass  # Still score, but note it was late
-
-    # Fetch all answers
-    answers_resp = (
-        supabase_client.table("assessment_answers")
-        .select("id, question_id, selected_option")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
-    answers = answers_resp.data or []
-
-    if not answers:
-        raise HTTPException(status_code=400, detail="No answers to submit")
-
-    # Fetch correct answers
-    question_ids = [a["question_id"] for a in answers]
-    questions_resp = (
-        supabase_client.table("mcq_questions")
-        .select("id, correct_option")
-        .in_("id", question_ids)
-        .execute()
-    )
-    correct_map = {q["id"]: q["correct_option"] for q in (questions_resp.data or [])}
-
-    # Score each answer
-    score = 0
-    for answer in answers:
-        is_correct = answer["selected_option"] == correct_map.get(answer["question_id"])
-        if is_correct:
-            score += 1
-
-        supabase_client.table("assessment_answers").update({
-            "is_correct": is_correct,
-        }).eq("id", answer["id"]).execute()
-
-    # Update attempt
-    supabase_client.table("assessment_attempts").update({
-        "status": "scored",
-        "submitted_at": now.isoformat(),
-        "score": score,
-        "max_score": len(answers),
-    }).eq("id", attempt_id).execute()
+    _score_attempt(attempt_id)
 
     return {
+        "status": "submitted",
         "attempt_id": attempt_id,
-        "score": score,
-        "max_score": len(answers),
         "total_questions": attempt["total_questions"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Get results
-# ---------------------------------------------------------------------------
-
-@router.get("/attempt/{attempt_id}/results")
-def get_results(
-    attempt_id: str,
-    current_user: AuthUser = Depends(get_current_user),
-):
-    """Get the results for a scored attempt."""
-    attempt_resp = (
-        supabase_client.table("assessment_attempts")
-        .select("*")
-        .eq("id", attempt_id)
-        .execute()
-    )
-
-    if not attempt_resp.data:
-        raise HTTPException(status_code=404, detail="Attempt not found")
-
-    attempt = attempt_resp.data[0]
-
-    if attempt["profile_id"] != current_user.id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if attempt["status"] != "scored":
-        raise HTTPException(status_code=400, detail="Attempt not yet scored")
-
-    # Fetch answers with correctness
-    answers_resp = (
-        supabase_client.table("assessment_answers")
-        .select("question_id, selected_option, is_correct")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
-
-    # Fetch questions for display
-    question_ids = attempt["selected_question_ids"]
-    questions_resp = (
-        supabase_client.table("mcq_questions")
-        .select("id, domain_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation")
-        .in_("id", question_ids)
-        .execute()
-    )
-    q_map = {q["id"]: q for q in (questions_resp.data or [])}
-
-    # Fetch domain names
-    domains_resp = (
-        supabase_client.table("domains")
-        .select("id, name")
-        .in_("id", attempt["domain_ids"])
-        .execute()
-    )
-    domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
-
-    # Build answer details
-    answers_map = {a["question_id"]: a for a in (answers_resp.data or [])}
-
-    questions_with_answers = []
-    for qid in question_ids:
-        q = q_map.get(qid, {})
-        a = answers_map.get(qid, {})
-        questions_with_answers.append({
-            "question_text": q.get("question_text", ""),
-            "option_a": q.get("option_a", ""),
-            "option_b": q.get("option_b", ""),
-            "option_c": q.get("option_c", ""),
-            "option_d": q.get("option_d", ""),
-            "correct_option": q.get("correct_option", ""),
-            "explanation": q.get("explanation"),
-            "selected_option": a.get("selected_option"),
-            "is_correct": a.get("is_correct", False),
-            "domainName": domain_map.get(q.get("domain_id"), ""),
-        })
-
-    return {
-        "attempt_id": attempt_id,
-        "score": attempt["score"],
-        "max_score": attempt["max_score"],
-        "total_questions": attempt["total_questions"],
-        "submitted_at": attempt["submitted_at"],
-        "questions": questions_with_answers,
     }

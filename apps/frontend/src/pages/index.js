@@ -5,4 +5,6 @@ export { default as Signup } from './Signup';
 export { default as Dashboard } from './Dashboard';
 export { default as MCQTest } from './MCQTest';
 export { default as Results } from './Results';
+export { default as SubmissionConfirmed } from './SubmissionConfirmed';
 export { default as AdminPanel } from './AdminPanel';
+export { default as AdminResults } from './AdminResults';

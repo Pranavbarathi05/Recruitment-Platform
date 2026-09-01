@@ -32,6 +32,12 @@ const AdminPanel = () => {
   const [mcqs, setMcqs] = useState([]);
   const [semesterFilter, setSemesterFilter] = useState(null); // null = all
 
+  // Assessment config state
+  const [configs, setConfigs] = useState([]);
+  const [editingConfig, setEditingConfig] = useState(null);
+  const [configForm, setConfigForm] = useState({});
+  const [configError, setConfigError] = useState('');
+
   // Domain form state
   const [showDomainForm, setShowDomainForm] = useState(false);
   const [editingDomain, setEditingDomain] = useState(null);
@@ -45,6 +51,16 @@ const AdminPanel = () => {
     correct_option: 'A', explanation: '', is_active: true, semester: 1,
   });
 
+  // Assessment Responses state
+  const [submissions, setSubmissions] = useState([]);
+  const [submissionsLoading, setSubmissionsLoading] = useState(false);
+  const [subSearch, setSubSearch] = useState('');
+  const [subSort, setSubSort] = useState('score');
+  const [subOrder, setSubOrder] = useState('desc');
+  const [subSemester, setSubSemester] = useState(null);
+  const [subBranch, setSubBranch] = useState('');
+
+
   const [message, setMessage] = useState('');
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -55,6 +71,108 @@ const AdminPanel = () => {
       : null,
     [session?.access_token],
   );
+
+  // Fetch assessment configs
+  const fetchConfigs = useCallback(async () => {
+    if (!authHeaders) return;
+    try {
+      const resp = await fetch(`${apiUrl}/admin/config`, { headers: authHeaders });
+      if (resp.ok) {
+        const data = await resp.json();
+        setConfigs(Array.isArray(data) ? data : []);
+      } else {
+        console.error('Failed to fetch configs:', resp.status, resp.statusText);
+        setConfigs([]);
+      }
+    } catch (err) {
+      console.error('Error fetching configs:', err);
+      setConfigs([]);
+    }
+  }, [apiUrl, authHeaders]);
+
+  useEffect(() => {
+    if (isAdmin) fetchConfigs();
+  }, [isAdmin, fetchConfigs]);
+
+  // Fetch submissions list
+  const fetchSubmissions = useCallback(async () => {
+    if (!authHeaders) return;
+    try {
+      setSubmissionsLoading(true);
+      const params = new URLSearchParams();
+      if (subSort) params.set('sort', subSort);
+      if (subOrder) params.set('order', subOrder);
+      if (subSemester) params.set('semester', subSemester);
+      if (subBranch) params.set('branch', subBranch);
+
+      if (subSearch) params.set('search', subSearch);
+
+      const resp = await fetch(`${apiUrl}/admin/assessments/submissions?${params}`, { headers: authHeaders });
+      if (resp.ok) {
+        const data = await resp.json();
+        setSubmissions(Array.isArray(data) ? data : []);
+      } else {
+        console.error('Failed to fetch submissions:', resp.status);
+        setSubmissions([]);
+      }
+    } catch (err) {
+      console.error('Error fetching submissions:', err);
+      setSubmissions([]);
+    } finally {
+      setSubmissionsLoading(false);
+    }
+  }, [apiUrl, authHeaders, subSort, subOrder, subSemester, subBranch, subSearch]);
+
+  useEffect(() => {
+    if (isAdmin) fetchSubmissions();
+  }, [isAdmin, fetchSubmissions]);
+
+  // Config CRUD
+  const handleConfigSubmit = async (e) => {
+    e.preventDefault();
+    setMessage('');
+    setConfigError('');
+
+    // Client-side validation before sending to backend
+    const tq = configForm.total_questions;
+    const md = configForm.max_domains;
+
+    if (tq !== undefined && tq !== null && tq < 1) {
+      setConfigError('Total questions must be at least 1.');
+      return;
+    }
+    if (md !== undefined && md !== null && (md < 1 || md > 2)) {
+      setConfigError('Maximum domains must be 1 or 2.');
+      return;
+    }
+    if (md === 2 && tq !== undefined && tq !== null && tq % 2 !== 0) {
+      setConfigError('Total questions must be even when using 2 domains.');
+      return;
+    }
+
+    try {
+      // Filter out undefined values so we only send changed fields
+      const payload = Object.fromEntries(
+        Object.entries(configForm).filter(([, v]) => v !== undefined && v !== null)
+      );
+      const resp = await fetch(`${apiUrl}/admin/config/${editingConfig.id}`, {
+        method: 'PUT',
+        headers: authHeaders,
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail);
+      }
+      setMessage('Configuration updated');
+      setEditingConfig(null);
+      setConfigForm({});
+      setConfigError('');
+      fetchConfigs();
+    } catch (err) {
+      setMessage(`Error: ${err.message}`);
+    }
+  };
 
   // Check admin status on mount and whenever session changes
   useEffect(() => {
@@ -94,14 +212,14 @@ const AdminPanel = () => {
 
   // Fetch domains
   const fetchDomains = useCallback(async () => {
+    if (!authHeaders) return;
     try {
       const resp = await fetch(`${apiUrl}/admin/domains`, { headers: authHeaders });
       if (resp.ok) setDomains(await resp.json());
     } catch (err) {
       console.error(err);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiUrl, session]);
+  }, [apiUrl, authHeaders]);
 
   useEffect(() => {
     if (isAdmin) fetchDomains();
@@ -109,6 +227,7 @@ const AdminPanel = () => {
 
   // Fetch MCQs for a domain, with optional semester filter
   const fetchMcqs = useCallback(async (domainId, sem) => {
+    if (!authHeaders) return;
     try {
       let url = `${apiUrl}/admin/domains/${domainId}/mcqs`;
       if (sem !== null && sem !== undefined) {
@@ -119,8 +238,7 @@ const AdminPanel = () => {
     } catch (err) {
       console.error(err);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiUrl, session]);
+  }, [apiUrl, authHeaders]);
 
   // Re-fetch MCQs when semester filter changes
   useEffect(() => {
@@ -310,6 +428,107 @@ const AdminPanel = () => {
                 <p className="text-theme-muted text-center py-8">No domains yet. Create one to get started.</p>
               )}
             </div>
+
+            {/* Assessment Configuration */}
+            <div className="mt-8">
+              <h2 className="text-xl font-bold text-theme-primary mb-4">Assessment Configuration</h2>
+              {configs.map((cfg) => (
+                <div key={cfg.id} className="bg-theme-secondary rounded-lg p-4 mb-3">
+                  {editingConfig?.id === cfg.id ? (
+                    <form onSubmit={handleConfigSubmit} className="space-y-3">
+                      <input
+                        placeholder="Name"
+                        value={configForm.name ?? ''}
+                        onChange={(e) => setConfigForm({ ...configForm, name: e.target.value })}
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                      />
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="text-xs text-theme-muted mb-1 block">Total Questions</label>
+                          <input
+                            type="number"
+                            min="1"
+                            value={configForm.total_questions ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
+                              setConfigForm({ ...configForm, total_questions: val });
+                            }}
+                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-theme-muted mb-1 block">Duration (minutes)</label>
+                          <input
+                            type="number"
+                            min="1"
+                            value={configForm.duration_minutes ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
+                              setConfigForm({ ...configForm, duration_minutes: val });
+                            }}
+                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-theme-muted mb-1 block">Max Domains (1 or 2)</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="2"
+                            value={configForm.max_domains ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
+                              setConfigForm({ ...configForm, max_domains: val });
+                            }}
+                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                            required
+                          />
+                        </div>
+                      </div>
+                      {configError && (
+                        <p className="text-xs text-red-400 bg-red-900/20 border border-red-500/50 rounded px-3 py-2">
+                          {configError}
+                        </p>
+                      )}
+                      <div className="flex gap-2">
+                        <button type="submit" className="flex-1 px-3 py-2 bg-green-600 hover:bg-green-700 text-white rounded text-sm">Save</button>
+                        <button type="button" onClick={() => { setEditingConfig(null); setConfigForm({}); setConfigError(''); }} className="px-3 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm">Cancel</button>
+                      </div>
+                    </form>
+                  ) : (
+                    <>
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <h3 className="font-semibold text-theme-primary">{cfg.name}</h3>
+                          <span className={`text-xs px-2 py-0.5 rounded ${cfg.is_active ? 'bg-green-900/50 text-green-300' : 'bg-red-900/50 text-red-300'}`}>
+                            {cfg.is_active ? 'Active' : 'Inactive'}
+                          </span>
+                        </div>
+                        <button
+                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
+                          className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
+                        >
+                          Edit
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 mt-3 text-xs text-theme-muted">
+                        <span>Questions: {cfg.total_questions}</span>
+                        <span>Duration: {cfg.duration_minutes}m</span>
+                        <span>Max Domains: {cfg.max_domains}</span>
+                      </div>
+                      <p className="text-xs text-theme-muted mt-1">
+                        2 domains → 50/50 split (total must be even)
+                      </p>
+                    </>
+                  )}
+                </div>
+              ))}
+              {configs.length === 0 && (
+                <p className="text-theme-muted text-sm">No assessment configurations found.</p>
+              )}
+            </div>
           </div>
 
           {/* MCQs for selected domain */}
@@ -475,6 +694,177 @@ const AdminPanel = () => {
               </div>
             )}
           </div>
+        </div>
+
+        {/* Assessment Responses / Leaderboard */}
+        <div className="mt-12">
+          <h2 className="text-2xl font-bold text-theme-primary mb-6">Assessment Responses</h2>
+
+          {/* Filters */}
+          <div className="bg-theme-secondary rounded-lg p-4 mb-4">
+            <div className="flex flex-wrap gap-3 items-end">
+              {/* Search */}
+              <div className="flex-1 min-w-[200px]">
+                <label className="text-xs text-theme-muted block mb-1">Search</label>
+                <input
+                  type="text"
+                  placeholder="Name, email, or USN..."
+                  value={subSearch}
+                  onChange={(e) => setSubSearch(e.target.value)}
+                  className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                />
+              </div>
+
+              {/* Semester filter */}
+              <div>
+                <label className="text-xs text-theme-muted block mb-1">Semester</label>
+                <select
+                  value={subSemester || ''}
+                  onChange={(e) => setSubSemester(e.target.value ? parseInt(e.target.value) : null)}
+                  className="px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                >
+                  <option value="">All</option>
+                  {SEMESTERS.map((s) => (
+                    <option key={s.value} value={s.value}>{s.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Branch filter */}
+              <div>
+                <label className="text-xs text-theme-muted block mb-1">Branch</label>
+                <input
+                  type="text"
+                  placeholder="Branch..."
+                  value={subBranch}
+                  onChange={(e) => setSubBranch(e.target.value)}
+                  className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                />
+              </div>
+
+              {/* Sort */}
+              <div>
+                <label className="text-xs text-theme-muted block mb-1">Sort by</label>
+                <select
+                  value={`${subSort}-${subOrder}`}
+                  onChange={(e) => {
+                    const [s, o] = e.target.value.split('-');
+                    setSubSort(s);
+                    setSubOrder(o);
+                  }}
+                  className="px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                >
+                  <option value="score-desc">Score: Highest First</option>
+                  <option value="score-asc">Score: Lowest First</option>
+                  <option value="percentage-desc">Percentage: Highest First</option>
+                  <option value="percentage-asc">Percentage: Lowest First</option>
+                  <option value="submitted_at-desc">Submitted: Newest First</option>
+                  <option value="submitted_at-asc">Submitted: Oldest First</option>
+                  <option value="name-asc">Name: A → Z</option>
+                  <option value="name-desc">Name: Z → A</option>
+                </select>
+              </div>
+
+              {/* Clear filters */}
+              <button
+                onClick={() => {
+                  setSubSearch('');
+                  setSubSemester(null);
+                  setSubBranch('');
+                  setSubSort('score');
+                  setSubOrder('desc');
+                }}
+                className="px-3 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm"
+              >
+                Clear Filters
+              </button>
+            </div>
+          </div>
+
+          {/* Submissions table */}
+          {submissionsLoading ? (
+            <div className="text-center py-12">
+              <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mx-auto" />
+              <p className="text-theme-muted mt-4">Loading submissions...</p>
+            </div>
+          ) : submissions.length === 0 ? (
+            <div className="text-center py-12 bg-theme-secondary rounded-lg">
+              <p className="text-theme-muted text-lg">No submitted assessments found.</p>
+              <p className="text-theme-muted text-sm mt-2">Submissions will appear here once candidates complete their assessments.</p>
+            </div>
+          ) : (
+            <div className="bg-theme-secondary rounded-lg overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-theme-tertiary">
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">Rank</th>
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">Candidate</th>
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">USN</th>
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">Domain</th>
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">Score</th>
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">%</th>
+                      <th className="px-4 py-3 text-left text-theme-muted font-medium">Submitted</th>
+                      <th className="px-4 py-3 text-right text-theme-muted font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {submissions.map((sub, idx) => (
+                      <tr key={sub.attempt_id} className="border-t border-theme-secondary hover:bg-theme-tertiary/50">
+                        <td className="px-4 py-3 text-theme-primary font-bold">
+                          {idx + 1}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="text-theme-primary font-medium">{sub.candidate_name}</div>
+                          <div className="text-theme-muted text-xs">{sub.email}</div>
+                        </td>
+                        <td className="px-4 py-3 text-theme-primary font-mono text-xs">{sub.usn}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap gap-1">
+                            {(sub.domain_names || []).map((d) => (
+                              <span key={d} className="text-xs bg-blue-900/50 text-blue-300 px-2 py-0.5 rounded">
+                                {d}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="font-bold text-theme-primary">
+                            {sub.score}/{sub.max_score}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`font-bold ${
+                            sub.percentage >= 80 ? 'text-green-400' :
+                            sub.percentage >= 50 ? 'text-yellow-400' : 'text-red-400'
+                          }`}>
+                            {sub.percentage}%
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-theme-muted text-xs">
+                          {sub.submitted_at ? new Date(sub.submitted_at).toLocaleString('en-US', {
+                            month: 'short', day: 'numeric',
+                            hour: '2-digit', minute: '2-digit',
+                          }) : '—'}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            onClick={() => navigate(`/admin/assessments/${sub.attempt_id}/results`)}
+                            className="text-xs px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded"
+                          >
+                            View Responses
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="px-4 py-3 text-xs text-theme-muted border-t border-theme-secondary">
+                Showing {submissions.length} submission{submissions.length !== 1 ? 's' : ''}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

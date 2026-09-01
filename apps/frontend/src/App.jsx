@@ -3,7 +3,7 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import { Navbar } from './components';
 import ProtectedRoute from './components/ProtectedRoute';
-import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, AdminPanel } from './pages';
+import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, SubmissionConfirmed, AdminPanel, AdminResults } from './pages';
 
 /**
  * Main App Component
@@ -63,6 +63,14 @@ function App() {
                 }
               />
               <Route
+                path="/assessment/:attemptId/submitted"
+                element={
+                  <ProtectedRoute>
+                    <SubmissionConfirmed />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
                 path="/assessment/:attemptId/results"
                 element={
                   <ProtectedRoute>
@@ -75,6 +83,14 @@ function App() {
                 element={
                   <ProtectedRoute>
                     <AdminPanel />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/admin/assessments/:attemptId/results"
+                element={
+                  <ProtectedRoute>
+                    <AdminResults />
                   </ProtectedRoute>
                 }
               />

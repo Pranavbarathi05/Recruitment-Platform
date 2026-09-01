@@ -51,16 +51,10 @@ const MCQTest = () => {
         setAnswers(data.answers || {});
         setAttemptData(data);
 
-        // Calculate time remaining
-        const attemptResp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}`, {
-          headers: authHeaders,
-        });
-        if (attemptResp.ok) {
-          const attempt = await attemptResp.json();
-          const startTime = new Date(attempt.started_at).getTime();
-          const durationMs = attempt.duration_minutes * 60 * 1000;
-          const now = Date.now();
-          const remaining = Math.max(0, Math.floor((startTime + durationMs - now) / 1000));
+        // Use expires_at from the backend response for server-authoritative timing
+        if (data.expires_at) {
+          const expiresMs = new Date(data.expires_at).getTime();
+          const remaining = Math.max(0, Math.floor((expiresMs - Date.now()) / 1000));
           setTimeRemaining(remaining);
         }
       } catch (err) {
@@ -127,11 +121,11 @@ const MCQTest = () => {
         throw new Error(errData.detail || 'Failed to submit');
       }
 
-      navigate(`/assessment/${attemptId}/results`);
+      navigate(`/assessment/${attemptId}/submitted`);
     } catch (err) {
       if (timeExpired) {
         alert('Time expired. Your answers have been auto-submitted.');
-        navigate(`/assessment/${attemptId}/results`);
+        navigate(`/assessment/${attemptId}/submitted`);
       } else {
         setError(err.message);
       }
