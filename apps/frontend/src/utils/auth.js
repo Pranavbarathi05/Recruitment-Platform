@@ -2,16 +2,16 @@
  * Test timer utilities
  *
  * These helpers manage test timer state in localStorage.
- * They use the Supabase user ID (passed as a parameter) to namespace keys.
+ * They use the user ID (passed as a parameter) to namespace keys.
  *
- * Authentication is handled entirely by Supabase Auth via AuthContext.
+ * Authentication is handled entirely by the FastAPI backend via AuthContext.
  * This file does NOT manage authentication state.
  */
 
 /**
  * Check if a test has been started for a given user.
  * @param {string} testId - The domain/test identifier
- * @param {string} userId - The Supabase user ID
+ * @param {string} userId - The user ID
  */
 export const hasStartedTest = (testId, userId) => {
   if (!userId) return false;
@@ -22,7 +22,7 @@ export const hasStartedTest = (testId, userId) => {
 /**
  * Check if a test has expired for a given user.
  * @param {string} testId - The domain/test identifier
- * @param {string} userId - The Supabase user ID
+ * @param {string} userId - The user ID
  */
 export const isTestExpired = (testId, userId) => {
   if (!userId) return false;
@@ -33,7 +33,7 @@ export const isTestExpired = (testId, userId) => {
 /**
  * Get the status of a test for a given user.
  * @param {string} testId - The domain/test identifier
- * @param {string} userId - The Supabase user ID
+ * @param {string} userId - The user ID
  * @returns {'expired' | 'in_progress' | 'available'} Test status
  */
 export const getTestStatus = (testId, userId) => {

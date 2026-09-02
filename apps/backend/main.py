@@ -11,6 +11,7 @@ from routers import admin
 from routers import assessment
 from routers import coding
 from routers import coding_admin
+from routers import auth
 
 app = FastAPI(
     title="DSC Recruitment Platform API",
@@ -31,6 +32,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(auth.router)
 app.include_router(submission.router)
 app.include_router(domains.router, tags=["Domains"])
 app.include_router(admin.router)

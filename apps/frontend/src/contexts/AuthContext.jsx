@@ -1,5 +1,5 @@
-import { createContext, useState, useEffect } from 'react';
-import { supabase } from '../lib/supabase';
+import { createContext, useState, useEffect, useCallback } from 'react';
+import { authSignup, authLogin, authLogout, authGetMe, getStoredAccessToken } from '../lib/api';
 
 // eslint-disable-next-line react-refresh/only-export-components
 export const AuthContext = createContext(null);
@@ -9,77 +9,81 @@ export function AuthProvider({ children }) {
   const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  /**
+   * On mount: check for an existing stored access token and validate it
+   * by calling the backend /auth/me endpoint.
+   *
+   * This replaces the previous supabase.auth.getSession() call.
+   */
   useEffect(() => {
-    // Check for existing session on mount
-    supabase.auth.getSession().then(({ data: { session: currentSession } }) => {
-      setSession(currentSession);
-      setUser(currentSession?.user ?? null);
-      setLoading(false);
-    });
-
-    // Listen for auth state changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, currentSession) => {
-        setSession(currentSession);
-        setUser(currentSession?.user ?? null);
+    const restoreSession = async () => {
+      const token = getStoredAccessToken();
+      if (!token) {
+        setLoading(false);
+        return;
       }
-    );
 
-    return () => subscription.unsubscribe();
+      try {
+        const me = await authGetMe();
+        setUser({ id: me.id, email: me.email });
+        setSession({ access_token: token });
+      } catch {
+        // Token invalid/expired — cleared by apiRequest on 401
+        setUser(null);
+        setSession(null);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    restoreSession();
   }, []);
 
   /**
    * Sign up a new candidate.
    *
-   * All candidate data is passed as Supabase Auth user metadata.
-   * The database trigger (handle_new_user) creates both profile and
-   * candidate rows atomically — no frontend database insert needed.
+   * All candidate data is passed to the backend, which forwards it to
+   * Supabase Auth as user metadata. The database trigger (handle_new_user)
+   * creates both profile and candidate rows atomically.
    */
-  const signUp = async ({ email, password, fullName, usn, semester, branch }) => {
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: {
-          full_name: fullName,
-          usn,
-          semester: parseInt(semester, 10),
-          branch,
-        },
-      },
-    });
+  const signUp = useCallback(async ({ email, password, fullName, usn, semester, branch }) => {
+    const data = await authSignup({ email, password, fullName, usn, semester, branch });
 
-    if (error) throw error;
+    if (data.needsConfirmation) {
+      return { needsConfirmation: true, user: data.user };
+    }
 
-    // If email confirmation is required, data.session will be null.
-    // The profile + candidate are created by the trigger when the user
-    // confirms their email and the auth.users row is finalized.
-    const needsConfirmation = data.user && !data.session;
+    // Session was returned — user is signed in
+    if (data.session?.access_token) {
+      setUser(data.user);
+      setSession({ access_token: data.session.access_token });
+    }
 
-    return { needsConfirmation, user: data.user };
-  };
+    return { needsConfirmation: false, user: data.user };
+  }, []);
 
   /**
    * Sign in with email and password.
-   * No frontend database operations — just Supabase auth.
    */
-  const signIn = async ({ email, password }) => {
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
+  const signIn = useCallback(async ({ email, password }) => {
+    const data = await authLogin({ email, password });
 
-    if (error) throw error;
+    if (data.session?.access_token) {
+      setUser(data.user);
+      setSession({ access_token: data.session.access_token });
+    }
+
     return data;
-  };
+  }, []);
 
   /**
-   * Sign out. Clears the Supabase session.
+   * Sign out. Clears local tokens and notifies the backend.
    */
-  const signOut = async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) throw error;
-  };
+  const signOut = useCallback(async () => {
+    await authLogout();
+    setUser(null);
+    setSession(null);
+  }, []);
 
   const value = {
     user,

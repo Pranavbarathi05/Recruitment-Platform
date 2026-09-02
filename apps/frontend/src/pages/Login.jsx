@@ -8,7 +8,7 @@ import { useAuth } from '../hooks/useAuth';
 /**
  * Login Page
  *
- * Uses Supabase Auth for email/password sign-in.
+ * Uses the FastAPI backend for email/password sign-in.
  * Handles invalid credentials, unverified email, and network errors.
  */
 const Login = () => {

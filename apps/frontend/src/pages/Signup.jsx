@@ -8,7 +8,7 @@ import { useAuth } from '../hooks/useAuth';
 /**
  * Signup Page
  *
- * Creates a Supabase Auth account and candidate profile.
+ * Creates an account via the FastAPI backend (which proxies to Supabase Auth).
  * Handles email confirmation flow and duplicate emails.
  */
 const Signup = () => {
