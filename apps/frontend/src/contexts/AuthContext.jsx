@@ -119,12 +119,27 @@ export function AuthProvider({ children }) {
     setUser(null);
   }, []);
 
+  /**
+   * Get headers for authenticated API requests.
+   * Cookie-based auth — browser sends session cookie automatically.
+   * Includes CSRF token from cookie for state-changing requests.
+   */
+  const getAuthHeaders = useCallback(() => {
+    const headers = { 'Content-Type': 'application/json' };
+    const match = document.cookie.match(/dsc_csrf=([^;]+)/);
+    if (match) {
+      headers['X-CSRF-Token'] = match[1];
+    }
+    return headers;
+  }, []);
+
   const value = {
     user,
     loading,
     signUp,
     signIn,
     signOut,
+    getAuthHeaders,
     isAuthenticated: !!user,
   };
 

@@ -16,6 +16,9 @@ Tests verify:
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 import pytest
@@ -3217,3 +3220,157 @@ class TestAuthEndpoints:
         data = response.json()
         assert "csrf_token" in data
         assert "dsc_csrf" in response.cookies
+
+
+# =====================================================================
+# ASSESSMENT DELETE / BULK OPERATIONS TESTS
+# =====================================================================
+
+
+class TestAssessmentDeleteAndBulk:
+    """Tests for individual delete, reset-all, and delete-all endpoints.
+
+    Uses app.dependency_overrides to bypass require_admin.
+    """
+
+    def _mock_admin(self, admin_id="admin-user-id", email="admin@test.com"):
+        """Return a mock admin AuthUser-compatible object."""
+        admin = MagicMock()
+        admin.id = admin_id
+        admin.email = email
+        return admin
+
+    def _set_admin_override(self, app_instance):
+        """Override require_admin with a mock admin user."""
+        from core.auth import require_admin
+        app_instance.dependency_overrides[require_admin] = lambda: self._mock_admin()
+
+    def _set_non_admin_override(self, app_instance):
+        """Override require_admin to raise 403."""
+        from core.auth import require_admin
+        app_instance.dependency_overrides[require_admin] = lambda: (_ for _ in ()).throw(HTTPException(status_code=403, detail="Admin access required"))
+
+    def test_individual_delete_requires_auth(self, client):
+        """DELETE /admin/assessments/{id} requires authentication."""
+        response = client.delete(f"/admin/assessments/{MOCK_ATTEMPT_ID}")
+        assert response.status_code == 401
+
+    def test_individual_delete_requires_admin(self, client, mock_supabase):
+        """DELETE /admin/assessments/{id} requires admin role."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: (_ for _ in ()).throw(HTTPException(status_code=403, detail="Admin access required"))
+        response = client.delete(f"/admin/assessments/{MOCK_ATTEMPT_ID}")
+        assert response.status_code == 403
+        app.dependency_overrides.clear()
+
+    def test_individual_delete_success(self, client, mock_supabase):
+        """DELETE /admin/assessments/{id} deletes the attempt."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: self._mock_admin()
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_ATTEMPT_ID, "profile_id": MOCK_PROFILE_ID}])
+        )
+        mock_supabase.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        response = client.delete(f"/admin/assessments/{MOCK_ATTEMPT_ID}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "deleted"
+        assert data["attempt_id"] == MOCK_ATTEMPT_ID
+        app.dependency_overrides.clear()
+
+    def test_individual_delete_not_found(self, client, mock_supabase):
+        """DELETE /admin/assessments/{id} returns 404 for nonexistent attempt."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: self._mock_admin()
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        response = client.delete(f"/admin/assessments/{MOCK_ATTEMPT_ID}")
+        assert response.status_code == 404
+        app.dependency_overrides.clear()
+
+    def test_reset_all_requires_auth(self, client):
+        """POST /admin/assessments/reset-all requires authentication."""
+        response = client.post("/admin/assessments/reset-all")
+        assert response.status_code == 401
+
+    def test_reset_all_requires_admin(self, client, mock_supabase):
+        """POST /admin/assessments/reset-all requires admin role."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: (_ for _ in ()).throw(HTTPException(status_code=403, detail="Admin access required"))
+        response = client.post("/admin/assessments/reset-all")
+        assert response.status_code == 403
+        app.dependency_overrides.clear()
+
+    def test_reset_all_success(self, client, mock_supabase):
+        """POST /admin/assessments/reset-all resets all attempts."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: self._mock_admin()
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        mock_supabase.table.return_value.update.return_value.neq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        mock_supabase.table.return_value.select.return_value.execute.return_value = (
+            _make_mock_response([{"id": "a1"}, {"id": "a2"}, {"id": "a3"}])
+        )
+        response = client.post("/admin/assessments/reset-all")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "reset_all"
+        assert data["reset_count"] == 3
+        app.dependency_overrides.clear()
+
+    def test_delete_all_requires_auth(self, client):
+        """DELETE /admin/assessments/all requires authentication."""
+        response = client.delete("/admin/assessments/all")
+        assert response.status_code == 401
+
+    def test_delete_all_requires_admin(self, client, mock_supabase):
+        """DELETE /admin/assessments/all requires admin role."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: (_ for _ in ()).throw(HTTPException(status_code=403, detail="Admin access required"))
+        response = client.delete("/admin/assessments/all")
+        assert response.status_code == 403
+        app.dependency_overrides.clear()
+
+    def test_delete_all_success(self, client, mock_supabase):
+        """DELETE /admin/assessments/all deletes all attempts."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: self._mock_admin()
+        mock_supabase.table.return_value.select.return_value.execute.return_value = (
+            _make_mock_response([{"id": "a1"}, {"id": "a2"}])
+        )
+        mock_supabase.table.return_value.delete.return_value.neq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        response = client.delete("/admin/assessments/all")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "deleted_all"
+        assert data["deleted_count"] == 2
+        app.dependency_overrides.clear()
+
+    def test_delete_all_empty(self, client, mock_supabase):
+        """DELETE /admin/assessments/all with no attempts returns 0."""
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: self._mock_admin()
+        mock_supabase.table.return_value.select.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        response = client.delete("/admin/assessments/all")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 0
+        app.dependency_overrides.clear()

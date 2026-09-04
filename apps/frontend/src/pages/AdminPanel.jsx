@@ -64,6 +64,19 @@ const AdminPanel = () => {
   const [resetCandidate, setResetCandidate] = useState(null);
   const [resetLoading, setResetLoading] = useState(false);
 
+  // Delete confirmation state
+  const [deleteCandidate, setDeleteCandidate] = useState(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+
+  // Reset All confirmation state
+  const [showResetAll, setShowResetAll] = useState(false);
+  const [resetAllLoading, setResetAllLoading] = useState(false);
+
+  // Delete All confirmation state
+  const [showDeleteAll, setShowDeleteAll] = useState(false);
+  const [deleteAllLoading, setDeleteAllLoading] = useState(false);
+  const [deleteAllConfirmText, setDeleteAllConfirmText] = useState('');
+
   const [message, setMessage] = useState('');
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -166,6 +179,7 @@ const AdminPanel = () => {
         method: 'PUT',
         headers: getAuthHeaders(),
         body: JSON.stringify(payload),
+        credentials: 'include',
       });
       if (!resp.ok) {
         const err = await resp.json();
@@ -266,6 +280,7 @@ const AdminPanel = () => {
         method: editingDomain ? 'PUT' : 'POST',
         headers: getAuthHeaders(),
         body: JSON.stringify(domainForm),
+        credentials: 'include',
       });
       if (!resp.ok) {
         const err = await resp.json();
@@ -287,6 +302,7 @@ const AdminPanel = () => {
       await fetch(`${apiUrl}/admin/domains/${domain.id}/${action}`, {
         method: 'POST',
         headers: getAuthHeaders(),
+        credentials: 'include',
       });
       fetchDomains();
     } catch (err) {
@@ -306,6 +322,7 @@ const AdminPanel = () => {
         method: editingMcq ? 'PUT' : 'POST',
         headers: getAuthHeaders(),
         body: JSON.stringify(editingMcq ? mcqForm : { ...mcqForm, domain_id: selectedDomain.id }),
+        credentials: 'include',
       });
       if (!resp.ok) {
         const err = await resp.json();
@@ -327,6 +344,7 @@ const AdminPanel = () => {
       await fetch(`${apiUrl}/admin/mcqs/${mcq.id}/${action}`, {
         method: 'POST',
         headers: getAuthHeaders(),
+        credentials: 'include',
       });
       fetchMcqs(selectedDomain.id, semesterFilter);
     } catch (err) {
@@ -358,6 +376,7 @@ const AdminPanel = () => {
       const resp = await fetch(`${apiUrl}/admin/assessments/${resetCandidate.attempt_id}/reset`, {
         method: 'POST',
         headers: getAuthHeaders(),
+        credentials: 'include',
       });
       const data = await resp.json();
       if (!resp.ok) {
@@ -366,13 +385,90 @@ const AdminPanel = () => {
       setMessage(`Assessment reset for ${resetCandidate.candidate_name}. They can now start a new assessment.`);
       setResetCandidate(null);
       fetchSubmissions();
-    } catch (err) {
-      setMessage(`Error: ${err.message}`);
+    } catch (err) {      setMessage(`Error: ${err.message}`);
       setResetCandidate(null);
     } finally {
       setResetLoading(false);
     }
   };
+
+  // Delete individual assessment handler
+  const handleDeleteAssessment = async () => {
+    if (!deleteCandidate || deleteLoading) return;
+    setDeleteLoading(true);
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessments/${deleteCandidate.attempt_id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+        credentials: 'include',
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || 'Delete failed');
+      }
+      setMessage(`Assessment attempt deleted for ${deleteCandidate.candidate_name}.`);
+      setDeleteCandidate(null);
+      fetchSubmissions();
+    } catch (err) {
+      setMessage(`Error: ${err.message}`);
+      setDeleteCandidate(null);
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  // Reset All assessments handler
+  const handleResetAll = async () => {
+    if (resetAllLoading) return;
+    setResetAllLoading(true);
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessments/reset-all`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        credentials: 'include',
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || 'Reset All failed');
+      }
+      setMessage(data.message || `Reset ${data.reset_count} assessments.`);
+      setShowResetAll(false);
+      fetchSubmissions();
+    } catch (err) {
+      setMessage(`Error: ${err.message}`);
+      setShowResetAll(false);
+    } finally {
+      setResetAllLoading(false);
+    }
+  };
+
+  // Delete All assessments handler
+  const handleDeleteAll = async () => {
+    if (deleteAllLoading || deleteAllConfirmText !== 'DELETE ALL') return;
+    setDeleteAllLoading(true);
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessments/all`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+        credentials: 'include',
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || 'Delete All failed');
+      }
+      setMessage(data.message || `Deleted ${data.deleted_count} assessments.`);
+      setShowDeleteAll(false);
+      setDeleteAllConfirmText('');
+      fetchSubmissions();
+    } catch (err) {
+      setMessage(`Error: ${err.message}`);
+      setShowDeleteAll(false);
+      setDeleteAllConfirmText('');
+    } finally {
+      setDeleteAllLoading(false);
+    }
+  };
+
 
   if (loading) {
     return (
@@ -752,7 +848,25 @@ const AdminPanel = () => {
 
         {/* Assessment Responses / Leaderboard */}
         <div className="mt-12">
-          <h2 className="text-2xl font-bold text-theme-primary mb-6">Assessment Responses</h2>
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-2xl font-bold text-theme-primary">Assessment Responses</h2>
+            {submissions.length > 0 && (
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowResetAll(true)}
+                  className="text-sm px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg font-semibold"
+                >
+                  Reset All
+                </button>
+                <button
+                  onClick={() => setShowDeleteAll(true)}
+                  className="text-sm px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold"
+                >
+                  Delete All
+                </button>
+              </div>
+            )}
+          </div>
 
           {/* Filters */}
           <div className="bg-theme-secondary rounded-lg p-4 mb-4">
@@ -910,12 +1024,20 @@ const AdminPanel = () => {
                               View Responses
                             </button>
                             {(sub.status === 'scored' || sub.status === 'submitted') && (
-                              <button
-                                onClick={() => setResetCandidate(sub)}
-                                className="text-xs px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded"
-                              >
-                                Reset
-                              </button>
+                              <>
+                                <button
+                                  onClick={() => setResetCandidate(sub)}
+                                  className="text-xs px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded"
+                                >
+                                  Reset
+                                </button>
+                                <button
+                                  onClick={() => setDeleteCandidate(sub)}
+                                  className="text-xs px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded"
+                                >
+                                  Delete
+                                </button>
+                              </>
                             )}
                           </div>
                         </td>
@@ -959,6 +1081,113 @@ const AdminPanel = () => {
               <button
                 onClick={() => setResetCandidate(null)}
                 disabled={resetLoading}
+                className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deleteCandidate && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-theme-secondary rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
+            <h3 className="text-xl font-bold text-theme-primary mb-4">Delete Assessment</h3>
+            <p className="text-theme-muted mb-2">
+              Are you sure you want to delete the assessment for{' '}
+              <span className="font-semibold text-theme-primary">{deleteCandidate.candidate_name}</span>?
+            </p>
+            <div className="bg-red-900/20 border border-red-500/50 rounded p-3 mb-4">
+              <p className="text-red-300 text-sm font-medium">⚠️ This permanently deletes this candidate's assessment attempt, including its answers, coding submissions, drafts, scores, and results.</p>
+              <p className="text-red-200 text-sm mt-1">This cannot be undone.</p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={handleDeleteAssessment}
+                disabled={deleteLoading}
+                className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold disabled:opacity-50"
+              >
+                {deleteLoading ? 'Deleting...' : 'Confirm Delete'}
+              </button>
+              <button
+                onClick={() => setDeleteCandidate(null)}
+                disabled={deleteLoading}
+                className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Reset All Confirmation Modal */}
+      {showResetAll && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-theme-secondary rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
+            <h3 className="text-xl font-bold text-theme-primary mb-4">Reset All Assessments</h3>
+            <p className="text-theme-muted mb-2">
+              Are you sure you want to reset ALL assessment attempts?
+            </p>
+            <div className="bg-orange-900/20 border border-orange-500/50 rounded p-3 mb-4">
+              <p className="text-orange-300 text-sm font-medium">This will mark all candidate assessment attempts as reset.</p>
+              <p className="text-orange-200 text-sm mt-1">Historical attempts and their data will be preserved. Candidates will be able to start a new assessment.</p>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={handleResetAll}
+                disabled={resetAllLoading}
+                className="flex-1 px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg font-semibold disabled:opacity-50"
+              >
+                {resetAllLoading ? 'Resetting...' : 'Confirm Reset All'}
+              </button>
+              <button
+                onClick={() => setShowResetAll(false)}
+                disabled={resetAllLoading}
+                className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete All Confirmation Modal */}
+      {showDeleteAll && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-theme-secondary rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
+            <h3 className="text-xl font-bold text-theme-primary mb-4">Delete All Assessments</h3>
+            <p className="text-theme-muted mb-2">
+              This permanently deletes ALL candidate assessment attempts and their associated answers, coding submissions, drafts, scores, and results.
+            </p>
+            <div className="bg-red-900/20 border border-red-500/50 rounded p-3 mb-4">
+              <p className="text-red-300 text-sm font-medium">⚠️ This cannot be undone.</p>
+              <p className="text-red-200 text-sm mt-1">Domains, MCQs, coding problems, test cases, and candidate profiles will NOT be affected.</p>
+            </div>
+            <div className="mb-4">
+              <label className="text-sm text-theme-muted block mb-1">Type <span className="font-bold text-theme-primary">DELETE ALL</span> to confirm:</label>
+              <input
+                type="text"
+                value={deleteAllConfirmText}
+                onChange={(e) => setDeleteAllConfirmText(e.target.value)}
+                className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                placeholder="DELETE ALL"
+              />
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={handleDeleteAll}
+                disabled={deleteAllLoading || deleteAllConfirmText !== 'DELETE ALL'}
+                className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold disabled:opacity-50"
+              >
+                {deleteAllLoading ? 'Deleting...' : 'Delete All'}
+              </button>
+              <button
+                onClick={() => { setShowDeleteAll(false); setDeleteAllConfirmText(''); }}
+                disabled={deleteAllLoading}
                 className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
               >
                 Cancel

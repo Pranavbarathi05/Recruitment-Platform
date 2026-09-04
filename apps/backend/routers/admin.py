@@ -738,7 +738,99 @@ def update_config(
 
 
 # ---------------------------------------------------------------------------
-# Assessment reset (admin only)
+# Assessment bulk operations (admin only)
+# ---------------------------------------------------------------------------
+
+@router.post("/assessments/reset-all")
+def reset_all_assessments(admin: AuthUser = Depends(require_admin)):
+    """Reset ALL assessment attempts. Sets status to 'reset' for every attempt.
+
+    Preserves all historical data. Candidates can start new assessments.
+    """
+    try:
+        # Cancel any in_progress attempts first
+        active_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id")
+            .eq("status", "in_progress")
+            .execute()
+        )
+        if active_resp.data:
+            from routers.assessment import _score_attempt
+            for act in active_resp.data:
+                _score_attempt(act["id"])
+
+        # Set all attempts to 'reset'
+        result = (
+            supabase_client.table("assessment_attempts")
+            .update({"status": "reset"})
+            .neq("status", "reset")
+            .execute()
+        )
+
+        # Count all attempts that are now reset
+        count_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id", count="exact")
+            .execute()
+        )
+        total = len(count_resp.data) if count_resp.data else 0
+
+        return {
+            "status": "reset_all",
+            "reset_count": total,
+            "message": f"All {total} assessment attempts have been reset.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/assessments/all")
+def delete_all_assessments(admin: AuthUser = Depends(require_admin)):
+    """Delete ALL assessment attempts and their associated data.
+
+    Uses ON DELETE CASCADE to remove child records:
+    - assessment_answers
+    - coding_submissions
+    - coding_drafts
+
+    Does NOT delete: users, profiles, domains, MCQs, coding problems,
+    coding test cases, assessment configuration.
+    """
+    try:
+        # Count attempts before deletion
+        count_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id", count="exact")
+            .execute()
+        )
+        total = len(count_resp.data) if count_resp.data else 0
+
+        if total == 0:
+            return {
+                "status": "deleted_all",
+                "deleted_count": 0,
+                "message": "No assessment attempts to delete.",
+            }
+
+        # Delete all attempts — CASCADE removes child records
+        supabase_client.table("assessment_attempts").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+
+        return {
+            "status": "deleted_all",
+            "deleted_count": total,
+            "message": f"All {total} assessment attempts and associated data have been deleted.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment individual operations (admin only)
 # ---------------------------------------------------------------------------
 
 @router.post("/assessments/{attempt_id}/reset")
@@ -791,6 +883,45 @@ def reset_assessment(
             "attempt_id": attempt_id,
             "candidate_profile_id": profile_id,
             "message": "Candidate can now start a new assessment. Previous attempt preserved.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/assessments/{attempt_id}")
+def delete_assessment(
+    attempt_id: str,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Delete a specific assessment attempt and all associated data.
+
+    Uses ON DELETE CASCADE to remove child records:
+    - assessment_answers
+    - coding_submissions
+    - coding_drafts
+
+    Does NOT delete: users, profiles, domains, MCQs, coding problems,
+    coding test cases, assessment configuration.
+    """
+    try:
+        attempt_resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id, profile_id")
+            .eq("id", attempt_id)
+            .execute()
+        )
+        if not attempt_resp.data:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        # Delete the attempt — CASCADE removes child records
+        supabase_client.table("assessment_attempts").delete().eq("id", attempt_id).execute()
+
+        return {
+            "status": "deleted",
+            "attempt_id": attempt_id,
+            "message": "Assessment attempt and all associated data have been deleted.",
         }
     except HTTPException:
         raise
