@@ -23,11 +23,16 @@ const CODING_LANGUAGES = [
   { value: 'java', label: 'Java' },
 ];
 
-const getDefaultStarter = (lang) => {
+const getDefaultStarter = (lang, problem) => {
+  // Use problem's per-language starter code if available
+  if (problem?.starter_code?.[lang]) {
+    return problem.starter_code[lang];
+  }
+  // Fallback defaults
   switch (lang) {
-    case 'python3': return '# Write your solution here\n\ndef solve():\n    pass\n';
-    case 'cpp': return '#include <iostream>\nusing namespace std;\n\nint main() {\n    return 0;\n}\n';
-    case 'java': return 'public class Main {\n    public static void main(String[] args) {\n    }\n}\n';
+    case 'python3': return '# Write your solution here\nclass Solution:\n    def solve(self, *args):\n        pass\n';
+    case 'cpp': return 'class Solution {\npublic:\n    // Write your solution here\n};\n';
+    case 'java': return 'class Solution {\n    // Write your solution here\n}\n';
     default: return '';
   }
 };
@@ -35,7 +40,7 @@ const getDefaultStarter = (lang) => {
 const AssessmentWorkspace = () => {
   const { attemptId } = useParams();
   const navigate = useNavigate();
-  const { session } = useAuth();
+  const { getAuthHeaders } = useAuth();
 
   const [activeTab, setActiveTab] = useState('mcq');
 
@@ -65,26 +70,18 @@ const AssessmentWorkspace = () => {
   const autosaveTimerRef = useRef(null);
   const lastSavedRef = useRef({}); // { [problemId]: lastSavedCode }
 
-  // Stable auth — ref avoids re-creating callbacks on every render
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-  const authHeadersRef = useRef(null);
-  useEffect(() => {
-    authHeadersRef.current = session?.access_token
-      ? { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` }
-      : null;
-  }, [session?.access_token]);
 
   // ========== FETCH ATTEMPT DATA ==========
   useEffect(() => {
-    if (!attemptId || !session?.access_token) return;
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` };
+    if (!attemptId) return;
 
     const fetchAll = async () => {
       try {
         setLoading(true);
 
         // Fetch MCQ questions
-        const mcqResp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/questions`, { headers });
+        const mcqResp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/questions`, { credentials: 'include' });
         let mcqData = null;
         if (mcqResp.ok) {
           mcqData = await mcqResp.json();
@@ -100,7 +97,7 @@ const AssessmentWorkspace = () => {
         }
 
         // Fetch coding problems
-        const codingResp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/problems`, { headers });
+        const codingResp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/problems`, { credentials: 'include' });
         if (codingResp.ok) {
           const codingData = await codingResp.json();
           const problems = codingData.problems || [];
@@ -115,7 +112,7 @@ const AssessmentWorkspace = () => {
               states[p.id] = { code: p.draft.source_code, language: p.draft.language || 'python3' };
             } else {
               const defaultLang = p.supported_languages?.[0] || 'python3';
-              states[p.id] = { code: getDefaultStarter(defaultLang), language: defaultLang };
+              states[p.id] = { code: getDefaultStarter(defaultLang, p), language: defaultLang };
             }
             if (p.submission_status) {
               subs[p.id] = { status: p.submission_status };
@@ -139,7 +136,7 @@ const AssessmentWorkspace = () => {
     };
 
     fetchAll();
-  }, [attemptId, session, apiUrl]);
+  }, [attemptId, apiUrl]);
 
   // ========== SHARED TIMER ==========
   useEffect(() => {
@@ -168,12 +165,11 @@ const AssessmentWorkspace = () => {
 
     if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
     autosaveTimerRef.current = setTimeout(async () => {
-      const headers = authHeadersRef.current;
-      if (!headers) return;
+      // Cookie auth — always available
       const lang = codingStates[problem.id]?.language || 'python3';
       try {
         await fetch(`${apiUrl}/coding/attempt/${attemptId}/draft`, {
-          method: 'PUT', headers,
+          method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
           body: JSON.stringify({ problem_id: problem.id, language: lang, source_code: currentCode }),
         });
         lastSavedRef.current[problem.id] = currentCode;
@@ -188,10 +184,9 @@ const AssessmentWorkspace = () => {
     setMcqAnswers((prev) => {
       const next = { ...prev, [questionId]: option };
       // Persist to backend (fire-and-forget, using ref for stable headers)
-      const headers = authHeadersRef.current;
-      if (headers && attemptId) {
+      if (attemptId) {
         fetch(`${apiUrl}/assessment/attempt/${attemptId}/answers`, {
-          method: 'PUT', headers,
+          method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
           body: JSON.stringify({ question_id: questionId, selected_option: option }),
         }).catch(() => {});
       }
@@ -214,9 +209,8 @@ const AssessmentWorkspace = () => {
     setCodingRunning(true);
     setCodingRunResults(null);
     try {
-      const headers = authHeadersRef.current;
       const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/run`, {
-        method: 'POST', headers,
+        method: 'POST', headers: getAuthHeaders(), credentials: 'include',
         body: JSON.stringify({ problem_id: problem.id, language: state.language, source_code: state.code }),
       });
       const result = await resp.json();
@@ -235,9 +229,8 @@ const AssessmentWorkspace = () => {
     const { problem, state } = current;
     setCodingSubmitting(true);
     try {
-      const headers = authHeadersRef.current;
       const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/submit`, {
-        method: 'POST', headers,
+        method: 'POST', headers: getAuthHeaders(), credentials: 'include',
         body: JSON.stringify({ problem_id: problem.id, language: state.language, source_code: state.code }),
       });
       if (resp.ok) {
@@ -255,9 +248,8 @@ const AssessmentWorkspace = () => {
     if (submitting) return;
     setSubmitting(true);
     try {
-      const headers = authHeadersRef.current;
       const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/submit`, {
-        method: 'POST', headers,
+        method: 'POST', headers: getAuthHeaders(), credentials: 'include',
       });
       if (!resp.ok && resp.status !== 409) {
         const err = await resp.json();
@@ -507,6 +499,11 @@ function CodingSection({
             <h2 className="text-xl font-bold text-theme-primary">{problem.title}</h2>
             <span className="text-sm text-theme-muted">{problem.points} pts</span>
           </div>
+          {problem.function_signature && (
+            <div className="mt-1 font-mono text-xs text-blue-400 bg-theme-primary rounded px-2 py-1 inline-block">
+              {problem.function_signature}
+            </div>
+          )}
         </div>
 
         {/* Scrollable problem content */}
@@ -543,10 +540,25 @@ function CodingSection({
                 <h3 className="font-semibold text-theme-primary mb-2">Examples</h3>
                 {problem.test_cases.map((tc, idx) => (
                   <div key={tc.id || idx} className="mb-3 last:mb-0">
-                    <div className="text-xs text-theme-muted mb-1">Sample {idx + 1}</div>
+                    <div className="text-xs text-theme-muted mb-1">Example {idx + 1}</div>
                     <div className="bg-theme-primary rounded p-3 font-mono text-sm">
-                      <div className="mb-2"><span className="text-theme-muted">Input:</span><pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{tc.input}</pre></div>
-                      <div><span className="text-theme-muted">Output:</span><pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{tc.expected_output}</pre></div>
+                      {tc.arguments ? (
+                        <>
+                          <div className="mb-2">
+                            <span className="text-theme-muted">Input:</span>
+                            <pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{JSON.stringify(tc.arguments, null, 2)}</pre>
+                          </div>
+                          <div>
+                            <span className="text-theme-muted">Output:</span>
+                            <pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{JSON.stringify(tc.expected_output)}</pre>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="mb-2"><span className="text-theme-muted">Input:</span><pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{tc.input}</pre></div>
+                          <div><span className="text-theme-muted">Output:</span><pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{tc.expected_output}</pre></div>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}

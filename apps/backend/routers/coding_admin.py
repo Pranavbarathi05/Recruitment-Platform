@@ -3,7 +3,7 @@ from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
 from schemas.coding import (
     CodingProblemCreate, CodingProblemUpdate,
-    CodingTestCaseCreate, CodingTestCaseUpdate,
+    CodingTestCaseCreate, CodingTestCaseUpdate, CodingBulkTestUpload,
     VALID_CODING_LANGUAGES, VALID_DIFFICULTIES,
 )
 
@@ -77,6 +77,9 @@ def create_coding_problem(
             "memory_limit_mb": payload.memory_limit_mb,
             "points": payload.points,
             "is_active": payload.is_active,
+            "function_name": payload.function_name,
+            "class_name": payload.class_name,
+            "function_signature": payload.function_signature,
         }).execute()
 
         return result.data[0] if result.data else {"status": "created"}
@@ -103,6 +106,30 @@ def update_coding_problem(
             raise HTTPException(status_code=400, detail="No fields to update")
 
         result = supabase_client.table("coding_problems").update(updates).eq("id", problem_id).execute()
+        return result.data[0] if result.data else {"status": "updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/tests/{test_id}")
+def update_test_case(
+    test_id: str,
+    payload: CodingTestCaseUpdate,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Update a test case. Admin only."""
+    try:
+        existing = supabase_client.table("coding_test_cases").select("id").eq("id", test_id).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Test case not found")
+
+        updates = payload.model_dump(exclude_unset=True)
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        result = supabase_client.table("coding_test_cases").update(updates).eq("id", test_id).execute()
         return result.data[0] if result.data else {"status": "updated"}
     except HTTPException:
         raise
@@ -218,14 +245,52 @@ def create_test_case(
 
         result = supabase_client.table("coding_test_cases").insert({
             "problem_id": problem_id,
-            "input": payload.input,
+            "arguments": payload.arguments,
             "expected_output": payload.expected_output,
             "is_public": payload.is_public,
             "points": payload.points,
             "ordering": payload.ordering,
+            # Legacy fields
+            "input": payload.input,
+            "expected_output": payload.expected_output,
         }).execute()
 
         return result.data[0] if result.data else {"status": "created"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/problems/{problem_id}/tests/bulk", status_code=201)
+def bulk_upload_test_cases(
+    problem_id: str,
+    payload: CodingBulkTestUpload,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Bulk upload test cases for a coding problem. Admin only."""
+    try:
+        existing = supabase_client.table("coding_problems").select("id").eq("id", problem_id).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Coding problem not found")
+
+        # Validate all test cases first
+        inserted = []
+        for idx, tc in enumerate(payload.test_cases):
+            result = supabase_client.table("coding_test_cases").insert({
+                "problem_id": problem_id,
+                "arguments": tc.arguments,
+                "expected_output": tc.expected_output,
+                "is_public": tc.is_public,
+                "points": tc.points,
+                "ordering": tc.ordering if tc.ordering else idx,
+                "input": tc.input,
+                "expected_output": tc.expected_output,
+            }).execute()
+            if result.data:
+                inserted.append(result.data[0])
+
+        return {"status": "created", "count": len(inserted), "test_cases": inserted}
     except HTTPException:
         raise
     except Exception as e:

@@ -1,6 +1,5 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useAuth } from '../hooks/useAuth';
 
 /**
  * Admin Results Page
@@ -17,7 +16,6 @@ import { useAuth } from '../hooks/useAuth';
 const AdminResults = () => {
   const { attemptId } = useParams();
   const navigate = useNavigate();
-  const { session } = useAuth();
 
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -25,22 +23,17 @@ const AdminResults = () => {
 
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-  const authHeaders = useMemo(
-    () => session?.access_token
-      ? { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` }
-      : null,
-    [session?.access_token],
-  );
+  // Cookie auth
 
   useEffect(() => {
-    if (!attemptId || !authHeaders) return;
+    if (!attemptId) return;
 
     const fetchResults = async () => {
       try {
         setLoading(true);
         setError(null);
         const resp = await fetch(`${apiUrl}/admin/assessments/${attemptId}/results`, {
-          headers: authHeaders,
+          credentials: 'include',
         });
 
         if (resp.status === 401 || resp.status === 403) {
@@ -61,7 +54,7 @@ const AdminResults = () => {
     };
 
     fetchResults();
-  }, [attemptId, apiUrl, authHeaders]);
+  }, [attemptId, apiUrl]);
 
   if (loading) {
     return (

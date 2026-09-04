@@ -19,6 +19,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -1261,98 +1262,209 @@ class TestCodingCandidateFlow:
 
 
 class TestCodeExecutor:
-    """Tests for the code execution service."""
+    """Tests for the code execution service.
 
-    def test_execute_python3_simple(self):
-        """Python3 code can be executed."""
+    All tests mock the compiler service HTTP calls so they don't require
+    a running gateway-api/compiler-1 instance.
+    """
+
+    def _mock_compiler_response(self, status="accepted", tests=None, error=None,
+                                 execution_time_ms=50, total_tests=1, passed_tests=1):
+        """Create a mock compiler service response."""
+        from services.compiler import CompilerResponse
+        if tests is None:
+            tests = [{"passed": True, "actual_output": "42", "expected_output": "42",
+                       "execution_time_ms": 50}]
+        return CompilerResponse(
+            status=status, language="python", execution_time_ms=execution_time_ms,
+            tests=tests, error=error, total_tests=total_tests, passed_tests=passed_tests,
+        )
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_execute_python3_simple(self, mock_exec):
+        """Python3 code execution delegates to compiler service."""
+        mock_exec.return_value = self._mock_compiler_response()
         from services.code_executor import execute_code
         result = execute_code("print(42)", "python3", "")
         assert result.status == "passed"
         assert result.stdout.strip() == "42"
+        mock_exec.assert_called_once()
 
-    def test_execute_python3_with_stdin(self):
-        """Python3 can read stdin."""
-        from services.code_executor import execute_code
-        result = execute_code(
-            "n = int(input()); print(n * 2)",
-            "python3",
-            "5",
+    @patch("services.code_executor.execute_code_sync")
+    def test_execute_python3_with_stdin(self, mock_exec):
+        """Python3 stdin is passed to compiler service."""
+        mock_exec.return_value = self._mock_compiler_response(
+            tests=[{"passed": True, "actual_output": "10", "expected_output": "10",
+                     "execution_time_ms": 30}]
         )
+        from services.code_executor import execute_code
+        result = execute_code("n = int(input()); print(n * 2)", "python3", "5")
         assert result.status == "passed"
         assert result.stdout.strip() == "10"
+        # Verify stdin was passed as test case input
+        call_args = mock_exec.call_args
+        assert call_args[1]["test_cases"][0]["input"] == "5"
 
-    def test_execute_python3_runtime_error(self):
-        """Runtime errors are captured."""
+    @patch("services.code_executor.execute_code_sync")
+    def test_execute_python3_runtime_error(self, mock_exec):
+        """Runtime errors from compiler service are mapped correctly."""
+        mock_exec.return_value = self._mock_compiler_response(
+            status="runtime_error",
+            tests=[{"passed": False, "actual_output": "", "stderr": "ZeroDivisionError",
+                     "execution_time_ms": 10}]
+        )
         from services.code_executor import execute_code
         result = execute_code("1/0", "python3", "")
         assert result.status == "failed"
 
-    def test_execute_python3_timeout(self):
-        """Timeout is enforced."""
-        from services.code_executor import execute_code
-        result = execute_code(
-            "import time; time.sleep(10)",
-            "python3",
-            "",
-            time_limit_ms=500,
+    @patch("services.code_executor.execute_code_sync")
+    def test_execute_python3_timeout(self, mock_exec):
+        """Timeout from compiler service is mapped correctly."""
+        mock_exec.return_value = self._mock_compiler_response(
+            status="time_limit_exceeded",
+            tests=[{"passed": False, "actual_output": "", "execution_time_ms": 500}]
         )
+        from services.code_executor import execute_code
+        result = execute_code("import time; time.sleep(10)", "python3", "", time_limit_ms=500)
         assert result.status == "timeout"
 
+    @patch("services.code_executor.execute_code_sync")
+    def test_execute_compiler_error_handled(self, mock_exec):
+        """Compiler service unavailability is handled gracefully."""
+        from services.compiler import CompilerError
+        mock_exec.side_effect = CompilerError("Compiler service unavailable")
+        from services.code_executor import execute_code
+        result = execute_code("print(42)", "python3", "")
+        assert result.status == "error"
+        assert "Compiler service" in result.stderr
+
     def test_execute_unsupported_language(self):
-        """Unsupported language returns error."""
+        """Unsupported language returns error without calling compiler."""
         from services.code_executor import execute_code
         result = execute_code("hello", "brainfuck", "")
         assert result.status == "error"
+        assert "Unsupported" in result.stderr
 
-    def test_evaluate_submission(self):
-        """Server-side evaluation scores correctly."""
+    @patch("services.code_executor.execute_code_sync")
+    def test_evaluate_submission_all_pass(self, mock_exec):
+        """Server-side evaluation scores correctly when all tests pass."""
+        mock_exec.return_value = self._mock_compiler_response(
+            tests=[
+                {"passed": True, "actual_output": "4", "execution_time_ms": 30},
+                {"passed": True, "actual_output": "9", "execution_time_ms": 40},
+            ],
+            total_tests=2, passed_tests=2, execution_time_ms=40,
+        )
         from services.code_executor import evaluate_submission
         test_cases = [
             {"input": "2", "expected_output": "4", "points": 5},
             {"input": "3", "expected_output": "9", "points": 5},
         ]
-        result = evaluate_submission(
-            "n = int(input()); print(n * n)",
-            "python3",
-            test_cases,
-            time_limit_ms=5000,
-        )
+        result = evaluate_submission("n = int(input()); print(n * n)", "python3", test_cases)
         assert result["tests_passed"] == 2
+        assert result["tests_total"] == 2
         assert result["score"] == 10
         assert result["max_score"] == 10
 
-    def test_evaluate_submission_partial(self):
+    @patch("services.code_executor.execute_code_sync")
+    def test_evaluate_submission_partial(self, mock_exec):
         """Partial scoring works."""
+        mock_exec.return_value = self._mock_compiler_response(
+            tests=[
+                {"passed": False, "actual_output": "3", "execution_time_ms": 20},
+                {"passed": False, "actual_output": "4", "execution_time_ms": 20},
+            ],
+            status="wrong_answer", total_tests=2, passed_tests=0,
+        )
         from services.code_executor import evaluate_submission
         test_cases = [
             {"input": "2", "expected_output": "4", "points": 5},
             {"input": "3", "expected_output": "9", "points": 5},
         ]
-        # This code returns n+1 not n*n — both tests should fail
-        result = evaluate_submission(
-            "n = int(input()); print(n + 1)",
-            "python3",
-            test_cases,
-            time_limit_ms=5000,
-        )
+        result = evaluate_submission("n = int(input()); print(n + 1)", "python3", test_cases)
         assert result["tests_passed"] == 0
         assert result["score"] == 0
         assert result["max_score"] == 10
 
-    def test_run_code_public(self):
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public(self, mock_exec):
         """Public test runner returns structured results."""
+        mock_exec.return_value = self._mock_compiler_response(
+            tests=[{"passed": True, "actual_output": "4", "execution_time_ms": 30}],
+        )
         from services.code_executor import run_code_public
         test_cases = [
             {"id": "tc1", "input": "2", "expected_output": "4", "is_public": True},
         ]
-        result = run_code_public(
-            "n = int(input()); print(n * n)",
-            "python3",
-            test_cases,
-        )
+        result = run_code_public("n = int(input()); print(n * n)", "python3", test_cases)
         assert result["all_passed"] is True
         assert len(result["results"]) == 1
         assert result["results"][0]["passed"] is True
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_compiler_unavailable(self, mock_exec):
+        """Run code handles compiler unavailability gracefully."""
+        from services.compiler import CompilerError
+        mock_exec.side_effect = CompilerError("Compiler service unavailable")
+        from services.code_executor import run_code_public
+        test_cases = [{"id": "tc1", "input": "2", "expected_output": "4", "is_public": True}]
+        result = run_code_public("print(42)", "python3", test_cases)
+        assert result["all_passed"] is False
+        assert "error" in result
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_evaluate_submission_compiler_error(self, mock_exec):
+        """Submission evaluation handles compiler errors gracefully."""
+        from services.compiler import CompilerError
+        mock_exec.side_effect = CompilerError("Compiler service timeout")
+        from services.code_executor import evaluate_submission
+        test_cases = [{"input": "2", "expected_output": "4", "points": 5}]
+        result = evaluate_submission("print(42)", "python3", test_cases)
+        assert result["score"] == 0
+        assert result["tests_passed"] == 0
+        assert len(result["test_results"]) == 1
+        assert result["test_results"][0]["status"] == "error"
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_evaluate_submission_forwards_tracking_ids(self, mock_exec):
+        """attempt_id and problem_id are forwarded to compiler service."""
+        mock_exec.return_value = self._mock_compiler_response()
+        from services.code_executor import evaluate_submission
+        test_cases = [{"input": "2", "expected_output": "4", "points": 5}]
+        evaluate_submission(
+            "print(42)", "python3", test_cases,
+            attempt_id="att-123", problem_id="prob-456",
+        )
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["attempt_id"] == "att-123"
+        assert call_kwargs["problem_id"] == "prob-456"
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_forwards_tracking_ids(self, mock_exec):
+        """attempt_id and problem_id are forwarded to compiler service in run."""
+        mock_exec.return_value = self._mock_compiler_response()
+        from services.code_executor import run_code_public
+        test_cases = [{"id": "tc1", "input": "2", "expected_output": "4", "is_public": True}]
+        run_code_public(
+            "print(42)", "python3", test_cases,
+            attempt_id="att-789", problem_id="prob-101",
+        )
+        call_kwargs = mock_exec.call_args[1]
+        assert call_kwargs["attempt_id"] == "att-789"
+        assert call_kwargs["problem_id"] == "prob-101"
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_no_local_execution(self, mock_exec):
+        """No local subprocess execution occurs — all through compiler service."""
+        mock_exec.return_value = self._mock_compiler_response()
+        from services.code_executor import execute_code
+        # This code would cause issues if run locally in the test process
+        execute_code("import os; os.system('echo PWNED')", "python3", "")
+        # The compiler service should have been called, not local execution
+        mock_exec.assert_called_once()
+        # Verify the code was sent to the compiler, not executed locally
+        call_args = mock_exec.call_args
+        assert "os.system" in call_args[1]["source_code"] or call_args[0][0] == "import os; os.system('echo PWNED')"
 
     def test_assessment_config_has_coding_problem_count(self, client, mock_supabase):
         """assessment_config supports coding_problem_count."""
@@ -1373,96 +1485,129 @@ class TestCodeExecutor:
 
 
 class TestCodeExecutorSecurity:
-    """Security-focused tests for the code execution sandbox."""
+    """Security tests for the code execution integration.
 
-    def test_env_cleaned_no_secrets(self):
-        """Candidate code must not see application secrets."""
+    Security isolation is provided by the external compiler service.
+    These tests verify that dsc_recruit delegates properly and never
+    executes code locally.
+    """
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_no_local_execution(self, mock_exec):
+        """Code must be sent to compiler service, never executed locally."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=50,
+            tests=[{"passed": True, "actual_output": "", "execution_time_ms": 50}],
+        )
+        from services.code_executor import execute_code
+        # This code would be dangerous if executed in the test process
+        execute_code("import os; os.system('rm -rf /')", "python3", "")
+        mock_exec.assert_called_once()
+        # Verify the dangerous code was sent to the compiler service, not run locally
+        call_args = mock_exec.call_args
+        assert call_args[1]["source_code"] == "import os; os.system('rm -rf /')"
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_env_not_leaked_to_compiler(self, mock_exec):
+        """Application environment variables are not passed to compiler service."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=10,
+            tests=[{"passed": True, "actual_output": "", "execution_time_ms": 10}],
+        )
+        from services.code_executor import execute_code
+        execute_code("import os; print(os.environ)", "python3", "")
+        # Verify the compiler service call doesn't include env vars
+        call_kwargs = mock_exec.call_args[1]
+        assert "env" not in call_kwargs or call_kwargs.get("env") is None
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_network_code_sent_to_compiler(self, mock_exec):
+        """Network-accessing code is sent to compiler service (not run locally)."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="runtime_error", language="python", execution_time_ms=100,
+            tests=[{"passed": False, "actual_output": "", "stderr": "NetworkError", "execution_time_ms": 100}],
+        )
         from services.code_executor import execute_code
         result = execute_code(
-            "import os; print('\n'.join(sorted(os.environ.keys())))",
-            "python3", "",
+            "import socket; socket.socket().connect(('8.8.8.8', 53))",
+            "python3", "", time_limit_ms=5000,
         )
-        env_keys = result.stdout.strip().split("\n")
-        # Must NOT contain any of these sensitive keys
-        forbidden = ["SUPABASE", "JWT", "SECRET", "TOKEN", "PASSWORD", "API_KEY", "SERVICE_ROLE"]
-        for key in env_keys:
-            for f in forbidden:
-                assert f not in key.upper(), f"Secret key '{key}' leaked to candidate code!"
+        # Compiler service handles network isolation
+        mock_exec.assert_called_once()
+        assert result.status == "failed"
 
-    def test_env_has_only_safe_keys(self):
-        """Only safe environment variables are passed to candidate code."""
-        from services.code_executor import execute_code
-        result = execute_code(
-            "import os; print('\n'.join(sorted(os.environ.keys())))",
-            "python3", "",
+    @patch("services.code_executor.execute_code_sync")
+    def test_timeout_mapped_from_compiler(self, mock_exec):
+        """Timeout from compiler service is mapped to timeout status."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="time_limit_exceeded", language="python", execution_time_ms=1000,
+            tests=[{"passed": False, "actual_output": "", "execution_time_ms": 1000}],
         )
-        env_keys = set(result.stdout.strip().split("\n"))
-        allowed = {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}
-        # Allow a few extras that may leak through (SHLVL, OLDPWD, etc.)
-        # but no application secrets
-        assert env_keys.issubset(allowed | {"SHLVL", "OLDPWD", "_"}) or len(env_keys - allowed) < 3
-
-    def test_network_blocked(self):
-        """Candidate code must not be able to make network connections."""
         from services.code_executor import execute_code
-        result = execute_code(
-            """
-import socket
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(2)
-    s.connect((\"8.8.8.8\", 53))
-    print(\"NETWORK_ACCESSIBLE\")
-except:
-    print(\"NETWORK_BLOCKED\")
-""",
-            "python3", "",
-            time_limit_ms=5000,
-        )
-        # Network should be blocked (unshare --net) or at least timeout
-        assert "NETWORK_ACCESSIBLE" not in result.stdout
-
-    def test_timeout_enforced(self):
-        """Infinite loops must be killed by the timeout."""
-        from services.code_executor import execute_code
-        result = execute_code(
-            "import time; time.sleep(60)",
-            "python3", "",
-            time_limit_ms=1000,
-        )
+        result = execute_code("import time; time.sleep(60)", "python3", "", time_limit_ms=1000)
         assert result.status == "timeout"
-        assert result.execution_time_ms < 5000  # Should be killed quickly
+        assert result.execution_time_ms <= 5000
 
-    def test_output_capped(self):
-        """Excessive output must be truncated."""
-        from services.code_executor import execute_code
-        result = execute_code(
-            "print('A' * 10_000_000)",  # 10MB output
-            "python3", "",
-            time_limit_ms=10000,
+    @patch("services.code_executor.execute_code_sync")
+    def test_compile_error_mapped_from_compiler(self, mock_exec):
+        """Compilation error from compiler service is mapped correctly."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="compilation_error", language="python", execution_time_ms=50,
+            tests=[], error="SyntaxError: invalid syntax",
         )
-        # Output should be capped at MAX_OUTPUT_BYTES
-        assert len(result.stdout) <= 1024 * 1024 + 100  # Allow small buffer
+        from services.code_executor import execute_code
+        result = execute_code("this is not valid python {{{", "python3", "")
+        assert result.status == "compile_error"
+        assert result.compilation_error is not None
 
-    def test_compile_error_handled(self):
-        """Compilation errors must not crash the executor."""
-        from services.code_executor import execute_code
-        result = execute_code(
-            "this is not valid python {{{",
-            "python3", "",
+    @patch("services.code_executor.execute_code_sync")
+    def test_runtime_error_mapped_from_compiler(self, mock_exec):
+        """Runtime error from compiler service is mapped correctly."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="runtime_error", language="python", execution_time_ms=30,
+            tests=[{"passed": False, "actual_output": "", "stderr": "ZeroDivisionError", "execution_time_ms": 30}],
         )
-        # Should return an error status, not crash
-        assert result.status in ("compile_error", "failed", "error")
-
-    def test_runtime_error_captured(self):
-        """Runtime errors must be captured, not crash the server."""
         from services.code_executor import execute_code
-        result = execute_code(
-            "1/0",
-            "python3", "",
-        )
+        result = execute_code("1/0", "python3", "")
         assert result.status == "failed"
         assert result.exit_code != 0
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_capacity_exceeded_mapped_from_compiler(self, mock_exec):
+        """capacity_exceeded from compiler is mapped to error status."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="capacity_exceeded", language="python", execution_time_ms=0,
+            tests=[], error="Service temporarily unavailable",
+        )
+        from services.code_executor import execute_code
+        result = execute_code("print(42)", "python3", "")
+        assert result.status == "error"
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_invalid_language_mapped_from_compiler(self, mock_exec):
+        """invalid_language from compiler is mapped to error status."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="invalid_language", language="brainfuck", execution_time_ms=0,
+            tests=[], error="Unsupported language",
+        )
+        from services.code_executor import execute_code
+        result = execute_code("print(42)", "python3", "")
+        assert result.status == "error"
+
+    def test_unsupported_language_not_sent_to_compiler(self):
+        """Unsupported language is rejected before calling compiler service."""
+        from services.code_executor import execute_code
+        result = execute_code("print(42)", "brainfuck", "")
+        assert result.status == "error"
+        assert "Unsupported" in result.stderr
 
 
 # =====================================================================
@@ -1735,9 +1880,15 @@ class TestCodingSecurityFixes:
     Fix 2: get_draft must reject problems not in selected_coding_problem_ids.
     """
 
-    def test_submit_coding_solution_no_score_in_response(self, client, mock_supabase):
+    @patch("services.code_executor.execute_code_sync")
+    def test_submit_coding_solution_no_score_in_response(self, mock_exec, client, mock_supabase):
         """submit_coding_solution response must not contain scoring data."""
-        from services.code_executor import evaluate_submission
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=50,
+            tests=[{"passed": True, "actual_output": "42", "execution_time_ms": 30}],
+            total_tests=1, passed_tests=1,
+        )
 
         # Auth
         mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
@@ -2165,3 +2316,904 @@ class TestAssessmentResumeAndReset:
             headers={"Authorization": "Bearer test-token"},
         )
         assert response.status_code in (401, 403)
+
+
+# =====================================================================
+# COMPILER SERVICE INTEGRATION TESTS
+# =====================================================================
+
+
+class TestCompilerServiceIntegration:
+    """Tests for the compiler.py service layer.
+
+    All HTTP calls to gateway-api are mocked. These verify the
+    request/response contract, language mapping, error handling,
+    and tracking context forwarding.
+    """
+
+    def test_execute_code_sends_correct_payload(self):
+        """Verify the HTTP request payload structure."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "accepted",
+            "language": "python",
+            "execution_time_ms": 100,
+            "tests": [{"passed": True, "actual_output": "42"}],
+            "total_tests": 1,
+            "passed_tests": 1,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            result = compiler_mod.execute_code_sync(
+                language="python3",
+                source_code="print(42)",
+                test_cases=[{"input": "", "expected_output": ""}],
+                attempt_id="att-1",
+                problem_id="prob-1",
+            )
+
+            # Verify the POST was made to the correct URL
+            call_args = MockClient.return_value.post.call_args
+            assert "/api/execute" in call_args[0][0]
+
+            # Verify payload
+            payload = call_args[1]["json"]
+            assert payload["language"] == "python"  # python3 mapped to python
+            assert payload["source_code"] == "print(42)"
+            assert len(payload["test_cases"]) == 1
+            assert payload["attempt_id"] == "att-1"
+            assert payload["question_id"] == "prob-1"  # problem_id mapped to question_id
+            assert "limits" in payload
+
+            # Verify result
+            assert result.status == "accepted"
+            assert result.language == "python"
+            assert result.execution_time_ms == 100
+            assert len(result.tests) == 1
+
+    def test_language_mapping(self):
+        """Verify language names are mapped correctly."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "accepted", "language": "cpp",
+            "execution_time_ms": 50, "tests": [], "total_tests": 0, "passed_tests": 0,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            compiler_mod.execute_code_sync(
+                language="cpp", source_code="int main() {}",
+                test_cases=[],
+            )
+
+            payload = MockClient.return_value.post.call_args[1]["json"]
+            assert payload["language"] == "cpp"
+
+    def test_wrong_answer_response(self):
+        """Verify wrong_answer is correctly parsed."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "wrong_answer",
+            "language": "python",
+            "execution_time_ms": 80,
+            "tests": [
+                {"passed": True, "actual_output": "4"},
+                {"passed": False, "actual_output": "5", "expected_output": "9"},
+            ],
+            "failed_test": 2,
+            "total_tests": 2,
+            "passed_tests": 1,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            result = compiler_mod.execute_code_sync(
+                language="python3", source_code="print(42)",
+                test_cases=[{"input": "", "expected_output": "4"}],
+            )
+
+            assert result.status == "wrong_answer"
+            assert result.passed_tests == 1
+            assert result.total_tests == 2
+            assert result.failed_test == 2
+
+    def test_compilation_error_response(self):
+        """Verify compilation_error is correctly parsed."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "compilation_error",
+            "language": "cpp",
+            "execution_time_ms": 30,
+            "tests": [],
+            "error": "error: expected ';' before '}' token",
+            "total_tests": 0,
+            "passed_tests": 0,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            result = compiler_mod.execute_code_sync(
+                language="cpp", source_code="int main() {}",
+                test_cases=[{"input": "", "expected_output": ""}],
+            )
+
+            assert result.status == "compilation_error"
+            assert result.error == "error: expected ';' before '}' token"
+
+    def test_timeout_response(self):
+        """Verify time_limit_exceeded is correctly parsed."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "time_limit_exceeded",
+            "language": "python",
+            "execution_time_ms": 5000,
+            "tests": [{"passed": False, "execution_time_ms": 5000}],
+            "total_tests": 1,
+            "passed_tests": 0,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            result = compiler_mod.execute_code_sync(
+                language="python3", source_code="import time; time.sleep(60)",
+                test_cases=[{"input": "", "expected_output": ""}],
+            )
+
+            assert result.status == "time_limit_exceeded"
+
+    def test_compiler_unavailable_raises_error(self):
+        """Verify CompilerError is raised when gateway is unreachable."""
+        import services.compiler as compiler_mod
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.side_effect = compiler_mod.httpx.ConnectError("Connection refused")
+
+            with pytest.raises(compiler_mod.CompilerError) as exc_info:
+                compiler_mod.execute_code_sync(
+                    language="python3", source_code="print(42)",
+                    test_cases=[{"input": "", "expected_output": ""}],
+                )
+            assert "unavailable" in str(exc_info.value).lower() or "connection" in str(exc_info.value).lower()
+
+    def test_compiler_timeout_raises_error(self):
+        """Verify CompilerError is raised on HTTP timeout."""
+        import services.compiler as compiler_mod
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.side_effect = compiler_mod.httpx.TimeoutException("Read timeout")
+
+            with pytest.raises(compiler_mod.CompilerError) as exc_info:
+                compiler_mod.execute_code_sync(
+                    language="python3", source_code="print(42)",
+                    test_cases=[{"input": "", "expected_output": ""}],
+                )
+            assert "timeout" in str(exc_info.value).lower()
+
+    def test_compiler_http_error_raises_error(self):
+        """Verify CompilerError is raised on HTTP 500."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+
+        http_error = compiler_mod.httpx.HTTPStatusError(
+            "Server Error", request=MagicMock(), response=mock_response
+        )
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.side_effect = http_error
+
+            with pytest.raises(compiler_mod.CompilerError) as exc_info:
+                compiler_mod.execute_code_sync(
+                    language="python3", source_code="print(42)",
+                    test_cases=[{"input": "", "expected_output": ""}],
+                )
+            assert "500" in str(exc_info.value)
+
+    def test_session_id_forwarded(self):
+        """session_id is forwarded when provided."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "accepted", "language": "python",
+            "execution_time_ms": 10, "tests": [], "total_tests": 0, "passed_tests": 0,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            compiler_mod.execute_code_sync(
+                language="python3", source_code="print(42)",
+                test_cases=[], session_id="sess-abc",
+            )
+
+            payload = MockClient.return_value.post.call_args[1]["json"]
+            assert payload["session_id"] == "sess-abc"
+
+    def test_no_tracking_ids_when_none(self):
+        """Tracking IDs are omitted when None."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "accepted", "language": "python",
+            "execution_time_ms": 10, "tests": [], "total_tests": 0, "passed_tests": 0,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            compiler_mod.execute_code_sync(
+                language="python3", source_code="print(42)",
+                test_cases=[],
+            )
+
+            payload = MockClient.return_value.post.call_args[1]["json"]
+            assert "attempt_id" not in payload
+            assert "question_id" not in payload
+            assert "session_id" not in payload
+
+    def test_limits_forwarded(self):
+        """Execution limits are forwarded to compiler service."""
+        import services.compiler as compiler_mod
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {
+            "status": "accepted", "language": "python",
+            "execution_time_ms": 10, "tests": [], "total_tests": 0, "passed_tests": 0,
+        }
+
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            MockClient.return_value.post.return_value = mock_response
+
+            compiler_mod.execute_code_sync(
+                language="python3", source_code="print(42)",
+                test_cases=[],
+                time_limit_seconds=5.0,
+                memory_limit_mb=512,
+                max_output_bytes=32768,
+            )
+
+            payload = MockClient.return_value.post.call_args[1]["json"]
+            assert payload["limits"]["time_limit_seconds"] == 5.0
+            assert payload["limits"]["memory_limit_mb"] == 512
+            assert payload["limits"]["max_output_bytes"] == 32768
+
+    def test_compiler_configurable_url(self):
+        """COMPILER_URL is read from environment."""
+        import services.compiler as compiler_mod
+        # Just verify the module-level config exists and defaults
+        assert hasattr(compiler_mod, "COMPILER_URL")
+        assert hasattr(compiler_mod, "COMPILER_TIMEOUT")
+        assert isinstance(compiler_mod.COMPILER_URL, str)
+        assert compiler_mod.COMPILER_TIMEOUT > 0
+
+    def test_compiler_response_to_dict(self):
+        """CompilerResponse.to_dict() returns correct structure."""
+        from services.compiler import CompilerResponse
+        resp = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=100,
+            tests=[{"passed": True}], error=None, failed_test=None,
+            total_tests=1, passed_tests=1,
+        )
+        d = resp.to_dict()
+        assert d["status"] == "accepted"
+        assert d["language"] == "python"
+        assert d["execution_time_ms"] == 100
+        assert len(d["tests"]) == 1
+        assert d["error"] is None
+        assert d["total_tests"] == 1
+        assert d["passed_tests"] == 1
+
+
+class TestEvaluatorIntegration:
+    """Tests for the legacy evaluator.py delegation to compiler service."""
+
+    @patch("services.evaluator.execute_code_sync")
+    def test_evaluate_code_delegates_to_compiler(self, mock_exec):
+        """Legacy evaluate_code() should call the compiler service."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=50,
+            tests=[{"passed": True, "actual_output": "42"}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.evaluator import evaluate_code
+        result = evaluate_code("att-1", "print(42)", "python3")
+        assert result["status"] == "accepted"
+        assert result["passed"] is True
+        assert result["attempt_id"] == "att-1"
+        mock_exec.assert_called_once()
+
+    @patch("services.evaluator.execute_code_sync")
+    def test_evaluate_code_handles_compiler_error(self, mock_exec):
+        """Legacy evaluate_code() handles compiler unavailability."""
+        from services.compiler import CompilerError
+        mock_exec.side_effect = CompilerError("Service down")
+        from services.evaluator import evaluate_code
+        result = evaluate_code("att-2", "print(42)", "python3")
+        assert result["status"] == "error"
+        assert result["passed"] is False
+        assert "Compiler service" in result["message"]
+
+
+# =====================================================================
+# HARNESS GENERATION TESTS
+# =====================================================================
+
+
+class TestHarnessGeneration:
+    """Tests for the harness generator (services/harness.py)."""
+
+    def test_python_harness_includes_candidate_code(self):
+        """Python harness includes the candidate's solution code."""
+        from services.harness import generate_python_harness
+        code = "class Solution:\n    def twoSum(self, nums, target):\n        return [0, 1]"
+        result = generate_python_harness(
+            candidate_code=code,
+            function_name="twoSum",
+            class_name="Solution",
+            test_arguments=[[[2, 7, 11, 15], 9]],
+            test_expected=[[0, 1]],
+        )
+        assert code in result
+        assert "import json" in result
+        assert "TEST_ARGS" in result
+
+    def test_python_harness_calls_function(self):
+        """Python harness calls the candidate's function with correct arguments."""
+        from services.harness import generate_python_harness
+        result = generate_python_harness(
+            candidate_code="def solve(n):\n    return n * 2",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[5], [10]],
+            test_expected=[10, 20],
+        )
+        assert "_instance = Solution()" not in result  # No class instantiation
+        assert "solve(_tc_args[0])" in result
+        assert "json.dumps" in result
+
+    def test_python_harness_with_class(self):
+        """Python harness instantiates class and calls method."""
+        from services.harness import generate_python_harness
+        result = generate_python_harness(
+            candidate_code="class Solution:\n    def solve(self, nums):\n        return sorted(nums)",
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[[3, 1, 2]], [[5, 4, 6]]],
+            test_expected=[[1, 2, 3], [4, 5, 6]],
+        )
+        assert "_instance = Solution()" in result
+        assert "_instance.solve(_tc_args[0])" in result
+
+    def test_python_harness_multiple_arguments(self):
+        """Python harness handles multiple function arguments."""
+        from services.harness import generate_harness
+        result = generate_harness(
+            candidate_code="def solve(a, b):\n    return a + b",
+            language="python3",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[1, 2], [3, 4]],
+            test_expected=[3, 7],
+        )
+        assert "_tc_args[0]" in result
+        assert "_tc_args[1]" in result
+
+    def test_python_harness_exception_handling(self):
+        """Python harness catches exceptions and reports them."""
+        from services.harness import generate_python_harness
+        result = generate_python_harness(
+            candidate_code="def solve(x):\n    return 1/0",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[1]],
+            test_expected=[0],
+        )
+        assert "except Exception" in result
+        assert '"error"' in result
+
+    def test_cpp_harness_includes_candidate_code(self):
+        """C++ harness includes the candidate's solution code."""
+        from services.harness import generate_cpp_harness
+        code = "class Solution {\npublic:\n    int solve(int n) { return n; }\n};"
+        result = generate_cpp_harness(
+            candidate_code=code,
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[5]],
+            test_expected=[5],
+        )
+        assert code in result
+        assert "#include <iostream>" in result
+        assert "int main()" in result
+
+    def test_java_harness_includes_candidate_code(self):
+        """Java harness includes the candidate's solution code."""
+        from services.harness import generate_java_harness
+        code = "class Solution {\n    public int solve(int n) { return n; }\n}"
+        result = generate_java_harness(
+            candidate_code=code,
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[5]],
+            test_expected=[5],
+        )
+        assert code in result
+        assert "import java.util.*" in result
+
+    def test_harness_main_entry_python(self):
+        """generate_harness dispatches to Python for python3."""
+        from services.harness import generate_harness
+        result = generate_harness(
+            candidate_code="def solve(x): return x",
+            language="python3",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[1]],
+            test_expected=[1],
+        )
+        assert "import json" in result
+        assert "TEST_ARGS" in result
+
+    def test_harness_main_entry_cpp(self):
+        """generate_harness dispatches to C++ for cpp."""
+        from services.harness import generate_harness
+        result = generate_harness(
+            candidate_code="int solve(int x) { return x; }",
+            language="cpp",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[1]],
+            test_expected=[1],
+        )
+        assert "#include <iostream>" in result
+
+    def test_harness_main_entry_java(self):
+        """generate_harness dispatches to Java for java."""
+        from services.harness import generate_harness
+        result = generate_harness(
+            candidate_code="class Solution { int solve(int x) { return x; } }",
+            language="java",
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[1]],
+            test_expected=[1],
+        )
+        assert "import java.util.*" in result
+
+    def test_harness_unsupported_language(self):
+        """generate_harness raises ValueError for unsupported language."""
+        from services.harness import generate_harness
+        with pytest.raises(ValueError, match="Unsupported language"):
+            generate_harness(
+                candidate_code="SELECT 1",
+                language="sql",
+                function_name="solve",
+                class_name=None,
+                test_arguments=[[]],
+                test_expected=[1],
+            )
+
+    def test_harness_embeds_test_data(self):
+        """Python harness embeds test data as JSON constants."""
+        from services.harness import generate_harness
+        result = generate_harness(
+            candidate_code="def solve(nums): return sorted(nums)",
+            language="python3",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[[3, 1, 2]], [[5, 4, 6]]],
+            test_expected=[[1, 2, 3], [4, 5, 6]],
+        )
+        assert "[3, 1, 2]" in result
+        assert "[1, 2, 3]" in result
+
+    def test_harness_output_comparison(self):
+        """Python harness compares actual vs expected output."""
+        from services.harness import generate_harness
+        result = generate_harness(
+            candidate_code="def solve(x): return x",
+            language="python3",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[42]],
+            test_expected=[42],
+        )
+        assert "_result_json == _expected_json" in result
+        assert '"passed"' in result
+
+
+class TestFunctionBasedSchemas:
+    """Tests for function-based coding schemas."""
+
+    def test_coding_problem_create_with_function_fields(self):
+        """CodingProblemCreate accepts function metadata."""
+        from schemas.coding import CodingProblemCreate
+        problem = CodingProblemCreate(
+            title="Two Sum",
+            slug="two-sum",
+            description="Find two numbers that add to target",
+            function_name="twoSum",
+            class_name="Solution",
+            function_signature="def twoSum(self, nums: List[int], target: int) -> List[int]",
+        )
+        assert problem.function_name == "twoSum"
+        assert problem.class_name == "Solution"
+        assert problem.function_signature is not None
+
+    def test_coding_problem_create_default_function_name(self):
+        """CodingProblemCreate defaults function_name to 'solve'."""
+        from schemas.coding import CodingProblemCreate
+        problem = CodingProblemCreate(
+            title="Test",
+            slug="test",
+            description="Test",
+        )
+        assert problem.function_name == "solve"
+        assert problem.class_name is None
+
+    def test_test_case_create_with_arguments(self):
+        """CodingTestCaseCreate accepts JSON arguments."""
+        from schemas.coding import CodingTestCaseCreate
+        tc = CodingTestCaseCreate(
+            arguments=[[2, 7, 11, 15], 9],
+            expected_output=[0, 1],
+        )
+        assert tc.arguments == [[2, 7, 11, 15], 9]
+        assert tc.expected_output == [0, 1]
+        assert tc.is_public is False
+        assert tc.points == 1
+
+    def test_test_case_create_rejects_non_array_arguments(self):
+        """CodingTestCaseCreate rejects non-array arguments."""
+        from schemas.coding import CodingTestCaseCreate
+        with pytest.raises(Exception):
+            CodingTestCaseCreate(
+                arguments="not an array",
+                expected_output=[0, 1],
+            )
+
+    def test_bulk_test_upload_schema(self):
+        """CodingBulkTestUpload validates test case array."""
+        from schemas.coding import CodingBulkTestUpload
+        upload = CodingBulkTestUpload(
+            test_cases=[
+                {"arguments": [[1, 2]], "expected_output": 3, "is_public": True},
+                {"arguments": [[3, 4]], "expected_output": 7, "is_public": False},
+            ]
+        )
+        assert len(upload.test_cases) == 2
+
+    def test_bulk_test_upload_rejects_empty(self):
+        """CodingBulkTestUpload rejects empty list."""
+        from schemas.coding import CodingBulkTestUpload
+        with pytest.raises(Exception):
+            CodingBulkTestUpload(test_cases=[])
+
+
+class TestCodeExecutorWithHarness:
+    """Tests for code_executor with harness generation."""
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_generates_harness(self, mock_exec):
+        """run_code_public generates a harness before sending to compiler."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=50,
+            tests=[{"passed": True, "actual_output": "[0, 1]"}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [[2, 7, 11, 15], 9],
+            "expected_output": [0, 1],
+            "is_public": True,
+        }]
+        result = run_code_public(
+            "class Solution:\n    def twoSum(self, nums, target):\n        return [0, 1]",
+            "python3",
+            test_cases,
+            function_name="twoSum",
+            class_name="Solution",
+        )
+        assert result["all_passed"] is True
+        # Verify the source code sent to compiler includes the harness
+        call_args = mock_exec.call_args
+        source_sent = call_args[1]["source_code"]
+        assert "import json" in source_sent  # Python harness includes this
+        assert "TEST_ARGS" in source_sent
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_evaluate_submission_with_harness(self, mock_exec):
+        """evaluate_submission generates a harness for scoring."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=50,
+            tests=[{"passed": True, "actual_output": "4"}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.code_executor import evaluate_submission
+        test_cases = [{
+            "arguments": [2],
+            "expected_output": 4,
+            "points": 5,
+        }]
+        result = evaluate_submission(
+            "def solve(n): return n * n",
+            "python3",
+            test_cases,
+            function_name="solve",
+        )
+        assert result["tests_passed"] == 1
+        assert result["score"] == 5
+        # Verify harness was generated
+        call_args = mock_exec.call_args
+        source_sent = call_args[1]["source_code"]
+        assert "TEST_ARGS" in source_sent
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_with_class_harness(self, mock_exec):
+        """run_code_public generates class-based harness when class_name provided."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="python", execution_time_ms=50,
+            tests=[{"passed": True}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "arguments": [[3, 1, 2]],
+            "expected_output": [1, 2, 3],
+        }]
+        run_code_public(
+            "class Solution:\n    def solve(self, nums):\n        return sorted(nums)",
+            "python3",
+            test_cases,
+            function_name="solve",
+            class_name="Solution",
+        )
+        call_args = mock_exec.call_args
+        source_sent = call_args[1]["source_code"]
+        assert "_instance = Solution()" in source_sent
+        assert "_instance.solve(" in source_sent
+
+
+# =====================================================================
+# AUTHENTICATION ENDPOINT TESTS
+# =====================================================================
+
+
+class TestAuthEndpoints:
+    """Tests for the /auth/* endpoints — cookie-only authentication."""
+
+    @patch("routers.auth._supabase_sign_up")
+    def test_signup_success(self, mock_signup, client):
+        """Successful signup sets cookie and returns user (no JWT in body)."""
+        mock_signup.return_value = {
+            "access_token": "test-jwt-token",
+            "user": {"id": "user-123", "email": "test@example.com"},
+            "expires_in": 3600,
+        }
+        response = client.post("/auth/signup", json={
+            "email": "test@example.com",
+            "password": "password123",
+            "full_name": "Test User",
+            "usn": "01CS21001",
+            "semester": 5,
+            "branch": "CSE",
+        })
+        assert response.status_code == 200
+        data = response.json()
+        # JWT must NOT be in response body
+        assert "access_token" not in data
+        assert data["user"]["email"] == "test@example.com"
+        assert "dsc_session" in response.cookies
+
+    @patch("routers.auth._supabase_sign_up")
+    def test_signup_duplicate_email(self, mock_signup, client):
+        """Signup with duplicate email returns error."""
+        mock_signup.side_effect = HTTPException(
+            status_code=400, detail="User already registered"
+        )
+        response = client.post("/auth/signup", json={
+            "email": "existing@example.com",
+            "password": "password123",
+            "full_name": "Test User",
+            "usn": "01CS21001",
+            "semester": 5,
+            "branch": "CSE",
+        })
+        assert response.status_code == 400
+
+    @patch("routers.auth._supabase_sign_in")
+    def test_login_success(self, mock_login, client):
+        """Successful login sets cookie and returns user (no JWT in body)."""
+        mock_login.return_value = {
+            "access_token": "test-jwt-token",
+            "user": {"id": "user-123", "email": "test@example.com"},
+            "expires_in": 3600,
+        }
+        response = client.post("/auth/login", json={
+            "email": "test@example.com",
+            "password": "password123",
+        })
+        assert response.status_code == 200
+        data = response.json()
+        # JWT must NOT be in response body
+        assert "access_token" not in data
+        assert data["user"]["email"] == "test@example.com"
+        assert "dsc_session" in response.cookies
+
+    @patch("routers.auth._supabase_sign_in")
+    def test_login_invalid_credentials(self, mock_login, client):
+        """Login with invalid credentials returns error."""
+        mock_login.side_effect = HTTPException(
+            status_code=401, detail="Invalid login credentials"
+        )
+        response = client.post("/auth/login", json={
+            "email": "wrong@example.com",
+            "password": "wrongpass",
+        })
+        assert response.status_code == 401
+
+    def test_login_missing_fields(self, client):
+        """Login with missing fields returns validation error."""
+        response = client.post("/auth/login", json={
+            "email": "test@example.com",
+        })
+        assert response.status_code == 422
+
+    def test_signup_weak_password(self, client):
+        """Signup with short password returns validation error."""
+        response = client.post("/auth/signup", json={
+            "email": "test@example.com",
+            "password": "123",
+            "full_name": "Test User",
+            "usn": "01CS21001",
+            "semester": 5,
+            "branch": "CSE",
+        })
+        assert response.status_code == 422
+
+    @patch("routers.auth._supabase_sign_out")
+    def test_logout_clears_cookie(self, mock_logout, client):
+        """Logout clears the session cookie."""
+        response = client.post("/auth/logout")
+        assert response.status_code == 200
+        assert response.json()["status"] == "logged out"
+
+    def test_me_without_auth(self, client):
+        """GET /auth/me without cookie returns 401."""
+        response = client.get("/auth/me")
+        assert response.status_code == 401
+
+    def test_me_with_invalid_cookie(self, client):
+        """GET /auth/me with invalid cookie returns 401."""
+        response = client.get("/auth/me", cookies={
+            "dsc_session": "invalid-token",
+        })
+        assert response.status_code == 401
+
+    @patch("routers.auth.decode_supabase_token")
+    def test_me_with_valid_cookie(self, mock_decode, client):
+        """GET /auth/me with valid session cookie returns user info."""
+        mock_decode.return_value = {
+            "sub": "user-123",
+            "email": "test@example.com",
+        }
+        response = client.get("/auth/me", cookies={
+            "dsc_session": "valid-jwt-token",
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "user-123"
+        assert data["email"] == "test@example.com"
+
+    @patch("routers.auth._supabase_sign_up")
+    def test_signup_needs_confirmation(self, mock_signup, client):
+        """Signup needing email confirmation returns user with needs_confirmation."""
+        mock_signup.return_value = {
+            "access_token": None,
+            "user": {"id": "user-456", "email": "new@example.com"},
+        }
+        response = client.post("/auth/signup", json={
+            "email": "new@example.com",
+            "password": "password123",
+            "full_name": "New User",
+            "usn": "01CS21002",
+            "semester": 3,
+            "branch": "ISE",
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert "access_token" not in data
+        assert data["user"]["needs_confirmation"] is True
+
+    @patch("routers.auth._supabase_sign_in")
+    def test_login_sets_cookie(self, mock_login, client):
+        """Login sets an HttpOnly session cookie."""
+        mock_login.return_value = {
+            "access_token": "test-jwt",
+            "user": {"id": "u1", "email": "a@b.com"},
+            "expires_in": 3600,
+        }
+        response = client.post("/auth/login", json={
+            "email": "a@b.com",
+            "password": "pass1234",
+        })
+        cookie = response.cookies.get("dsc_session")
+        assert cookie == "test-jwt"
+
+    def test_bearer_header_rejected(self, client):
+        """Bearer header is NOT accepted — cookie-only auth."""
+        response = client.get("/auth/me", headers={
+            "Authorization": "Bearer some-token",
+        })
+        assert response.status_code == 401
+
+    def test_csrf_endpoint_returns_token(self, client):
+        """GET /auth/csrf returns a CSRF token and sets cookie."""
+        response = client.get("/auth/csrf")
+        assert response.status_code == 200
+        data = response.json()
+        assert "csrf_token" in data
+        assert "dsc_csrf" in response.cookies

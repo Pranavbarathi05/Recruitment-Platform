@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useAuth } from '../hooks/useAuth';
+import { } from '../hooks/useAuth';
 
 /**
  * Results Page
@@ -11,7 +11,7 @@ import { useAuth } from '../hooks/useAuth';
 const Results = () => {
   const { attemptId } = useParams();
   const navigate = useNavigate();
-  const { session } = useAuth();
+  // Cookie auth — no manual auth needed
 
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -20,15 +20,13 @@ const Results = () => {
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   useEffect(() => {
-    if (!attemptId || !session?.access_token) return;
+    if (!attemptId) return;
 
     const fetchResults = async () => {
       try {
         setLoading(true);
         const response = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/results`, {
-          headers: {
-            Authorization: `Bearer ${session?.access_token}`,
-          },
+          credentials: 'include',
         });
 
         // Read body ONCE, then branch on status.
@@ -47,7 +45,7 @@ const Results = () => {
     };
 
     fetchResults();
-  }, [attemptId, session, apiUrl]);
+  }, [attemptId, apiUrl]);
 
   if (loading) {
     return (

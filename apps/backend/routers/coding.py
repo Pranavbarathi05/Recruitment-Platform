@@ -82,13 +82,14 @@ def get_coding_problems(
     if not problem_ids:
         return {"attempt_id": attempt_id, "problems": [], "expires_at": attempt.get("expires_at")}
 
-    # Fetch problems (safe columns only, no domain_id — problems are global)
+    # Fetch problems (safe columns only — problems are global)
     problems_resp = (
         supabase_client.table("coding_problems")
         .select(
             "id, title, slug, description, difficulty, constraints, "
             "input_format, output_format, explanation, starter_code, "
-            "supported_languages, time_limit_ms, memory_limit_mb, points"
+            "supported_languages, time_limit_ms, memory_limit_mb, points, "
+            "function_name, class_name, function_signature"
         )
         .in_("id", problem_ids)
         .execute()
@@ -96,11 +97,11 @@ def get_coding_problems(
     problem_map = {p["id"]: p for p in (problems_resp.data or [])}
     ordered = [problem_map[pid] for pid in problem_ids if pid in problem_map]
 
-    # PUBLIC test cases only
+    # PUBLIC test cases only (with arguments for function-based display)
     for p in ordered:
         tests_resp = (
             supabase_client.table("coding_test_cases")
-            .select("id, input, expected_output, ordering, points")
+            .select("id, arguments, expected_output, ordering, points, input")
             .eq("problem_id", p["id"])
             .eq("is_public", True)
             .order("ordering")
@@ -235,7 +236,7 @@ def run_code(
 
     tests_resp = (
         supabase_client.table("coding_test_cases")
-        .select("id, input, expected_output, is_public, ordering")
+        .select("id, arguments, expected_output, is_public, ordering, input")
         .eq("problem_id", payload.problem_id)
         .eq("is_public", True)
         .order("ordering")
@@ -247,7 +248,7 @@ def run_code(
 
     problem_resp = (
         supabase_client.table("coding_problems")
-        .select("time_limit_ms, memory_limit_mb")
+        .select("time_limit_ms, memory_limit_mb, function_name, class_name")
         .eq("id", payload.problem_id)
         .execute()
     )
@@ -259,6 +260,10 @@ def run_code(
         test_cases,
         time_limit_ms=problem.get("time_limit_ms", 2000),
         memory_limit_mb=problem.get("memory_limit_mb", 256),
+        attempt_id=attempt_id,
+        problem_id=payload.problem_id,
+        function_name=problem.get("function_name", "solve"),
+        class_name=problem.get("class_name"),
     )
 
 
@@ -283,7 +288,7 @@ def submit_coding_solution(
     # ALL test cases (public + hidden)
     tests_resp = (
         supabase_client.table("coding_test_cases")
-        .select("id, input, expected_output, is_public, points, ordering")
+        .select("id, arguments, expected_output, is_public, points, ordering, input")
         .eq("problem_id", payload.problem_id)
         .order("ordering")
         .execute()
@@ -294,7 +299,7 @@ def submit_coding_solution(
 
     problem_resp = (
         supabase_client.table("coding_problems")
-        .select("time_limit_ms, memory_limit_mb")
+        .select("time_limit_ms, memory_limit_mb, function_name, class_name")
         .eq("id", payload.problem_id)
         .execute()
     )
@@ -306,6 +311,10 @@ def submit_coding_solution(
         test_cases,
         time_limit_ms=problem.get("time_limit_ms", 2000),
         memory_limit_mb=problem.get("memory_limit_mb", 256),
+        attempt_id=attempt_id,
+        problem_id=payload.problem_id,
+        function_name=problem.get("function_name", "solve"),
+        class_name=problem.get("class_name"),
     )
 
     if eval_result["tests_passed"] == eval_result["tests_total"]:

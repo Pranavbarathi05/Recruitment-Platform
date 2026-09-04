@@ -5,6 +5,7 @@ load_dotenv()
 from fastapi import FastAPI
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
+from routers import auth
 from routers import submission
 from routers import domains
 from routers import admin

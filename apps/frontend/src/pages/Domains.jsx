@@ -14,7 +14,7 @@ const Domains = () => {
   const [error, setError] = useState(null);
   const [selectedDomains, setSelectedDomains] = useState([]);
   const [starting, setStarting] = useState(false);
-  const { session } = useAuth();
+  const { getAuthHeaders } = useAuth();
   const navigate = useNavigate();
 
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -67,10 +67,8 @@ const Domains = () => {
     try {
       const response = await fetch(`${apiUrl}/assessment/start`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.access_token}`,
-        },
+        headers: getAuthHeaders(),
+        credentials: 'include',
         body: JSON.stringify({ domain_ids: selectedDomains }),
       });
 

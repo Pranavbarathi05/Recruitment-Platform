@@ -1,62 +1,77 @@
 import { createContext, useState, useEffect, useCallback } from 'react';
-import { authSignup, authLogin, authLogout, authGetMe, getStoredAccessToken } from '../lib/api';
+
+const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // eslint-disable-next-line react-refresh/only-export-components
 export const AuthContext = createContext(null);
 
+/**
+ * Authentication Provider — Cookie-only auth.
+ *
+ * The browser NEVER has access to the JWT.
+ * Authentication is purely through HttpOnly cookies set by FastAPI.
+ * CSRF protection uses double-submit token pattern.
+ */
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
-  const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
 
   /**
-   * On mount: check for an existing stored access token and validate it
-   * by calling the backend /auth/me endpoint.
-   *
-   * This replaces the previous supabase.auth.getSession() call.
+   * On mount: restore session from cookie + fetch CSRF token.
    */
   useEffect(() => {
-    const restoreSession = async () => {
-      const token = getStoredAccessToken();
-      if (!token) {
-        setLoading(false);
-        return;
-      }
-
+    const init = async () => {
       try {
-        const me = await authGetMe();
-        setUser({ id: me.id, email: me.email });
-        setSession({ access_token: token });
+        // Restore session from cookie
+        const meResp = await fetch(`${apiUrl}/auth/me`, {
+          credentials: 'include',
+        });
+        if (meResp.ok) {
+          const data = await meResp.json();
+          setUser(data);
+        } else {
+          setUser(null);
+        }
+
+
       } catch {
-        // Token invalid/expired — cleared by apiRequest on 401
         setUser(null);
-        setSession(null);
       } finally {
         setLoading(false);
       }
     };
 
-    restoreSession();
+    init();
   }, []);
 
   /**
    * Sign up a new candidate.
-   *
-   * All candidate data is passed to the backend, which forwards it to
-   * Supabase Auth as user metadata. The database trigger (handle_new_user)
-   * creates both profile and candidate rows atomically.
    */
   const signUp = useCallback(async ({ email, password, fullName, usn, semester, branch }) => {
-    const data = await authSignup({ email, password, fullName, usn, semester, branch });
+    const resp = await fetch(`${apiUrl}/auth/signup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        email,
+        password,
+        full_name: fullName,
+        usn,
+        semester: parseInt(semester, 10),
+        branch,
+      }),
+    });
 
-    if (data.needsConfirmation) {
-      return { needsConfirmation: true, user: data.user };
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      throw new Error(data.detail || 'Signup failed');
     }
 
-    // Session was returned — user is signed in
-    if (data.session?.access_token) {
-      setUser(data.user);
-      setSession({ access_token: data.session.access_token });
+    setUser(data.user);
+
+    if (data.user?.needs_confirmation) {
+      return { needsConfirmation: true, user: data.user };
     }
 
     return { needsConfirmation: false, user: data.user };
@@ -66,33 +81,51 @@ export function AuthProvider({ children }) {
    * Sign in with email and password.
    */
   const signIn = useCallback(async ({ email, password }) => {
-    const data = await authLogin({ email, password });
+    const resp = await fetch(`${apiUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email, password }),
+    });
 
-    if (data.session?.access_token) {
-      setUser(data.user);
-      setSession({ access_token: data.session.access_token });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      throw new Error(data.detail || 'Login failed');
     }
+
+    setUser(data.user);
 
     return data;
   }, []);
 
   /**
-   * Sign out. Clears local tokens and notifies the backend.
+   * Sign out — clear session cookie.
    */
   const signOut = useCallback(async () => {
-    await authLogout();
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      const match = document.cookie.match(/dsc_csrf=([^;]+)/);
+      if (match) headers['X-CSRF-Token'] = match[1];
+
+      await fetch(`${apiUrl}/auth/logout`, {
+        method: 'POST',
+        headers,
+        credentials: 'include',
+      });
+    } catch {
+      // Non-critical — clear local state regardless
+    }
     setUser(null);
-    setSession(null);
   }, []);
 
   const value = {
     user,
-    session,
     loading,
     signUp,
     signIn,
     signOut,
-    isAuthenticated: !!session,
+    isAuthenticated: !!user,
   };
 
   return (

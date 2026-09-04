@@ -1,5 +1,6 @@
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Any, List
+import json
 
 
 # ============================================================
@@ -29,6 +30,10 @@ class CodingProblemCreate(BaseModel):
     memory_limit_mb: int = Field(default=256, gt=0, le=1024)
     points: int = Field(default=10, gt=0, le=100)
     is_active: bool = True
+    # Function-based model fields
+    function_name: str = Field(default="solve", min_length=1, max_length=200)
+    class_name: Optional[str] = Field(default=None, max_length=200)
+    function_signature: Optional[str] = None
 
     def model_post_init(self, __context):
         if self.difficulty not in VALID_DIFFICULTIES:
@@ -54,6 +59,10 @@ class CodingProblemUpdate(BaseModel):
     memory_limit_mb: Optional[int] = Field(None, gt=0, le=1024)
     points: Optional[int] = Field(None, gt=0, le=100)
     is_active: Optional[bool] = None
+    # Function-based model fields
+    function_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    class_name: Optional[str] = Field(default=None, max_length=200)
+    function_signature: Optional[str] = None
 
     def model_post_init(self, __context):
         if self.difficulty is not None and self.difficulty not in VALID_DIFFICULTIES:
@@ -71,19 +80,37 @@ class CodingProblemUpdate(BaseModel):
 # ============================================================
 
 class CodingTestCaseCreate(BaseModel):
-    input: str = Field(..., min_length=1)
-    expected_output: str = Field(..., min_length=1)
+    # Function-based model: arguments is a JSONB array
+    arguments: List[Any] = Field(..., min_length=1, description="Function arguments as a JSON array")
+    expected_output: Any = Field(..., description="Expected return value as JSON")
     is_public: bool = False
     points: int = Field(default=1, gt=0, le=10)
     ordering: int = Field(default=0, ge=0)
+    # Legacy fields (optional for backward compatibility)
+    input: Optional[str] = None
+    legacy_expected_output: Optional[str] = None
+
+    @field_validator("arguments")
+    @classmethod
+    def validate_arguments(cls, v):
+        if not isinstance(v, list):
+            raise ValueError("arguments must be a JSON array")
+        return v
 
 
 class CodingTestCaseUpdate(BaseModel):
-    input: Optional[str] = Field(None, min_length=1)
-    expected_output: Optional[str] = Field(None, min_length=1)
+    arguments: Optional[List[Any]] = Field(None, description="Function arguments as a JSON array")
+    expected_output: Optional[Any] = Field(None, description="Expected return value as JSON")
     is_public: Optional[bool] = None
     points: Optional[int] = Field(None, gt=0, le=10)
     ordering: Optional[int] = Field(None, ge=0)
+    input: Optional[str] = None
+    legacy_expected_output: Optional[str] = None
+
+
+class CodingBulkTestUpload(BaseModel):
+    """Bulk upload multiple test cases at once."""
+    test_cases: List[CodingTestCaseCreate] = Field(..., min_length=1, max_length=100)
 
 
 # ============================================================

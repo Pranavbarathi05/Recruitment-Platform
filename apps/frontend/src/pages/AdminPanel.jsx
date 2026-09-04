@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 
@@ -22,7 +22,7 @@ const SEMESTERS = [
 ];
 
 const AdminPanel = () => {
-  const { session } = useAuth();
+  const { getAuthHeaders } = useAuth();
   const navigate = useNavigate();
 
   const [isAdmin, setIsAdmin] = useState(false);
@@ -68,18 +68,13 @@ const AdminPanel = () => {
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   // Memoize auth headers so the effect dependency is stable
-  const authHeaders = useMemo(
-    () => session?.access_token
-      ? { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` }
-      : null,
-    [session?.access_token],
-  );
+  // Cookie auth — no manual auth headers needed
 
   // Fetch assessment configs
   const fetchConfigs = useCallback(async () => {
-    if (!authHeaders) return;
+    // Cookie auth — always available
     try {
-      const resp = await fetch(`${apiUrl}/admin/config`, { headers: authHeaders });
+      const resp = await fetch(`${apiUrl}/admin/config`, { credentials: 'include' });
       if (resp.ok) {
         const data = await resp.json();
         setConfigs(Array.isArray(data) ? data : []);
@@ -91,7 +86,7 @@ const AdminPanel = () => {
       console.error('Error fetching configs:', err);
       setConfigs([]);
     }
-  }, [apiUrl, authHeaders]);
+  }, [apiUrl]);
 
   useEffect(() => {
     if (isAdmin) fetchConfigs();
@@ -99,7 +94,7 @@ const AdminPanel = () => {
 
   // Fetch submissions list
   const fetchSubmissions = useCallback(async () => {
-    if (!authHeaders) return;
+    // Cookie auth — always available
     try {
       setSubmissionsLoading(true);
       const params = new URLSearchParams();
@@ -110,7 +105,7 @@ const AdminPanel = () => {
 
       if (subSearch) params.set('search', subSearch);
 
-      const resp = await fetch(`${apiUrl}/admin/assessments/submissions?${params}`, { headers: authHeaders });
+      const resp = await fetch(`${apiUrl}/admin/assessments/submissions?${params}`, { credentials: 'include' });
       if (resp.ok) {
         const data = await resp.json();
         setSubmissions(Array.isArray(data) ? data : []);
@@ -124,7 +119,7 @@ const AdminPanel = () => {
     } finally {
       setSubmissionsLoading(false);
     }
-  }, [apiUrl, authHeaders, subSort, subOrder, subSemester, subBranch, subSearch]);
+  }, [apiUrl, subSort, subOrder, subSemester, subBranch, subSearch]);
 
   useEffect(() => {
     if (isAdmin) fetchSubmissions();
@@ -169,7 +164,7 @@ const AdminPanel = () => {
       );
       const resp = await fetch(`${apiUrl}/admin/config/${editingConfig.id}`, {
         method: 'PUT',
-        headers: authHeaders,
+        headers: getAuthHeaders(),
         body: JSON.stringify(payload),
       });
       if (!resp.ok) {
@@ -188,13 +183,13 @@ const AdminPanel = () => {
 
   // Check admin status on mount and whenever session changes
   useEffect(() => {
-    if (!authHeaders) return;
+    // Cookie auth — always available
 
     let cancelled = false;
 
     const checkAdmin = async () => {
       try {
-        const resp = await fetch(`${apiUrl}/admin/domains`, { headers: authHeaders });
+        const resp = await fetch(`${apiUrl}/admin/domains`, { credentials: 'include' });
         if (cancelled) return;
 
         if (resp.ok) {
@@ -220,18 +215,18 @@ const AdminPanel = () => {
 
     checkAdmin();
     return () => { cancelled = true; };
-  }, [authHeaders, apiUrl, navigate]);
+  }, [apiUrl, navigate]);
 
   // Fetch domains
   const fetchDomains = useCallback(async () => {
-    if (!authHeaders) return;
+    // Cookie auth — always available
     try {
-      const resp = await fetch(`${apiUrl}/admin/domains`, { headers: authHeaders });
+      const resp = await fetch(`${apiUrl}/admin/domains`, { credentials: 'include' });
       if (resp.ok) setDomains(await resp.json());
     } catch (err) {
       console.error(err);
     }
-  }, [apiUrl, authHeaders]);
+  }, [apiUrl]);
 
   useEffect(() => {
     if (isAdmin) fetchDomains();
@@ -239,18 +234,18 @@ const AdminPanel = () => {
 
   // Fetch MCQs for a domain, with optional semester filter
   const fetchMcqs = useCallback(async (domainId, sem) => {
-    if (!authHeaders) return;
+    // Cookie auth — always available
     try {
       let url = `${apiUrl}/admin/domains/${domainId}/mcqs`;
       if (sem !== null && sem !== undefined) {
         url += `?semester=${sem}`;
       }
-      const resp = await fetch(url, { headers: authHeaders });
+      const resp = await fetch(url, { credentials: 'include' });
       if (resp.ok) setMcqs(await resp.json());
     } catch (err) {
       console.error(err);
     }
-  }, [apiUrl, authHeaders]);
+  }, [apiUrl]);
 
   // Re-fetch MCQs when semester filter changes
   useEffect(() => {
@@ -269,7 +264,7 @@ const AdminPanel = () => {
         : `${apiUrl}/admin/domains`;
       const resp = await fetch(url, {
         method: editingDomain ? 'PUT' : 'POST',
-        headers: authHeaders,
+        headers: getAuthHeaders(),
         body: JSON.stringify(domainForm),
       });
       if (!resp.ok) {
@@ -291,7 +286,7 @@ const AdminPanel = () => {
       const action = domain.is_active ? 'deactivate' : 'activate';
       await fetch(`${apiUrl}/admin/domains/${domain.id}/${action}`, {
         method: 'POST',
-        headers: authHeaders,
+        headers: getAuthHeaders(),
       });
       fetchDomains();
     } catch (err) {
@@ -309,7 +304,7 @@ const AdminPanel = () => {
         : `${apiUrl}/admin/domains/${selectedDomain.id}/mcqs`;
       const resp = await fetch(url, {
         method: editingMcq ? 'PUT' : 'POST',
-        headers: authHeaders,
+        headers: getAuthHeaders(),
         body: JSON.stringify(editingMcq ? mcqForm : { ...mcqForm, domain_id: selectedDomain.id }),
       });
       if (!resp.ok) {
@@ -331,7 +326,7 @@ const AdminPanel = () => {
       const action = mcq.is_active ? 'deactivate' : 'activate';
       await fetch(`${apiUrl}/admin/mcqs/${mcq.id}/${action}`, {
         method: 'POST',
-        headers: authHeaders,
+        headers: getAuthHeaders(),
       });
       fetchMcqs(selectedDomain.id, semesterFilter);
     } catch (err) {
@@ -342,7 +337,7 @@ const AdminPanel = () => {
   const handleDeleteMcq = async (mcqId) => {
     if (!confirm('Delete this MCQ? This cannot be undone if the question has been used in an attempt.')) return;
     try {
-      const resp = await fetch(`${apiUrl}/admin/mcqs/${mcqId}`, { method: 'DELETE', headers: authHeaders });
+      const resp = await fetch(`${apiUrl}/admin/mcqs/${mcqId}`, { method: 'DELETE', headers: getAuthHeaders(), credentials: 'include' });
       if (!resp.ok) {
         const err = await resp.json();
         setMessage(`Error: ${err.detail}`);
@@ -362,7 +357,7 @@ const AdminPanel = () => {
     try {
       const resp = await fetch(`${apiUrl}/admin/assessments/${resetCandidate.attempt_id}/reset`, {
         method: 'POST',
-        headers: authHeaders,
+        headers: getAuthHeaders(),
       });
       const data = await resp.json();
       if (!resp.ok) {

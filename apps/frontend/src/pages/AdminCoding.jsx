@@ -3,20 +3,28 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 
 /**
- * Admin Coding Problems Page
+ * Admin Coding Problems Page — Function-Based Problem Builder
  *
- * Admin management for coding problems and test cases.
+ * Admin management for LeetCode-style coding problems.
  * Features:
- * - List all coding problems with domain/difficulty/test counts
- * - Create/edit/delete coding problems
- * - Manage test cases (public + hidden) per problem
+ * - Create/edit/delete coding problems with function metadata
+ * - Per-language starter code
+ * - JSON test case management (arguments + expected output)
+ * - Bulk test case upload
+ * - Public/Hidden visibility
  */
 
 const DIFFICULTIES = ['easy', 'medium', 'hard'];
 const LANGUAGES = ['python3', 'cpp', 'java'];
 
+const DEFAULT_STARTER_CODE = {
+  python3: 'class Solution:\n    def solve(self, nums, target):\n        # Write your solution here\n        pass\n',
+  cpp: 'class Solution {\npublic:\n    vector<int> solve(vector<int>& nums, int target) {\n        // Write your solution here\n        return {};\n    }\n};\n',
+  java: 'class Solution {\n    public int[] solve(int[] nums, int target) {\n        // Write your solution here\n        return new int[]{};\n    }\n}\n',
+};
+
 const AdminCoding = () => {
-  const { session } = useAuth();
+  const { getAuthHeaders } = useAuth();
   const navigate = useNavigate();
 
   const [isAdmin, setIsAdmin] = useState(false);
@@ -29,10 +37,12 @@ const AdminCoding = () => {
   const [editingProblem, setEditingProblem] = useState(null);
   const [problemForm, setProblemForm] = useState({
     title: '', slug: '', description: '',
-    difficulty: 'medium', constraints: '', input_format: '', output_format: '',
-    explanation: '', points: 10, time_limit_ms: 2000, memory_limit_mb: 256,
+    difficulty: 'medium', constraints: '', points: 10,
+    time_limit_ms: 2000, memory_limit_mb: 256,
     supported_languages: ['python3', 'cpp', 'java'], is_active: true,
-    starter_code: {},
+    starter_code: { ...DEFAULT_STARTER_CODE },
+    function_name: 'solve', class_name: 'Solution', function_signature: '',
+    input_format: '', output_format: '', explanation: '',
   });
 
   // Test cases state
@@ -40,38 +50,39 @@ const AdminCoding = () => {
   const [showTestForm, setShowTestForm] = useState(false);
   const [editingTest, setEditingTest] = useState(null);
   const [testForm, setTestForm] = useState({
-    input: '', expected_output: '', is_public: false, points: 1, ordering: 0,
+    arguments: '', expected_output: '',
+    is_public: false, points: 1, ordering: 0,
   });
+
+  // Bulk upload state
+  const [showBulkUpload, setShowBulkUpload] = useState(false);
+  const [bulkJson, setBulkJson] = useState('');
+  const [bulkError, setBulkError] = useState('');
 
   const [message, setMessage] = useState('');
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-  // Admin check — uses token primitive in deps to avoid re-running on every render.
-  // Uses a cancelled flag to prevent stale async callbacks from navigating.
+  // Admin check
   useEffect(() => {
-    const token = session?.access_token;
-    if (!token) return;
+    
 
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+    // Cookie auth
     let cancelled = false;
 
     const checkAdmin = async () => {
       try {
-        const resp = await fetch(`${apiUrl}/admin/domains`, { headers });
+        const resp = await fetch(`${apiUrl}/admin/domains`, { credentials: 'include' });
         if (cancelled) return;
 
         if (resp.ok) {
           setIsAdmin(true);
           setLoading(false);
         } else if (resp.status === 403) {
-          // Not admin — redirect to candidate view
           navigate('/domains');
         } else if (resp.status === 401) {
-          // Token expired — let ProtectedRoute handle it
           navigate('/login');
         } else {
-          // Server error — show message, don't redirect
-          setMessage('Error: Could not verify admin status. Please try again.');
+          setMessage('Error: Could not verify admin status.');
           setLoading(false);
         }
       } catch {
@@ -84,15 +95,14 @@ const AdminCoding = () => {
 
     checkAdmin();
     return () => { cancelled = true; };
-  }, [apiUrl, session?.access_token, navigate]);
+  }, [apiUrl, navigate]);
 
-  // Fetch problems — called from CRUD handlers (not effects)
+  // Fetch problems
   const fetchProblems = useCallback(async () => {
-    const token = session?.access_token;
-    if (!token) return;
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+    
+    // Cookie auth
     try {
-      const resp = await fetch(`${apiUrl}/admin/coding/problems`, { headers });
+      const resp = await fetch(`${apiUrl}/admin/coding/problems`, { credentials: 'include' });
       if (resp.ok) {
         const data = await resp.json();
         setProblems(Array.isArray(data) ? data : []);
@@ -100,15 +110,14 @@ const AdminCoding = () => {
     } catch (err) {
       console.error('Error fetching problems:', err);
     }
-  }, [apiUrl, session?.access_token]);
+  }, [apiUrl]);
 
-  // Fetch test cases for selected problem
+  // Fetch test cases
   const fetchTestCases = useCallback(async (problemId) => {
-    const token = session?.access_token;
-    if (!token || !problemId) return;
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+    
+    // Cookie auth
     try {
-      const resp = await fetch(`${apiUrl}/admin/coding/problems/${problemId}/tests`, { headers });
+      const resp = await fetch(`${apiUrl}/admin/coding/problems/${problemId}/tests`, { credentials: 'include' });
       if (resp.ok) {
         const data = await resp.json();
         setTestCases(Array.isArray(data) ? data : []);
@@ -116,23 +125,25 @@ const AdminCoding = () => {
     } catch (err) {
       console.error('Error fetching tests:', err);
     }
-  }, [apiUrl, session?.access_token]);
+  }, [apiUrl]);
 
   useEffect(() => {
-    if (!isAdmin || !session?.access_token) return;
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` };
-    fetch(`${apiUrl}/admin/coding/problems`, { headers })
+    if (!isAdmin) return;
+    // Cookie auth
+    fetch(`${apiUrl}/admin/coding/problems`, { credentials: 'include' })
       .then((r) => r.json())
       .then((data) => { if (Array.isArray(data)) setProblems(data); })
       .catch((err) => console.error('Error fetching problems:', err));
-  }, [isAdmin, apiUrl, session?.access_token]);
+  }, [isAdmin, apiUrl]);
 
   useEffect(() => {
-    if (selectedProblem && session?.access_token) {
-      const load = async () => { await fetchTestCases(selectedProblem.id); };
-      load();
-    }
-  }, [selectedProblem, fetchTestCases, session?.access_token]);
+    if (!selectedProblem) return;
+    // Cookie auth
+    fetch(`${apiUrl}/admin/coding/problems/${selectedProblem.id}/tests`, { credentials: 'include' })
+      .then((r) => r.json())
+      .then((data) => { if (Array.isArray(data)) setTestCases(data); })
+      .catch((err) => console.error('Error fetching tests:', err));
+  }, [selectedProblem, apiUrl]);
 
   // Problem CRUD
   const handleProblemSubmit = async (e) => {
@@ -143,16 +154,16 @@ const AdminCoding = () => {
         : `${apiUrl}/admin/coding/problems`;
       const method = editingProblem ? 'PUT' : 'POST';
 
-      // Generate slug from title if creating
       const payload = { ...problemForm };
       if (!editingProblem && !payload.slug) {
         payload.slug = payload.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       }
 
-      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` };
+      // Cookie auth
       const resp = await fetch(url, {
         method,
-        headers,
+        headers: getAuthHeaders(),
+        credentials: 'include',
         body: JSON.stringify(payload),
       });
 
@@ -174,10 +185,9 @@ const AdminCoding = () => {
   const handleDeleteProblem = async (problemId) => {
     if (!confirm('Delete this problem? This cannot be undone.')) return;
     try {
-      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` };
+      // Cookie auth
       const resp = await fetch(`${apiUrl}/admin/coding/problems/${problemId}`, {
-        method: 'DELETE',
-        headers,
+        method: 'DELETE', headers: getAuthHeaders(), credentials: 'include',
       });
       if (resp.ok) {
         setMessage('Problem deleted');
@@ -197,8 +207,8 @@ const AdminCoding = () => {
       ? `${apiUrl}/admin/coding/problems/${problem.id}/deactivate`
       : `${apiUrl}/admin/coding/problems/${problem.id}/activate`;
     try {
-      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` };
-      const resp = await fetch(endpoint, { method: 'POST', headers });
+      // Cookie auth
+      const resp = await fetch(endpoint, { method: 'POST', headers: getAuthHeaders(), credentials: 'include' });
       if (resp.ok) {
         setMessage(problem.is_active ? 'Problem deactivated' : 'Problem activated');
         fetchProblems();
@@ -215,23 +225,50 @@ const AdminCoding = () => {
   const handleTestSubmit = async (e) => {
     e.preventDefault();
     try {
+      // Parse JSON arguments
+      let parsedArgs;
+      let parsedExpected;
+      try {
+        parsedArgs = JSON.parse(testForm.arguments);
+        if (!Array.isArray(parsedArgs)) {
+          setMessage('Arguments must be a JSON array');
+          return;
+        }
+      } catch {
+        setMessage('Invalid JSON in arguments field');
+        return;
+      }
+      try {
+        parsedExpected = JSON.parse(testForm.expected_output);
+      } catch {
+        setMessage('Invalid JSON in expected output field');
+        return;
+      }
+
       const url = editingTest
         ? `${apiUrl}/admin/coding/tests/${editingTest.id}`
         : `${apiUrl}/admin/coding/problems/${selectedProblem.id}/tests`;
       const method = editingTest ? 'PUT' : 'POST';
 
-      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` };
+      // Cookie auth
       const resp = await fetch(url, {
         method,
-        headers,
-        body: JSON.stringify(testForm),
+        headers: getAuthHeaders(),
+        credentials: 'include',
+        body: JSON.stringify({
+          arguments: parsedArgs,
+          expected_output: parsedExpected,
+          is_public: testForm.is_public,
+          points: testForm.points,
+          ordering: testForm.ordering,
+        }),
       });
 
       if (resp.ok) {
         setMessage(editingTest ? 'Test case updated' : 'Test case created');
         setShowTestForm(false);
         setEditingTest(null);
-        setTestForm({ input: '', expected_output: '', is_public: false, points: 1, ordering: 0 });
+        setTestForm({ arguments: '', expected_output: '', is_public: false, points: 1, ordering: testCases.length });
         fetchTestCases(selectedProblem.id);
       } else {
         const err = await resp.json();
@@ -245,10 +282,9 @@ const AdminCoding = () => {
   const handleDeleteTest = async (testId) => {
     if (!confirm('Delete this test case?')) return;
     try {
-      const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` };
+      // Cookie auth
       const resp = await fetch(`${apiUrl}/admin/coding/tests/${testId}`, {
-        method: 'DELETE',
-        headers,
+        method: 'DELETE', headers: getAuthHeaders(), credentials: 'include',
       });
       if (resp.ok) {
         setMessage('Test case deleted');
@@ -259,13 +295,61 @@ const AdminCoding = () => {
     }
   };
 
+  // Bulk upload
+  const handleBulkUpload = async () => {
+    try {
+      const parsed = JSON.parse(bulkJson);
+      if (!Array.isArray(parsed)) {
+        setBulkError('JSON must be an array of test cases');
+        return;
+      }
+
+      // Validate each test case
+      for (let i = 0; i < parsed.length; i++) {
+        const tc = parsed[i];
+        if (!tc.arguments || !Array.isArray(tc.arguments)) {
+          setBulkError(`Test case ${i + 1}: arguments must be a JSON array`);
+          return;
+        }
+        if (tc.expected_output === undefined) {
+          setBulkError(`Test case ${i + 1}: expected_output is required`);
+          return;
+        }
+      }
+
+      // Cookie auth
+      const resp = await fetch(`${apiUrl}/admin/coding/problems/${selectedProblem.id}/tests/bulk`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        credentials: 'include',
+        body: JSON.stringify({ test_cases: parsed }),
+      });
+
+      if (resp.ok) {
+        const result = await resp.json();
+        setMessage(`Uploaded ${result.count} test cases`);
+        setShowBulkUpload(false);
+        setBulkJson('');
+        setBulkError('');
+        fetchTestCases(selectedProblem.id);
+      } else {
+        const err = await resp.json();
+        setBulkError(err.detail || 'Error uploading test cases');
+      }
+    } catch (err) {
+      setBulkError('Invalid JSON: ' + err.message);
+    }
+  };
+
   const resetProblemForm = () => {
     setProblemForm({
       title: '', slug: '', description: '',
-      difficulty: 'medium', constraints: '', input_format: '', output_format: '',
-      explanation: '', points: 10, time_limit_ms: 2000, memory_limit_mb: 256,
+      difficulty: 'medium', constraints: '', points: 10,
+      time_limit_ms: 2000, memory_limit_mb: 256,
       supported_languages: ['python3', 'cpp', 'java'], is_active: true,
-      starter_code: {},
+      starter_code: { ...DEFAULT_STARTER_CODE },
+      function_name: 'solve', class_name: 'Solution', function_signature: '',
+      input_format: '', output_format: '', explanation: '',
     });
   };
 
@@ -277,15 +361,18 @@ const AdminCoding = () => {
       description: problem.description,
       difficulty: problem.difficulty,
       constraints: problem.constraints || '',
-      input_format: problem.input_format || '',
-      output_format: problem.output_format || '',
-      explanation: problem.explanation || '',
       points: problem.points,
       time_limit_ms: problem.time_limit_ms,
       memory_limit_mb: problem.memory_limit_mb,
       supported_languages: problem.supported_languages || ['python3'],
       is_active: problem.is_active,
-      starter_code: problem.starter_code || {},
+      starter_code: problem.starter_code || { ...DEFAULT_STARTER_CODE },
+      function_name: problem.function_name || 'solve',
+      class_name: problem.class_name || '',
+      function_signature: problem.function_signature || '',
+      input_format: problem.input_format || '',
+      output_format: problem.output_format || '',
+      explanation: problem.explanation || '',
     });
     setShowProblemForm(true);
   };
@@ -360,7 +447,7 @@ const AdminCoding = () => {
                           </span>
                         </div>
                         <div className="text-xs text-theme-muted mt-1">
-                          {p.points} pts • {p.public_test_count}/{p.total_test_count} tests
+                          {p.function_name || 'solve'}() • {p.points} pts • {p.public_test_count}/{p.total_test_count} tests
                         </div>
                       </div>
                       <div className="flex gap-1">
@@ -377,54 +464,89 @@ const AdminCoding = () => {
             )}
           </div>
 
-          {/* Right panel: Problem form or Test Cases */}
+          {/* Right panel */}
           <div className="w-1/2">
             {showProblemForm ? (
-              <div className="bg-theme-secondary rounded-lg p-6">
+              <div className="bg-theme-secondary rounded-lg p-6 max-h-[80vh] overflow-y-auto">
                 <h2 className="text-xl font-bold text-theme-primary mb-4">
                   {editingProblem ? 'Edit Problem' : 'New Problem'}
                 </h2>
                 <form onSubmit={handleProblemSubmit} className="space-y-3">
-                  <div>
-                    <label className={labelClass}>Title *</label>
-                    <input value={problemForm.title} onChange={(e) => setProblemForm({ ...problemForm, title: e.target.value })} className={inputClass} required />
-                  </div>
-                  <div>
-                    <label className={labelClass}>Slug *</label>
-                    <input value={problemForm.slug} onChange={(e) => setProblemForm({ ...problemForm, slug: e.target.value })} className={inputClass} required />
-                  </div>
-                  <div>
-                    <label className={labelClass}>Description *</label>
-                    <textarea value={problemForm.description} onChange={(e) => setProblemForm({ ...problemForm, description: e.target.value })} className={inputClass} rows={4} required />
-                  </div>
-                  <div className="grid grid-cols-3 gap-3">
+                  {/* Basic Info */}
+                  <div className="border-b border-theme-border pb-3">
+                    <h3 className="text-sm font-bold text-theme-primary mb-2">Problem Details</h3>
                     <div>
-                      <label className={labelClass}>Difficulty</label>
-                      <select value={problemForm.difficulty} onChange={(e) => setProblemForm({ ...problemForm, difficulty: e.target.value })} className={inputClass}>
-                        {DIFFICULTIES.map((d) => <option key={d} value={d}>{d}</option>)}
-                      </select>
+                      <label className={labelClass}>Title *</label>
+                      <input value={problemForm.title} onChange={(e) => setProblemForm({ ...problemForm, title: e.target.value })} className={inputClass} required />
                     </div>
                     <div>
-                      <label className={labelClass}>Points</label>
-                      <input type="number" value={problemForm.points} onChange={(e) => setProblemForm({ ...problemForm, points: parseInt(e.target.value) || 10 })} className={inputClass} min={1} />
+                      <label className={labelClass}>Slug *</label>
+                      <input value={problemForm.slug} onChange={(e) => setProblemForm({ ...problemForm, slug: e.target.value })} className={inputClass} required />
                     </div>
                     <div>
-                      <label className={labelClass}>Time Limit (ms)</label>
-                      <input type="number" value={problemForm.time_limit_ms} onChange={(e) => setProblemForm({ ...problemForm, time_limit_ms: parseInt(e.target.value) || 2000 })} className={inputClass} min={100} />
+                      <label className={labelClass}>Description *</label>
+                      <textarea value={problemForm.description} onChange={(e) => setProblemForm({ ...problemForm, description: e.target.value })} className={inputClass} rows={4} required />
+                    </div>
+                    <div className="grid grid-cols-3 gap-3 mt-2">
+                      <div>
+                        <label className={labelClass}>Difficulty</label>
+                        <select value={problemForm.difficulty} onChange={(e) => setProblemForm({ ...problemForm, difficulty: e.target.value })} className={inputClass}>
+                          {DIFFICULTIES.map((d) => <option key={d} value={d}>{d}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className={labelClass}>Points</label>
+                        <input type="number" value={problemForm.points} onChange={(e) => setProblemForm({ ...problemForm, points: parseInt(e.target.value) || 10 })} className={inputClass} min={1} />
+                      </div>
+                      <div>
+                        <label className={labelClass}>Time Limit (ms)</label>
+                        <input type="number" value={problemForm.time_limit_ms} onChange={(e) => setProblemForm({ ...problemForm, time_limit_ms: parseInt(e.target.value) || 2000 })} className={inputClass} min={100} />
+                      </div>
+                    </div>
+                    <div>
+                      <label className={labelClass}>Constraints</label>
+                      <textarea value={problemForm.constraints} onChange={(e) => setProblemForm({ ...problemForm, constraints: e.target.value })} className={inputClass} rows={2} />
                     </div>
                   </div>
-                  <div>
-                    <label className={labelClass}>Constraints</label>
-                    <textarea value={problemForm.constraints} onChange={(e) => setProblemForm({ ...problemForm, constraints: e.target.value })} className={inputClass} rows={2} />
+
+                  {/* Function Definition */}
+                  <div className="border-b border-theme-border pb-3">
+                    <h3 className="text-sm font-bold text-theme-primary mb-2">Function Definition</h3>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className={labelClass}>Function Name *</label>
+                        <input value={problemForm.function_name} onChange={(e) => setProblemForm({ ...problemForm, function_name: e.target.value })} className={inputClass} required />
+                      </div>
+                      <div>
+                        <label className={labelClass}>Class Name</label>
+                        <input value={problemForm.class_name} onChange={(e) => setProblemForm({ ...problemForm, class_name: e.target.value })} className={inputClass} placeholder="e.g. Solution" />
+                      </div>
+                    </div>
+                    <div>
+                      <label className={labelClass}>Function Signature</label>
+                      <input value={problemForm.function_signature} onChange={(e) => setProblemForm({ ...problemForm, function_signature: e.target.value })} className={inputClass} placeholder="e.g. def twoSum(self, nums: List[int], target: int) -> List[int]" />
+                    </div>
                   </div>
-                  <div>
-                    <label className={labelClass}>Input Format</label>
-                    <textarea value={problemForm.input_format} onChange={(e) => setProblemForm({ ...problemForm, input_format: e.target.value })} className={inputClass} rows={2} />
+
+                  {/* Starter Code */}
+                  <div className="border-b border-theme-border pb-3">
+                    <h3 className="text-sm font-bold text-theme-primary mb-2">Starter Code (per language)</h3>
+                    {LANGUAGES.filter((l) => problemForm.supported_languages.includes(l)).map((lang) => (
+                      <div key={lang} className="mb-2">
+                        <label className={labelClass}>{lang}</label>
+                        <textarea
+                          value={problemForm.starter_code[lang] || ''}
+                          onChange={(e) => setProblemForm({
+                            ...problemForm,
+                            starter_code: { ...problemForm.starter_code, [lang]: e.target.value },
+                          })}
+                          className={`${inputClass} font-mono text-xs`}
+                          rows={6}
+                        />
+                      </div>
+                    ))}
                   </div>
-                  <div>
-                    <label className={labelClass}>Output Format</label>
-                    <textarea value={problemForm.output_format} onChange={(e) => setProblemForm({ ...problemForm, output_format: e.target.value })} className={inputClass} rows={2} />
-                  </div>
+
                   <div className="flex gap-2">
                     <button type="submit" className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-semibold">
                       {editingProblem ? 'Update' : 'Create'}
@@ -439,31 +561,80 @@ const AdminCoding = () => {
               <div className="bg-theme-secondary rounded-lg p-6">
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-xl font-bold text-theme-primary">{selectedProblem.title}</h2>
-                  <button
-                    onClick={() => { setTestForm({ input: '', expected_output: '', is_public: false, points: 1, ordering: testCases.length }); setEditingTest(null); setShowTestForm(true); }}
-                    className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg text-sm font-semibold"
-                  >
-                    + Add Test Case
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => { setShowBulkUpload(!showBulkUpload); }}
+                      className="bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded-lg text-sm font-semibold"
+                    >
+                      📦 Bulk Upload
+                    </button>
+                    <button
+                      onClick={() => { setTestForm({ arguments: '', expected_output: '', is_public: false, points: 1, ordering: testCases.length }); setEditingTest(null); setShowTestForm(true); }}
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg text-sm font-semibold"
+                    >
+                      + Add Test Case
+                    </button>
+                  </div>
                 </div>
 
+                {/* Bulk Upload */}
+                {showBulkUpload && (
+                  <div className="bg-theme-primary rounded-lg p-4 mb-4 space-y-3">
+                    <h3 className="font-semibold text-theme-primary text-sm">Bulk Upload (JSON)</h3>
+                    <p className="text-xs text-theme-muted">
+                      Paste a JSON array of test cases. Each object needs: arguments (array), expected_output (any JSON), is_public (bool), points (int).
+                    </p>
+                    <textarea
+                      value={bulkJson}
+                      onChange={(e) => setBulkJson(e.target.value)}
+                      className={`${inputClass} font-mono text-xs`}
+                      rows={8}
+                      placeholder='[{"arguments": [[2,7,11,15], 9], "expected_output": [0,1], "is_public": true, "points": 1}]'
+                    />
+                    {bulkError && <div className="text-red-400 text-xs">{bulkError}</div>}
+                    <div className="flex gap-2">
+                      <button onClick={handleBulkUpload} className="bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded text-sm">
+                        Upload
+                      </button>
+                      <button onClick={() => { setShowBulkUpload(false); setBulkJson(''); setBulkError(''); }} className="text-theme-muted text-sm">
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Test Case Form */}
                 {showTestForm && (
                   <form onSubmit={handleTestSubmit} className="bg-theme-primary rounded-lg p-4 mb-4 space-y-3">
                     <h3 className="font-semibold text-theme-primary text-sm">{editingTest ? 'Edit Test Case' : 'New Test Case'}</h3>
                     <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className={labelClass}>Input *</label>
-                        <textarea value={testForm.input} onChange={(e) => setTestForm({ ...testForm, input: e.target.value })} className={inputClass} rows={3} required />
+                        <label className={labelClass}>Arguments (JSON array) *</label>
+                        <textarea
+                          value={testForm.arguments}
+                          onChange={(e) => setTestForm({ ...testForm, arguments: e.target.value })}
+                          className={`${inputClass} font-mono text-xs`}
+                          rows={3}
+                          placeholder='[[2,7,11,15], 9]'
+                          required
+                        />
                       </div>
                       <div>
-                        <label className={labelClass}>Expected Output *</label>
-                        <textarea value={testForm.expected_output} onChange={(e) => setTestForm({ ...testForm, expected_output: e.target.value })} className={inputClass} rows={3} required />
+                        <label className={labelClass}>Expected Output (JSON) *</label>
+                        <textarea
+                          value={testForm.expected_output}
+                          onChange={(e) => setTestForm({ ...testForm, expected_output: e.target.value })}
+                          className={`${inputClass} font-mono text-xs`}
+                          rows={3}
+                          placeholder='[0,1]'
+                          required
+                        />
                       </div>
                     </div>
                     <div className="flex gap-3 items-end">
                       <div className="flex items-center gap-2">
                         <input type="checkbox" id="is_public" checked={testForm.is_public} onChange={(e) => setTestForm({ ...testForm, is_public: e.target.checked })} className="rounded" />
-                        <label htmlFor="is_public" className="text-sm text-theme-primary">Public (visible to candidates)</label>
+                        <label htmlFor="is_public" className="text-sm text-theme-primary">Public</label>
                       </div>
                       <div>
                         <label className={labelClass}>Points</label>
@@ -481,6 +652,7 @@ const AdminCoding = () => {
                   </form>
                 )}
 
+                {/* Test Cases List */}
                 {testCases.length === 0 ? (
                   <div className="text-theme-muted text-sm py-4">No test cases yet. Add your first test case above.</div>
                 ) : (
@@ -492,18 +664,30 @@ const AdminCoding = () => {
                             {tc.is_public ? '🌐 PUBLIC' : '🔒 HIDDEN'} — Test {idx + 1} ({tc.points} pts)
                           </span>
                           <div className="flex gap-1">
-                            <button onClick={() => { setTestForm({ input: tc.input, expected_output: tc.expected_output, is_public: tc.is_public, points: tc.points, ordering: tc.ordering }); setEditingTest(tc); setShowTestForm(true); }} className="text-blue-400 hover:text-blue-300 text-xs">Edit</button>
+                            <button onClick={() => {
+                              setTestForm({
+                                arguments: tc.arguments ? JSON.stringify(tc.arguments, null, 2) : tc.input || '',
+                                expected_output: tc.expected_output !== undefined ? JSON.stringify(tc.expected_output, null, 2) : '',
+                                is_public: tc.is_public, points: tc.points, ordering: tc.ordering,
+                              });
+                              setEditingTest(tc);
+                              setShowTestForm(true);
+                            }} className="text-blue-400 hover:text-blue-300 text-xs">Edit</button>
                             <button onClick={() => handleDeleteTest(tc.id)} className="text-red-400 hover:text-red-300 text-xs">Delete</button>
                           </div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 font-mono text-xs">
                           <div>
-                            <span className="text-theme-muted">Input:</span>
-                            <pre className="text-theme-secondary bg-theme-primary rounded p-2 mt-1 whitespace-pre-wrap max-h-20 overflow-y-auto">{tc.input}</pre>
+                            <span className="text-theme-muted">Arguments:</span>
+                            <pre className="text-theme-secondary bg-theme-primary rounded p-2 mt-1 whitespace-pre-wrap max-h-20 overflow-y-auto">
+                              {tc.arguments ? JSON.stringify(tc.arguments, null, 2) : tc.input}
+                            </pre>
                           </div>
                           <div>
                             <span className="text-theme-muted">Expected:</span>
-                            <pre className="text-theme-secondary bg-theme-primary rounded p-2 mt-1 whitespace-pre-wrap max-h-20 overflow-y-auto">{tc.expected_output}</pre>
+                            <pre className="text-theme-secondary bg-theme-primary rounded p-2 mt-1 whitespace-pre-wrap max-h-20 overflow-y-auto">
+                              {tc.expected_output !== undefined ? JSON.stringify(tc.expected_output, null, 2) : ''}
+                            </pre>
                           </div>
                         </div>
                       </div>

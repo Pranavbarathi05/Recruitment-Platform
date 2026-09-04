@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useAuth } from '../hooks/useAuth';
 import CodeEditor from '../components/CodeEditor';
 
 /**
@@ -26,7 +25,7 @@ const LANGUAGES = [
 const CodingTest = () => {
   const { attemptId } = useParams();
   const navigate = useNavigate();
-  const { session } = useAuth();
+  // Cookie auth
 
   const [problems, setProblems] = useState([]);
   const [currentProblemIndex, setCurrentProblemIndex] = useState(0);
@@ -50,20 +49,17 @@ const CodingTest = () => {
 
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-  const authHeaders = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${session?.access_token}`,
-  };
+  // Cookie auth — no manual headers needed
 
   // Fetch problems
   useEffect(() => {
-    if (!attemptId || !session?.access_token) return;
+    if (!attemptId) return;
 
     const fetchProblems = async () => {
       try {
         setLoading(true);
         const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/problems`, {
-          headers: authHeaders,
+          credentials: 'include',
         });
         if (!resp.ok) {
           const err = await resp.json();
@@ -123,7 +119,7 @@ const CodingTest = () => {
       try {
         await fetch(`${apiUrl}/coding/attempt/${attemptId}/draft`, {
           method: 'PUT',
-          headers: authHeaders,
+          credentials: 'include',
           body: JSON.stringify({
             problem_id: problem.id,
             language,
@@ -157,7 +153,7 @@ const CodingTest = () => {
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [timeRemaining > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [timeRemaining > 0]);
 
   const getDefaultStarter = (lang) => {
     switch (lang) {
@@ -186,7 +182,7 @@ const CodingTest = () => {
     try {
       const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/run`, {
         method: 'POST',
-        headers: authHeaders,
+        credentials: 'include',
         body: JSON.stringify({
           problem_id: problems[currentProblemIndex].id,
           language,
@@ -215,7 +211,7 @@ const CodingTest = () => {
     try {
       const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/submit`, {
         method: 'POST',
-        headers: authHeaders,
+        credentials: 'include',
         body: JSON.stringify({
           problem_id: problems[currentProblemIndex].id,
           language,
@@ -245,7 +241,7 @@ const CodingTest = () => {
     try {
       const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/complete`, {
         method: 'POST',
-        headers: authHeaders,
+        credentials: 'include',
       });
 
       if (resp.ok) {
