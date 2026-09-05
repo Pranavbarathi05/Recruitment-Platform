@@ -29,8 +29,15 @@ import {
 
 // Served locally by the application (copied from node_modules/pyodide).
 const PYODIDE_INDEX_URL = '/pyodide/';
-// Referenced through a variable so bundlers leave the runtime import alone.
-const PYODIDE_ENTRY_URL = `${PYODIDE_INDEX_URL}pyodide.mjs`;
+
+// Resolve the pyodide entry URL at runtime from the worker's own origin.
+// The path is built from separate parts so Vite's static analysis never sees
+// a single resolvable "/pyodide/pyodide.mjs" string. The worker and the
+// pyodide assets share the same origin, so we construct the absolute URL
+// from the worker's location (import.meta.url) at runtime.
+const _pyodideHost = new URL(import.meta.url).origin;
+const _pyodidePath = '/pyodide/pyodide.mjs';
+const PYODIDE_ENTRY_URL = _pyodideHost + _pyodidePath;
 
 let pyodidePromise = null;
 let runningRunId = null;
@@ -56,7 +63,7 @@ function getPyodide() {
     // Loaded at runtime from the app's own static assets so the ~9.6MB wasm +
     // stdlib are never bundled into JS chunks and always served locally
     // (works offline / on restricted networks).
-    pyodidePromise = import(/* @vite-ignore */ PYODIDE_ENTRY_URL)
+    pyodidePromise = import(PYODIDE_ENTRY_URL)
       .then((mod) =>
         mod.loadPyodide({
           indexURL: PYODIDE_INDEX_URL,
