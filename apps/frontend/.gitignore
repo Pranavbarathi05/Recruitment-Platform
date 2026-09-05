@@ -10,6 +10,10 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+
+# Pyodide runtime assets — regenerated from node_modules by scripts/copy-pyodide.mjs
+public/pyodide
+
 *.local
 .env
 .env.*

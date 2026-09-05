@@ -41,6 +41,19 @@ DEFAULT_TIME_LIMIT_MS = 2000
 DEFAULT_MEMORY_LIMIT_MB = 256
 MAX_OUTPUT_BYTES = 65536
 
+# Compiler status -> status vocabulary used by the candidate-facing result UI.
+# The UI renders `compile_error`, `runtime_error`, `timeout`, `failed`, `passed`.
+RUN_STATUS_MAP = {
+    "accepted": "passed",
+    "wrong_answer": "failed",
+    "time_limit_exceeded": "timeout",
+    "runtime_error": "runtime_error",
+    "compilation_error": "compile_error",
+    "invalid_language": "error",
+    "internal_error": "error",
+    "capacity_exceeded": "error",
+}
+
 
 # ============================================================
 # Execution Result (backward compatibility)
@@ -148,27 +161,62 @@ def run_code_public(
             problem_id=problem_id,
         )
 
+        compiler_tests = response.tests or []
+        compilation_error = (
+            response.error if response.status == "compilation_error" else None
+        )
+
         results = []
         all_passed = True
 
-        for idx, test in enumerate(response.tests):
-            passed = test.get("passed", False)
+        for idx, tc in enumerate(test_cases):
+            passed = False
+            status = RUN_STATUS_MAP.get(response.status, "error")
+            actual_output = None
+            stderr = None
+            execution_time_ms = response.execution_time_ms
+
+            if idx < len(compiler_tests):
+                test = compiler_tests[idx]
+                passed = bool(test.get("passed", False))
+                actual_output = test.get("actual_output")
+                stderr = test.get("stderr") or test.get("error")
+                execution_time_ms = test.get(
+                    "execution_time_ms", execution_time_ms
+                )
+                if not passed:
+                    status = RUN_STATUS_MAP.get(
+                        test.get("status") or response.status, status
+                    )
+
             if not passed:
                 all_passed = False
+                # Surface compiler diagnostics so the UI can show them. The
+                # compiler service reports compilation failures with an empty
+                # tests list and the diagnostics in `error`.
+                if status == "compile_error" and not stderr and compilation_error:
+                    stderr = compilation_error
 
-            # For public tests, show expected/actual on failure
-            tc = test_cases[idx] if idx < len(test_cases) else {}
+            # For public tests, show expected/actual/input on failure.
+            # `input`/`arguments` are public test-case fields already sent to
+            # the candidate in the problems payload.
             results.append({
                 "id": tc.get("id"),
                 "is_public": True,
                 "passed": passed,
                 "expected_output": tc.get("expected_output") if not passed else None,
-                "actual_output": test.get("actual_output") if not passed else None,
-                "status": "passed" if passed else response.status,
-                "execution_time_ms": test.get("execution_time_ms", response.execution_time_ms),
+                "actual_output": actual_output if not passed else None,
+                "input": tc.get("input"),
+                "arguments": tc.get("arguments"),
+                "stderr": stderr if not passed else None,
+                "status": "passed" if passed else status,
+                "execution_time_ms": execution_time_ms,
             })
 
-        return {"all_passed": all_passed, "results": results}
+        payload = {"all_passed": all_passed, "results": results}
+        if compilation_error:
+            payload["compilation_error"] = compilation_error
+        return payload
 
     except CompilerError as e:
         logger.error(f"Compiler service error during run: {e}")

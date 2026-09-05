@@ -3039,6 +3039,83 @@ class TestCodeExecutorWithHarness:
         assert "_instance = Solution()" in source_sent
         assert "_instance.solve(" in source_sent
 
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_compile_error_surfaces_diagnostics(self, mock_exec):
+        """Compilation failures return per-test compile_error + diagnostics."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="compilation_error",
+            language="python",
+            execution_time_ms=0,
+            tests=[],
+            error='File "<string>", line 1\n    def solve(:\n             ^\nSyntaxError: invalid syntax',
+            total_tests=1,
+            passed_tests=0,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [2],
+            "expected_output": 4,
+            "is_public": True,
+        }]
+        result = run_code_public("def solve(:", "python3", test_cases)
+        assert result["all_passed"] is False
+        assert result["results"][0]["status"] == "compile_error"
+        assert "SyntaxError" in result["results"][0]["stderr"]
+        assert "SyntaxError" in result["compilation_error"]
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_normalizes_timeout_status(self, mock_exec):
+        """Compiler statuses are normalized to the UI vocabulary."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="time_limit_exceeded",
+            language="python",
+            execution_time_ms=500,
+            tests=[{"passed": False, "actual_output": "", "execution_time_ms": 500}],
+            total_tests=1,
+            passed_tests=0,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [2],
+            "expected_output": 4,
+            "is_public": True,
+        }]
+        result = run_code_public("import time; time.sleep(10)", "python3", test_cases)
+        assert result["all_passed"] is False
+        assert result["results"][0]["status"] == "timeout"
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_normalizes_runtime_error_status(self, mock_exec):
+        """Runtime errors surface per-test stderr."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="runtime_error",
+            language="python",
+            execution_time_ms=10,
+            tests=[{
+                "passed": False,
+                "actual_output": "",
+                "stderr": "ZeroDivisionError: division by zero",
+                "execution_time_ms": 10,
+            }],
+            total_tests=1,
+            passed_tests=0,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [2],
+            "expected_output": 4,
+            "is_public": True,
+        }]
+        result = run_code_public("1/0", "python3", test_cases)
+        assert result["results"][0]["status"] == "runtime_error"
+        assert "ZeroDivisionError" in result["results"][0]["stderr"]
+
 
 # =====================================================================
 # AUTHENTICATION ENDPOINT TESTS

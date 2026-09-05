@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import CodeEditor from '../components/CodeEditor';
+import TestResultsPanel from '../components/TestResultsPanel';
+import { runCodeLocally, isClientRunnable } from '../execution/runner';
 
 /**
  * Combined Assessment Workspace
@@ -202,6 +204,24 @@ const AssessmentWorkspace = () => {
   }, [codingProblems, codingIndex, codingStates]);
 
   // ========== CODING: RUN CODE ==========
+  //
+  // Client-side execution (Web Worker + WASM) for languages with a browser
+  // runtime — currently python3 via Pyodide. Run never touches the submission
+  // flow and its result is feedback only, never authoritative scoring.
+  // Languages without a client-side runtime fall back to the existing
+  // server-side run endpoint so the platform keeps working.
+  const runCodeOnServer = async (problem, state) => {
+    const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/run`, {
+      method: 'POST', headers: getAuthHeaders(), credentials: 'include',
+      body: JSON.stringify({ problem_id: problem.id, language: state.language, source_code: state.code }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to run code');
+    }
+    return resp.json();
+  };
+
   const handleRunCode = async () => {
     const current = getCurrentCodingProblem();
     if (!current || codingRunning) return;
@@ -209,11 +229,16 @@ const AssessmentWorkspace = () => {
     setCodingRunning(true);
     setCodingRunResults(null);
     try {
-      const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/run`, {
-        method: 'POST', headers: getAuthHeaders(), credentials: 'include',
-        body: JSON.stringify({ problem_id: problem.id, language: state.language, source_code: state.code }),
-      });
-      const result = await resp.json();
+      const result = isClientRunnable(state.language)
+        ? await runCodeLocally({
+            language: state.language,
+            sourceCode: state.code,
+            testCases: problem.test_cases || [], // public tests only
+            functionName: problem.function_name || 'solve',
+            className: problem.class_name || null,
+            timeLimitMs: problem.time_limit_ms || 2000,
+          })
+        : await runCodeOnServer(problem, state);
       setCodingRunResults(result);
     } catch (err) {
       setCodingRunResults({ all_passed: false, results: [], error: err.message });
@@ -356,7 +381,10 @@ const AssessmentWorkspace = () => {
             attemptId={attemptId}
             problems={codingProblems}
             currentIndex={codingIndex}
-            setCurrentIndex={setCodingIndex}
+            setCurrentIndex={(idx) => {
+              setCodingIndex(idx);
+              setCodingRunResults(null); // clear results when switching problems
+            }}
             language={currentCodingState.language}
             setLanguage={(lang) => setCodingStates((prev) => ({
               ...prev,
@@ -605,30 +633,7 @@ function CodingSection({
         </div>
 
         {/* Test Results Panel — bottom of right pane, scrollable */}
-        {runResults && (
-          <div className="shrink-0 h-48 border-t border-theme-border px-4 py-3 bg-theme-secondary overflow-y-auto">
-            <h4 className="font-semibold text-theme-primary mb-2 text-sm">
-              Test Results {runResults.all_passed ? '— All Passed ✓' : ''}
-            </h4>
-            {runResults.error ? (
-              <div className="text-red-400 text-sm">{runResults.error}</div>
-            ) : (
-              <div className="space-y-2">
-                {(runResults.results || []).map((r, idx) => (
-                  <div key={r.id || idx} className={`text-sm p-2 rounded ${r.passed ? 'bg-green-900/30 text-green-300' : 'bg-red-900/30 text-red-300'}`}>
-                    <span className="font-mono">{r.passed ? '✓' : '✗'} Sample {idx + 1}</span>
-                    {!r.passed && r.actual_output !== undefined && (
-                      <div className="mt-1 text-xs">
-                        <div>Expected: <code className="text-green-200">{r.expected_output}</code></div>
-                        <div>Got: <code className="text-red-200">{r.actual_output || '(empty)'}</code></div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        <TestResultsPanel runResults={runResults} />
       </div>
     </div>
   );

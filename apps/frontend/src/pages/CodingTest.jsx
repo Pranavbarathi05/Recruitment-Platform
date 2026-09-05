@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import CodeEditor from '../components/CodeEditor';
+import TestResultsPanel from '../components/TestResultsPanel';
+import { runCodeLocally, isClientRunnable } from '../execution/runner';
 
 /**
  * Coding Test Page
@@ -174,28 +176,46 @@ const CodingTest = () => {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Run executes client-side (Web Worker + WASM via Pyodide) for languages
+  // with a browser runtime — currently python3. It never touches the Submit
+  // flow; results are candidate feedback only. Other languages keep using the
+  // existing server-side run endpoint.
+  const runCodeOnServer = async (problem) => {
+    const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/run`, {
+      method: 'POST',
+      credentials: 'include',
+      body: JSON.stringify({
+        problem_id: problem.id,
+        language,
+        source_code: sourceCode,
+      }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || 'Failed to run code');
+    }
+
+    return resp.json();
+  };
+
   const handleRunCode = async () => {
-    if (!problems[currentProblemIndex] || running) return;
+    const problem = problems[currentProblemIndex];
+    if (!problem || running) return;
     setRunning(true);
     setRunResults(null);
 
     try {
-      const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/run`, {
-        method: 'POST',
-        credentials: 'include',
-        body: JSON.stringify({
-          problem_id: problems[currentProblemIndex].id,
-          language,
-          source_code: sourceCode,
-        }),
-      });
-
-      if (!resp.ok) {
-        const err = await resp.json();
-        throw new Error(err.detail || 'Failed to run code');
-      }
-
-      const result = await resp.json();
+      const result = isClientRunnable(language)
+        ? await runCodeLocally({
+            language,
+            sourceCode,
+            testCases: problem.test_cases || [], // public tests only
+            functionName: problem.function_name || 'solve',
+            className: problem.class_name || null,
+            timeLimitMs: problem.time_limit_ms || 2000,
+          })
+        : await runCodeOnServer(problem);
       setRunResults(result);
     } catch (err) {
       setRunResults({ all_passed: false, results: [], error: err.message });
@@ -470,43 +490,7 @@ const CodingTest = () => {
           </div>
 
           {/* Run Results */}
-          {runResults && (
-            <div className="border-t border-theme-border px-4 py-3 bg-theme-secondary max-h-64 overflow-y-auto">
-              <h4 className="font-semibold text-theme-primary mb-2 text-sm">
-                Test Results {runResults.all_passed ? '— All Passed ✓' : ''}
-              </h4>
-              {runResults.error ? (
-                <div className="text-red-400 text-sm">{runResults.error}</div>
-              ) : (
-                <div className="space-y-2">
-                  {(runResults.results || []).map((r, idx) => (
-                    <div
-                      key={r.id || idx}
-                      className={`text-sm p-2 rounded ${
-                        r.passed
-                          ? 'bg-green-900/30 text-green-300'
-                          : 'bg-red-900/30 text-red-300'
-                      }`}
-                    >
-                      <span className="font-mono">{r.passed ? '✓' : '✗'} Sample {idx + 1}</span>
-                      {!r.passed && r.actual_output !== undefined && (
-                        <div className="mt-1 text-xs">
-                          <div>Expected: <code className="text-green-200">{r.expected_output}</code></div>
-                          <div>Got: <code className="text-red-200">{r.actual_output || '(empty)'}</code></div>
-                        </div>
-                      )}
-                      {!r.passed && r.status === 'compile_error' && (
-                        <div className="mt-1 text-xs text-red-400">Compilation Error</div>
-                      )}
-                      {!r.passed && r.status === 'timeout' && (
-                        <div className="mt-1 text-xs text-yellow-400">Time Limit Exceeded</div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          <TestResultsPanel runResults={runResults} />
         </div>
       </div>
     </div>
