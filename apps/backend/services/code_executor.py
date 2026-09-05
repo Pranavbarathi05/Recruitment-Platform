@@ -116,6 +116,7 @@ def run_code_public(
     problem_id: Optional[str] = None,
     function_name: str = "solve",
     class_name: Optional[str] = None,
+    function_signature: Optional[str] = None,
 ) -> dict:
     """
     Run code against PUBLIC test cases (browser feedback only, never scored).
@@ -136,6 +137,7 @@ def run_code_public(
             language=language,
             function_name=function_name,
             class_name=class_name,
+            function_signature=function_signature,
             test_arguments=test_arguments,
             test_expected=test_expected,
         )
@@ -244,6 +246,7 @@ def evaluate_submission(
     problem_id: Optional[str] = None,
     function_name: str = "solve",
     class_name: Optional[str] = None,
+    function_signature: Optional[str] = None,
 ) -> dict:
     """
     Evaluate submission against ALL test cases (server-side only).
@@ -270,6 +273,7 @@ def evaluate_submission(
             language=language,
             function_name=function_name,
             class_name=class_name,
+            function_signature=function_signature,
             test_arguments=test_arguments,
             test_expected=test_expected,
         )

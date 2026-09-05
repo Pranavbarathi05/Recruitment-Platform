@@ -16,6 +16,7 @@ Tests verify:
 """
 
 import os
+import re
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -2788,6 +2789,77 @@ class TestHarnessGeneration:
         assert "#include <iostream>" in result
         assert "int main()" in result
 
+    def test_cpp_harness_supported_signature_generates(self):
+        """A fully supported C++ signature still generates a typed harness."""
+        from services.harness import generate_cpp_harness
+        code = "int add(int a, int b) { return a + b; }"
+        result = generate_cpp_harness(
+            candidate_code=code,
+            function_name="add",
+            class_name=None,
+            test_arguments=[[20, 22]],
+            test_expected=[42],
+            function_signature="int add(int a, int b)",
+        )
+        assert "int _arg0 = jsonToInt(args.to_array()[0]);" in result
+        assert "int _arg1 = jsonToInt(args.to_array()[1]);" in result
+        assert "int _result_native = add(_arg0, _arg1);" in result
+        assert "json::Value _result = intToJson(_result_native);" in result
+        # raw json::Value must not be passed to the native function
+        assert "json::Value _result = add(args.to_array()" not in result
+
+    def test_cpp_harness_unsupported_parameter_type_rejected(self):
+        """An unsupported C++ parameter type raises instead of falling back."""
+        from services.harness import generate_cpp_harness
+        with pytest.raises(ValueError, match="Unsupported C\\+\\+ parameter type"):
+            generate_cpp_harness(
+                candidate_code="int solve(char c) { return 1; }",
+                function_name="solve",
+                class_name=None,
+                test_arguments=[["a"]],
+                test_expected=[1],
+                function_signature="int solve(char c)",
+            )
+
+    def test_cpp_harness_unsupported_return_type_rejected(self):
+        """An unsupported C++ return type raises instead of falling back."""
+        from services.harness import generate_cpp_harness
+        with pytest.raises(ValueError, match="Unsupported C\\+\\+ return type"):
+            generate_cpp_harness(
+                candidate_code="void solve(int n) {}",
+                function_name="solve",
+                class_name=None,
+                test_arguments=[[1]],
+                test_expected=[1],
+                function_signature="void solve(int n)",
+            )
+
+    def test_cpp_harness_mismatched_function_name_rejected(self):
+        """A signature for a different function raises instead of falling back."""
+        from services.harness import generate_cpp_harness
+        with pytest.raises(ValueError, match="does not match"):
+            generate_cpp_harness(
+                candidate_code="int add(int a, int b) { return a + b; }",
+                function_name="add",
+                class_name=None,
+                test_arguments=[[1, 2]],
+                test_expected=[3],
+                function_signature="int sub(int a, int b)",
+            )
+
+    def test_cpp_harness_legacy_without_signature_preserved(self):
+        """Legacy raw-json::Value path still works when no signature is given."""
+        from services.harness import generate_cpp_harness
+        result = generate_cpp_harness(
+            candidate_code="class Solution {\npublic:\n    int solve(int n) { return n; }\n};",
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[5]],
+            test_expected=[5],
+            function_signature=None,
+        )
+        assert "json::Value _result = _obj.solve(args.to_array()[0]);" in result
+
     def test_java_harness_includes_candidate_code(self):
         """Java harness includes the candidate's solution code."""
         from services.harness import generate_java_harness
@@ -2801,6 +2873,153 @@ class TestHarnessGeneration:
         )
         assert code in result
         assert "import java.util.*" in result
+
+    def test_java_harness_supported_signature_generates(self):
+        """A supported Java signature generates a typed native harness."""
+        from services.harness import generate_java_harness
+        code = "class Solution {\n    public int[] twoSum(int[] nums, int target) { return nums; }\n}"
+        result = generate_java_harness(
+            candidate_code=code,
+            function_name="twoSum",
+            class_name="Solution",
+            test_arguments=[[[2, 7], 9]],
+            test_expected=[[0, 1]],
+            function_signature="public int[] twoSum(int[] nums, int target)",
+        )
+        assert "int[] _arg0 = jsonToIntArray(tcArgs.get(0));" in result
+        assert "int _arg1 = jsonToInt(tcArgs.get(1));" in result
+        assert "Solution _obj = new Solution();" in result
+        assert "int[] _result_native = _obj.twoSum(_arg0, _arg1);" in result
+        assert "JsonValue _result = intArrayToJson(_result_native);" in result
+        # raw JsonValue must not be passed to the native method
+        assert "_obj.twoSum(tcArgs" not in result
+
+    def test_java_harness_static_free_function_detected(self):
+        """Static-style Java function works without an explicit class_name."""
+        from services.harness import generate_java_harness
+        code = "class Solver {\n    public static int add(int a, int b) { return a + b; }\n}"
+        result = generate_java_harness(
+            candidate_code=code,
+            function_name="add",
+            class_name=None,
+            test_arguments=[[20, 22]],
+            test_expected=[42],
+            function_signature="public static int add(int a, int b)",
+        )
+        assert "int _arg0 = jsonToInt(tcArgs.get(0));" in result
+        assert "int _result_native = Solver.add(_arg0, _arg1);" in result
+
+    def test_java_harness_owner_detection_ignores_nested_class(self):
+        """Nested helper classes before the method must not be chosen as owner."""
+        from services.harness import generate_java_harness
+        code = (
+            "class Solution {\n"
+            "    static class Pair { int a; int b; }\n"
+            "    public int add(int a, int b) { return a + b; }\n"
+            "}"
+        )
+        result = generate_java_harness(
+            candidate_code=code,
+            function_name="add",
+            class_name=None,
+            test_arguments=[[20, 22]],
+            test_expected=[42],
+            function_signature="public int add(int a, int b)",
+        )
+        assert "Solution _obj = new Solution();" in result
+        assert "Pair _obj = new Pair();" not in result
+        assert "int _result_native = _obj.add(_arg0, _arg1);" in result
+
+    def test_java_harness_unsupported_parameter_type_rejected(self):
+        """An unsupported Java parameter type raises instead of falling back."""
+        from services.harness import generate_java_harness
+        with pytest.raises(ValueError, match="Unsupported Java parameter type"):
+            generate_java_harness(
+                candidate_code="class Solution { int solve(char c) { return 1; } }",
+                function_name="solve",
+                class_name="Solution",
+                test_arguments=[["a"]],
+                test_expected=[1],
+                function_signature="public int solve(char c)",
+            )
+
+    def test_java_harness_unsupported_return_type_rejected(self):
+        """An unsupported Java return type raises instead of falling back."""
+        from services.harness import generate_java_harness
+        with pytest.raises(ValueError, match="Unsupported Java return type"):
+            generate_java_harness(
+                candidate_code="class Solution { void solve(int n) {} }",
+                function_name="solve",
+                class_name="Solution",
+                test_arguments=[[1]],
+                test_expected=[1],
+                function_signature="public void solve(int n)",
+            )
+
+    def test_java_harness_mismatched_function_name_rejected(self):
+        """A Java signature for a different function raises instead of falling back."""
+        from services.harness import generate_java_harness
+        with pytest.raises(ValueError, match="does not match"):
+            generate_java_harness(
+                candidate_code="class Solution { int add(int a, int b) { return a + b; } }",
+                function_name="add",
+                class_name="Solution",
+                test_arguments=[[1, 2]],
+                test_expected=[3],
+                function_signature="public int sub(int a, int b)",
+            )
+
+    def test_java_harness_legacy_without_signature_preserved(self):
+        """Legacy raw-JsonValue Java path still works when no signature is given."""
+        from services.harness import generate_java_harness
+        result = generate_java_harness(
+            candidate_code="class Solution {\n    public int solve(int n) { return n; }\n}",
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[5]],
+            test_expected=[5],
+            function_signature=None,
+        )
+        assert "JsonValue _result = _obj.solve(tcArgs);" in result
+
+    @pytest.mark.parametrize(
+        "signature,args,expected,native_ret,to_json_fn",
+        [
+            ("public int add(int a, int b)", [[20, 22]], [42], "int", "intToJson"),
+            ("public long addLong(long a, long b)", [[1, 2]], [3], "long", "longToJson"),
+            ("public double avg(double a, double b)", [[10.0, 20.0]], [15.0], "double", "doubleToJson"),
+            ("public boolean isPalindrome(String s)", [["racecar"]], [True], "boolean", "booleanToJson"),
+            ("public String echo(String s)", [["hi"]], ["hi"], "String", "stringToJson"),
+            ("public int[] twoSum(int[] nums, int target)", [[[2, 7], 9]], [[0, 1]], "int[]", "intArrayToJson"),
+            ("public long[] shift(long[] a, long b)", [[[1, 2], 3]], [[4, 5]], "long[]", "longArrayToJson"),
+            ("public double[] scale(double[] a, double b)", [[[1.5, 2.0], 2.0]], [[3.0, 4.0]], "double[]", "doubleArrayToJson"),
+            ("public boolean[] flip(boolean[] a)", [[[True, False]]], [[False, True]], "boolean[]", "booleanArrayToJson"),
+            ("public String[] sortStrings(String[] a)", [[["b", "a"]]], [["a", "b"]], "String[]", "stringArrayToJson"),
+            ("public int[][] transpose(int[][] m)", [[[[1, 2], [3, 4]]]], [[[1, 3], [2, 4]]], "int[][]", "intMatrixToJson"),
+            ("public String[][] grid(String[][] m)", [[[["a"], ["b"]]]], [[["a"], ["b"]]], "String[][]", "stringMatrixToJson"),
+        ],
+    )
+    def test_java_harness_type_matrix(self, signature, args, expected, native_ret, to_json_fn):
+        """Each supported Java type generates native typed marshaling calls."""
+        from services.harness import generate_java_harness
+        fn = re.search(r"(\w+)\s*\(", signature).group(1)
+        nparams = signature[signature.find("(") + 1:signature.rfind(")")]
+        count = 0 if not nparams.strip() else nparams.count(",") + 1
+        result = generate_java_harness(
+            candidate_code=f"class Solution {{ public {signature} {{ return null; }} }}",
+            function_name=fn,
+            class_name="Solution",
+            test_arguments=[args],
+            test_expected=[expected],
+            function_signature=signature,
+        )
+        for i in range(count):
+            assert f"_arg{i} = jsonTo" in result
+        assert f"{native_ret} _result_native = _obj.{fn}(" in result
+        assert f"JsonValue _result = {to_json_fn}(_result_native);" in result
+        # raw JsonValue invocation must not appear
+        assert f"_obj.{fn}(tcArgs" not in result
+        assert f"JsonValue _result = _obj.{fn}(" not in result
 
     def test_harness_main_entry_python(self):
         """generate_harness dispatches to Python for python3."""

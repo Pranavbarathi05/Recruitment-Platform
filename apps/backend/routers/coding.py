@@ -248,7 +248,7 @@ def run_code(
 
     problem_resp = (
         supabase_client.table("coding_problems")
-        .select("time_limit_ms, memory_limit_mb, function_name, class_name")
+        .select("time_limit_ms, memory_limit_mb, function_name, class_name, function_signature")
         .eq("id", payload.problem_id)
         .execute()
     )
@@ -264,6 +264,7 @@ def run_code(
         problem_id=payload.problem_id,
         function_name=problem.get("function_name", "solve"),
         class_name=problem.get("class_name"),
+        function_signature=problem.get("function_signature"),
     )
 
 
@@ -299,7 +300,7 @@ def submit_coding_solution(
 
     problem_resp = (
         supabase_client.table("coding_problems")
-        .select("time_limit_ms, memory_limit_mb, function_name, class_name")
+        .select("time_limit_ms, memory_limit_mb, function_name, class_name, function_signature")
         .eq("id", payload.problem_id)
         .execute()
     )
@@ -315,6 +316,7 @@ def submit_coding_solution(
         problem_id=payload.problem_id,
         function_name=problem.get("function_name", "solve"),
         class_name=problem.get("class_name"),
+        function_signature=problem.get("function_signature"),
     )
 
     if eval_result["tests_passed"] == eval_result["tests_total"]:
