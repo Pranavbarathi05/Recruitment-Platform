@@ -4,6 +4,7 @@ import teamimg from '../assets/images/team.jpg';
 import learn from '../assets/images/learn.jpg';
 import share from '../assets/images/share.jpg';
 import { useAuth } from '../hooks/useAuth';
+import PasswordInput from '../components/PasswordInput';
 
 /**
  * Signup Page
@@ -228,9 +229,8 @@ const Signup = () => {
 
             <div>
               <label htmlFor="password" className="block text-sm font-medium text-theme-muted mb-2">Password</label>
-              <input
+              <PasswordInput
                 id="password"
-                type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
