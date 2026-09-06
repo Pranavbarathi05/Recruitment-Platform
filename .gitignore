@@ -41,3 +41,4 @@ npm-debug.log*
 
 # Freebuff platform metadata
 .freebuff/
+.wasmer/
