@@ -8,6 +8,7 @@ All endpoints:
 - Use the shared attempt's selected_coding_problem_ids
 """
 
+import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
@@ -20,6 +21,31 @@ router = APIRouter(prefix="/coding", tags=["Coding Assessment"])
 
 def _utcnow():
     return datetime.now(timezone.utc)
+
+
+def _normalize_test_case_expected(test_case: dict) -> dict:
+    """Restore the typed expected value at the DB -> application boundary.
+
+    ``coding_test_cases.expected_output`` is a legacy TEXT column, so
+    function-based rows (``arguments IS NOT NULL``) that store JSON values such
+    as ``[0,1]`` or ``true`` come back from the database as JSON text
+    (``"[0,1]"``, ``"true"``). Candidate functions return real JSON-compatible
+    values, so a stringified expected would never match and correct answers
+    would be reported as wrong answers.
+
+    Parse the stored JSON text back into its actual value for function-based
+    rows. Legacy input-based rows (``arguments IS NULL``) keep their raw-string
+    semantics untouched. Values that are not valid JSON are left as-is.
+    """
+    if test_case.get("arguments") is None:
+        return test_case
+    expected = test_case.get("expected_output")
+    if isinstance(expected, str):
+        try:
+            test_case["expected_output"] = json.loads(expected)
+        except ValueError:
+            pass
+    return test_case
 
 
 def _is_expired(attempt: dict) -> bool:
@@ -107,7 +133,9 @@ def get_coding_problems(
             .order("ordering")
             .execute()
         )
-        p["test_cases"] = tests_resp.data or []
+        p["test_cases"] = [
+            _normalize_test_case_expected(tc) for tc in (tests_resp.data or [])
+        ]
 
     # Submission status (no scoring data exposed to candidate)
     subs_resp = (
@@ -242,7 +270,9 @@ def run_code(
         .order("ordering")
         .execute()
     )
-    test_cases = tests_resp.data or []
+    test_cases = [
+        _normalize_test_case_expected(tc) for tc in (tests_resp.data or [])
+    ]
     if not test_cases:
         return {"all_passed": True, "results": [], "message": "No public test cases"}
 
@@ -294,7 +324,9 @@ def submit_coding_solution(
         .order("ordering")
         .execute()
     )
-    test_cases = tests_resp.data or []
+    test_cases = [
+        _normalize_test_case_expected(tc) for tc in (tests_resp.data or [])
+    ]
     if not test_cases:
         raise HTTPException(status_code=400, detail="No test cases configured")
 

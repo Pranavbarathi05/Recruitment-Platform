@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
+import { generatePythonStarterCode } from '../utils/codingStarterCode';
 
 /**
  * Admin Coding Problems Page — Function-Based Problem Builder
@@ -16,12 +17,6 @@ import { useAuth } from '../hooks/useAuth';
 
 const DIFFICULTIES = ['easy', 'medium', 'hard'];
 const LANGUAGES = ['python3', 'cpp', 'java'];
-
-const DEFAULT_STARTER_CODE = {
-  python3: 'class Solution:\n    def solve(self, nums, target):\n        # Write your solution here\n        pass\n',
-  cpp: 'class Solution {\npublic:\n    vector<int> solve(vector<int>& nums, int target) {\n        // Write your solution here\n        return {};\n    }\n};\n',
-  java: 'class Solution {\n    public int[] solve(int[] nums, int target) {\n        // Write your solution here\n        return new int[]{};\n    }\n}\n',
-};
 
 const AdminCoding = () => {
   const { getAuthHeaders } = useAuth();
@@ -40,8 +35,8 @@ const AdminCoding = () => {
     difficulty: 'medium', constraints: '', points: 10,
     time_limit_ms: 2000, memory_limit_mb: 256,
     supported_languages: ['python3', 'cpp', 'java'], is_active: true,
-    starter_code: { ...DEFAULT_STARTER_CODE },
-    function_name: 'solve', class_name: 'Solution', function_signature: '',
+    starter_code: { python3: '' },
+    function_name: 'solve', class_name: '', function_signature: '',
     input_format: '', output_format: '', explanation: '',
   });
 
@@ -347,8 +342,8 @@ const AdminCoding = () => {
       difficulty: 'medium', constraints: '', points: 10,
       time_limit_ms: 2000, memory_limit_mb: 256,
       supported_languages: ['python3', 'cpp', 'java'], is_active: true,
-      starter_code: { ...DEFAULT_STARTER_CODE },
-      function_name: 'solve', class_name: 'Solution', function_signature: '',
+      starter_code: { python3: '' },
+      function_name: 'solve', class_name: '', function_signature: '',
       input_format: '', output_format: '', explanation: '',
     });
   };
@@ -366,7 +361,9 @@ const AdminCoding = () => {
       memory_limit_mb: problem.memory_limit_mb,
       supported_languages: problem.supported_languages || ['python3'],
       is_active: problem.is_active,
-      starter_code: problem.starter_code || { ...DEFAULT_STARTER_CODE },
+      starter_code: problem.starter_code && Object.keys(problem.starter_code).length > 0
+        ? problem.starter_code
+        : { python3: '' },
       function_name: problem.function_name || 'solve',
       class_name: problem.class_name || '',
       function_signature: problem.function_signature || '',
@@ -387,6 +384,26 @@ const AdminCoding = () => {
 
   const inputClass = 'w-full bg-theme-primary text-theme-primary border border-theme-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500';
   const labelClass = 'block text-sm font-medium text-theme-muted mb-1';
+
+  const updatePythonStarterCode = (value) => {
+    setProblemForm({
+      ...problemForm,
+      starter_code: { ...problemForm.starter_code, python3: value },
+    });
+  };
+
+  const applyPythonStarterFromMetadata = () => {
+    try {
+      const generated = generatePythonStarterCode(
+        problemForm.function_name,
+        problemForm.class_name,
+        problemForm.function_signature,
+      );
+      updatePythonStarterCode(generated);
+    } catch {
+      updatePythonStarterCode('');
+    }
+  };
 
   return (
     <div className="min-h-screen bg-theme-primary py-8 px-4">
@@ -526,22 +543,36 @@ const AdminCoding = () => {
                       <label className={labelClass}>Function Signature</label>
                       <input value={problemForm.function_signature} onChange={(e) => setProblemForm({ ...problemForm, function_signature: e.target.value })} className={inputClass} placeholder="e.g. def twoSum(self, nums: List[int], target: int) -> List[int]" />
                     </div>
+                    <p className="text-xs text-theme-muted mt-1">
+                      These fields describe the function contract. The Python starter below is the candidate-visible
+                      boilerplate; the test harness and invocation code stay behind the scenes.
+                    </p>
                   </div>
 
-                  {/* Starter Code */}
+                  {/* Starter Code (per language) */}
                   <div className="border-b border-theme-border pb-3">
-                    <h3 className="text-sm font-bold text-theme-primary mb-2">Starter Code (per language)</h3>
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-sm font-bold text-theme-primary mb-0">Starter Code (per language)</h3>
+                      <button
+                        type="button"
+                        onClick={applyPythonStarterFromMetadata}
+                        className="text-xs text-blue-400 hover:text-blue-300 underline"
+                      >
+                        Regenerate Python from metadata
+                      </button>
+                    </div>
                     {LANGUAGES.filter((l) => problemForm.supported_languages.includes(l)).map((lang) => (
                       <div key={lang} className="mb-2">
-                        <label className={labelClass}>{lang}</label>
+                        <label className={labelClass}>{lang} {lang === 'python3' ? '(candidate-visible)' : ''}</label>
                         <textarea
-                          value={problemForm.starter_code[lang] || ''}
+                          value={problemForm.starter_code?.[lang] || ''}
                           onChange={(e) => setProblemForm({
                             ...problemForm,
                             starter_code: { ...problemForm.starter_code, [lang]: e.target.value },
                           })}
                           className={`${inputClass} font-mono text-xs`}
                           rows={6}
+                          placeholder={lang === 'python3' ? 'Generated from function metadata when you click "Regenerate".' : 'Candidate-visible starter code for this language.'}
                         />
                       </div>
                     ))}

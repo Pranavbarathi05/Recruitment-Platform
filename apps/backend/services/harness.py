@@ -24,6 +24,102 @@ logger = logging.getLogger(__name__)
 # Python Harness (primary)
 # ============================================================
 
+def _parse_python_param_names(parsed_signature: Optional[str]) -> list[str]:
+    """
+    Extract the actual parameter names from a Python function signature string.
+
+    We keep names in their declaration order and discard type annotations,
+    default values, and the special 'self'/'cls' tokens. When the signature has
+    no useful parameter list we return the empty list.
+
+    Only the parameter names themselves matter here: the caller decides whether
+    the generated starter is a class method (adds `self`) or a free function.
+    """
+    if not parsed_signature or not parsed_signature.strip():
+        return []
+
+    open_paren = parsed_signature.find("(")
+    close_paren = parsed_signature.rfind(")")
+    if open_paren == -1 or close_paren == -1 or close_paren < open_paren:
+        return []
+
+    params_str = parsed_signature[open_paren + 1:close_paren].strip()
+    if not params_str:
+        return []
+
+    collected: list[str] = []
+    for part in params_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        # Drop return annotation, then default value, then a single trailing
+        # `: Type` annotation. This keeps `nums: List[int]` -> `nums` without
+        # needing a full Python type parser.
+        arrow_idx = part.find("->")
+        if arrow_idx != -1:
+            part = part[:arrow_idx].strip()
+        eq_idx = part.find("=")
+        if eq_idx != -1:
+            part = part[:eq_idx].strip()
+        if ":" in part:
+            candidate = part.split(":")[0].strip()
+            if candidate and candidate.isidentifier() and candidate not in ("self", "cls"):
+                collected.append(candidate)
+                continue
+            # The text before the colon was not a clean name (e.g. a bare type
+            # hint); fall through and recover the identifier from the remainder.
+            part = part.split(":")[-1].strip()
+
+        # Fallback: walk whitespace-separated tokens backward and keep the last
+        # plain identifier that is not self/cls.
+        p_tokens = part.split()
+        if not p_tokens:
+            continue
+        for raw in reversed(p_tokens):
+            if raw in ("self", "cls"):
+                continue
+            if raw.isidentifier():
+                collected.append(raw)
+                break
+
+    return collected
+
+
+def _generate_python_starter_code(
+    function_name: str,
+    class_name: Optional[str],
+    function_signature: Optional[str] = None,
+) -> str:
+    """
+    Generate a candidate-visible Python starter that matches the configured
+    problem metadata.
+
+    The candidate sees ONLY the function/class boilerplate, never the harness.
+    """
+    if not function_name:
+        raise ValueError("function_name is required for Python starter code")
+
+    param_names = [p for p in _parse_python_param_names(function_signature) if p not in ("self", "cls")]
+    body_params = param_names if param_names else ["arg1", "arg2"]
+
+    if class_name:
+        if not class_name.strip():
+            raise ValueError("class_name must not be blank when provided")
+        return (
+            f"class {class_name.strip()}:\n"
+            f"    def {function_name}(self, {", ".join(body_params)}):\n"
+            f"        # Write your solution here\n"
+            f"        pass\n"
+        )
+
+    return (
+        f"def {function_name}({", ".join(body_params)}):\n"
+        f"    # Write your solution here\n"
+        f"    pass\n"
+    )
+
+
 def generate_python_harness(
     candidate_code: str,
     function_name: str,

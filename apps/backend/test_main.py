@@ -3088,6 +3088,118 @@ class TestHarnessGeneration:
         assert "[3, 1, 2]" in result
         assert "[1, 2, 3]" in result
 
+    def test_python_starter_code_free_function(self):
+        """Starter code uses configured function_name and signature parameter names."""
+        from services.harness import _generate_python_starter_code
+        starter = _generate_python_starter_code(
+            function_name="solve",
+            class_name=None,
+            function_signature="def solve(nums, target):",
+        )
+        assert starter.startswith("def solve(nums, target):")
+        assert "class Solution" not in starter
+
+    def test_python_starter_code_with_class(self):
+        """Starter code includes Solution class and self parameter."""
+        from services.harness import _generate_python_starter_code
+        starter = _generate_python_starter_code(
+            function_name="twoSum",
+            class_name="Solution",
+            function_signature="def twoSum(self, nums: List[int], target: int) -> List[int]",
+        )
+        assert starter.startswith("class Solution:")
+        assert "def twoSum(self, nums, target):" in starter
+
+    def test_python_starter_code_no_signature_defaults(self):
+        """Starter code falls back to generic parameter names when signature is blank."""
+        from services.harness import _generate_python_starter_code
+        starter = _generate_python_starter_code(
+            function_name="solve",
+            class_name=None,
+            function_signature=None,
+        )
+        assert starter.startswith("def solve(arg1, arg2):")
+
+    def test_python_starter_code_rejects_blank_function_name(self):
+        """Starter code raises when function_name is missing."""
+        from services.harness import _generate_python_starter_code
+        with pytest.raises(ValueError):
+            _generate_python_starter_code(
+                function_name="",
+                class_name=None,
+                function_signature=None,
+            )
+
+    def test_python_harness_two_sum_pass(self):
+        """Two Sum harness calls solve(nums, target) and compares against [0,1]."""
+        from services.harness import generate_python_harness
+        result = generate_python_harness(
+            candidate_code=(
+                "def solve(nums, target):\n"
+                "    for i, num in enumerate(nums):\n"
+                "        complement = target - num\n"
+                "        if complement in nums[:i]:\n"
+                "            return [nums.index(complement), i]\n"
+                "    return []"
+            ),
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[[2, 7, 11, 15], 9]],
+            test_expected=[[0, 1]],
+        )
+        assert "solve(_tc_args[0], _tc_args[1])" in result
+        assert "json.loads" in result
+        assert "TEST_ARGS" in result
+        assert "TEST_EXPECTED" in result
+
+    def test_python_harness_two_sum_wrong_answer_via_harness_output(self):
+        """Wrong answer is represented by passed=false in harness output."""
+        from services.harness import generate_python_harness
+        result = generate_python_harness(
+            candidate_code="def solve(nums, target): return [0, 0]",
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[[2, 7, 11, 15], 9]],
+            test_expected=[[0, 1]],
+        )
+        assert "solve(_tc_args[0], _tc_args[1])" in result
+        # The harness serializes both sides and compares them; a wrong answer
+        # still produces a valid JSON result with passed=false.
+        assert "_result_json == _expected_json" in result
+
+    def test_python_starter_code_respects_signature_param_names(self):
+        """Starter code uses signature parameter names, not annotation tokens."""
+        from services.harness import _generate_python_starter_code
+        starter = _generate_python_starter_code(
+            function_name="twoSum",
+            class_name="Solution",
+            function_signature="def twoSum(self, nums: List[int], target: int) -> List[int]",
+        )
+        assert "def twoSum(self, nums, target):" in starter
+        assert "def twoSum(self, List[int], int):" not in starter
+
+    def test_python_starter_code_no_class_uses_signature_param_names(self):
+        """Free-function starter uses signature parameter names."""
+        from services.harness import _generate_python_starter_code
+        starter = _generate_python_starter_code(
+            function_name="solve",
+            class_name=None,
+            function_signature="def solve(nums: list[int], target: int) -> list[int]",
+        )
+        assert "def solve(nums, target):" in starter
+        assert "def solve(list[int], int):" not in starter
+
+    def test_python_starter_code_selfless_when_no_class_and_sig_has_self(self):
+        """When there is no class, starter code omits self even if signature has it."""
+        from services.harness import _generate_python_starter_code
+        starter = _generate_python_starter_code(
+            function_name="solve",
+            class_name=None,
+            function_signature="def solve(self, nums: list[int], target: int) -> list[int]",
+        )
+        assert "def solve(nums, target):" in starter
+        assert "def solve(self, nums, target):" not in starter
+
     def test_harness_output_comparison(self):
         """Python harness compares actual vs expected output."""
         from services.harness import generate_harness
@@ -3334,6 +3446,309 @@ class TestCodeExecutorWithHarness:
         result = run_code_public("1/0", "python3", test_cases)
         assert result["results"][0]["status"] == "runtime_error"
         assert "ZeroDivisionError" in result["results"][0]["stderr"]
+
+
+class TestExpectedOutputNormalization:
+    """Regression tests for the TEXT expected_output column.
+
+    ``coding_test_cases.expected_output`` is a legacy TEXT column, so
+    function-based rows (arguments IS NOT NULL) come back from the database as
+    JSON text ("[0,1]", "true") instead of real JSON-compatible values. This
+    made correct answers fail comparison. The read boundary in coding.py must
+    restore the typed value; legacy input-based rows must stay raw strings.
+    """
+
+    def _normalize(self, tc):
+        from routers.coding import _normalize_test_case_expected
+        return _normalize_test_case_expected(dict(tc))
+
+    def test_function_based_array(self):
+        tc = {"arguments": [[2, 7, 11, 15], 9], "expected_output": "[0,1]"}
+        assert self._normalize(tc)["expected_output"] == [0, 1]
+
+    def test_function_based_boolean(self):
+        tc = {"arguments": [[1, 2]], "expected_output": "true"}
+        assert self._normalize(tc)["expected_output"] is True
+
+    def test_function_based_number(self):
+        tc = {"arguments": [[21, 21]], "expected_output": "42"}
+        assert self._normalize(tc)["expected_output"] == 42
+
+    def test_function_based_string(self):
+        tc = {"arguments": [["hello"]], "expected_output": '"abc"'}
+        assert self._normalize(tc)["expected_output"] == "abc"
+
+    def test_function_based_nested_array(self):
+        tc = {"arguments": [[1]], "expected_output": "[[1,2],[3,4]]"}
+        assert self._normalize(tc)["expected_output"] == [[1, 2], [3, 4]]
+
+    def test_legacy_input_based_preserves_raw_string(self):
+        """arguments IS NULL rows must never be json.loads'd."""
+        tc = {"arguments": None, "expected_output": "some raw legacy output"}
+        assert self._normalize(tc)["expected_output"] == "some raw legacy output"
+        # Even when the legacy string happens to look like JSON.
+        tc2 = {"arguments": None, "expected_output": "[0,1]"}
+        assert self._normalize(tc2)["expected_output"] == "[0,1]"
+
+    def test_already_typed_value_unchanged(self):
+        tc = {"arguments": [[2, 7, 11, 15], 9], "expected_output": [0, 1]}
+        assert self._normalize(tc)["expected_output"] == [0, 1]
+
+    def test_invalid_json_string_left_as_is(self):
+        """Defensive: non-JSON text on a function row stays a string."""
+        tc = {"arguments": [["x"]], "expected_output": "hello world"}
+        assert self._normalize(tc)["expected_output"] == "hello world"
+
+    # ------------------------------------------------------------------
+    # End-to-end: the candidate problem API drives client-side Pyodide Run
+    # ------------------------------------------------------------------
+
+    def _make_attempt(self):
+        now = datetime.now(timezone.utc)
+        return {
+            "id": MOCK_ATTEMPT_ID,
+            "profile_id": MOCK_PROFILE_ID,
+            "status": "in_progress",
+            "domain_ids": [MOCK_DOMAIN_1_ID],
+            "selected_coding_problem_ids": [MOCK_CODING_PROBLEM_ID],
+            "total_coding_problems": 1,
+            "duration_minutes": 20,
+            "started_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=20)).isoformat(),
+        }
+
+    @staticmethod
+    def _make_problem_row():
+        return {
+            "id": MOCK_CODING_PROBLEM_ID,
+            "title": "Two Sum",
+            "slug": "two-sum",
+            "description": "d",
+            "difficulty": "easy",
+            "constraints": None,
+            "input_format": None,
+            "output_format": None,
+            "explanation": None,
+            "starter_code": {},
+            "supported_languages": ["python3"],
+            "time_limit_ms": 2000,
+            "memory_limit_mb": 256,
+            "points": 10,
+            "function_name": "twoSum",
+            "class_name": "Solution",
+            "function_signature": "twoSum(nums: list[int], target: int) -> list[int]",
+        }
+
+    def _make_stub_supabase(self, reads, writes=None):
+        """Deterministic fluent stub: table name selects the response list."""
+        from types import SimpleNamespace
+
+        writes = writes or {}
+
+        class _Fluent:
+            def __init__(self, name):
+                self._name = name
+                self._mode = "select"
+
+            def select(self, *a, **k):
+                self._mode = "select"
+                return self
+
+            def in_(self, *a, **k):
+                return self
+
+            def eq(self, *a, **k):
+                return self
+
+            def order(self, *a, **k):
+                return self
+
+            def insert(self, *a, **k):
+                self._mode = "insert"
+                return self
+
+            def update(self, *a, **k):
+                self._mode = "update"
+                return self
+
+            def delete(self, *a, **k):
+                self._mode = "delete"
+                return self
+
+            def execute(self):
+                if self._mode == "insert":
+                    data = writes.get(self._name, [])
+                elif self._mode == "select":
+                    data = reads.get(self._name, [])
+                else:  # update/delete
+                    data = []
+                return SimpleNamespace(data=data)
+
+        class _Client:
+            def table(self, name):
+                return _Fluent(name)
+
+        return _Client()
+
+    def test_problems_endpoint_returns_typed_expected(self):
+        """GET problems emits real values (not JSON text) for public tests."""
+        from unittest.mock import patch
+        from routers import coding as coding_router
+        from routers.coding import get_coding_problems
+
+        stub = self._make_stub_supabase({
+            "assessment_attempts": [self._make_attempt()],
+            "coding_problems": [self._make_problem_row()],
+            # Simulates the real TEXT column reads observed in DEV.
+            "coding_test_cases": [
+                {
+                    "id": MOCK_TEST_CASE_ID,
+                    "arguments": [[2, 7, 11, 15], 9],
+                    "expected_output": "[0,1]",
+                    "ordering": 0,
+                    "points": 1,
+                    "input": None,
+                },
+                {
+                    "id": "tc2-id",
+                    "arguments": [[3, 2, 4], 6],
+                    "expected_output": "[1,2]",
+                    "ordering": 1,
+                    "points": 1,
+                    "input": None,
+                },
+            ],
+            "coding_submissions": [],
+            "coding_drafts": [],
+        })
+
+        with patch.object(coding_router, "supabase_client", stub):
+            user = MagicMock()
+            user.id = MOCK_PROFILE_ID
+            result = get_coding_problems(MOCK_ATTEMPT_ID, user)
+
+        test_cases = result["problems"][0]["test_cases"]
+        assert test_cases[0]["expected_output"] == [0, 1]
+        assert test_cases[0]["expected_output"] != "[0,1]"
+        assert test_cases[1]["expected_output"] == [1, 2]
+
+    @patch("routers.coding.run_code_public")
+    def test_run_endpoint_normalizes_before_code_executor(self, mock_run):
+        """Server Run hands typed expected values to run_code_public."""
+        from unittest.mock import patch
+        from schemas.coding import CodingRunRequest
+        from routers import coding as coding_router
+        from routers.coding import run_code
+
+        stub = self._make_stub_supabase({
+            "assessment_attempts": [self._make_attempt()],
+            "coding_test_cases": [
+                {
+                    "id": MOCK_TEST_CASE_ID,
+                    "arguments": [[2, 7, 11, 15], 9],
+                    "expected_output": "[0,1]",
+                    "is_public": True,
+                    "ordering": 0,
+                    "input": None,
+                }
+            ],
+            "coding_problems": [
+                {
+                    "time_limit_ms": 2000,
+                    "memory_limit_mb": 256,
+                    "function_name": "twoSum",
+                    "class_name": "Solution",
+                    "function_signature": None,
+                }
+            ],
+        })
+        mock_run.return_value = {"all_passed": True, "results": [], "message": "ok"}
+
+        with patch.object(coding_router, "supabase_client", stub):
+            user = MagicMock()
+            user.id = MOCK_PROFILE_ID
+            req = CodingRunRequest(
+                problem_id=MOCK_CODING_PROBLEM_ID,
+                language="python3",
+                source_code="def twoSum(nums, target): return [0, 1]",
+            )
+            run_code(MOCK_ATTEMPT_ID, req, user)
+
+        received_tests = mock_run.call_args.args[2]
+        assert received_tests[0]["expected_output"] == [0, 1]
+        assert isinstance(received_tests[0]["expected_output"], list)
+
+    @patch("routers.coding.evaluate_submission")
+    def test_submit_endpoint_normalizes_before_scoring(self, mock_eval):
+        """Submit (public + hidden) hands typed expected values to evaluate_submission."""
+        from unittest.mock import patch
+        from schemas.coding import CodingSubmitRequest
+        from routers import coding as coding_router
+        from routers.coding import submit_coding_solution
+
+        stub = self._make_stub_supabase(
+            {
+                "assessment_attempts": [self._make_attempt()],
+                # ALL test cases (public + hidden) come back as JSON text.
+                "coding_test_cases": [
+                    {
+                        "id": MOCK_TEST_CASE_ID,
+                        "arguments": [[2, 7, 11, 15], 9],
+                        "expected_output": "[0,1]",
+                        "is_public": True,
+                        "points": 1,
+                        "ordering": 0,
+                        "input": None,
+                    },
+                    {
+                        "id": "hidden-1",
+                        "arguments": [[3, 3], 6],
+                        "expected_output": "[0,1]",
+                        "is_public": False,
+                        "points": 1,
+                        "ordering": 1,
+                        "input": None,
+                    },
+                ],
+                "coding_problems": [
+                    {
+                        "time_limit_ms": 2000,
+                        "memory_limit_mb": 256,
+                        "function_name": "twoSum",
+                        "class_name": "Solution",
+                        "function_signature": None,
+                    }
+                ],
+                "coding_submissions": [],
+            },
+            writes={"coding_submissions": [{"id": "sub-1"}]},
+        )
+        mock_eval.return_value = {
+            "tests_passed": 2,
+            "tests_total": 2,
+            "score": 2,
+            "max_score": 2,
+            "execution_time_ms": 10,
+            "test_results": [{"status": "passed"}, {"status": "passed"}],
+        }
+
+        with patch.object(coding_router, "supabase_client", stub):
+            user = MagicMock()
+            user.id = MOCK_PROFILE_ID
+            req = CodingSubmitRequest(
+                problem_id=MOCK_CODING_PROBLEM_ID,
+                language="python3",
+                source_code="def twoSum(nums, target): return [0, 1]",
+            )
+            response = submit_coding_solution(MOCK_ATTEMPT_ID, req, user)
+
+        assert response["status"] == "passed"
+        received_tests = mock_eval.call_args.args[2]
+        assert received_tests[0]["expected_output"] == [0, 1]
+        assert received_tests[1]["expected_output"] == [0, 1]
+        assert all(
+            isinstance(t["expected_output"], list) for t in received_tests
+        )
 
 
 # =====================================================================

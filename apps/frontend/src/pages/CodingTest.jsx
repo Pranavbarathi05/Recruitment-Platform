@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import CodeEditor from '../components/CodeEditor';
 import TestResultsPanel from '../components/TestResultsPanel';
 import { runCodeLocally, isClientRunnable } from '../execution/runner';
+import { generatePythonStarterCode } from '../utils/codingStarterCode';
 
 /**
  * Coding Test Page
@@ -96,11 +97,28 @@ const CodingTest = () => {
       setSourceCode(problem.draft.source_code);
       setLanguage(problem.draft.language || 'python3');
     } else {
-      // Load starter code
-      const starters = problem.starter_code || {};
-      const defaultLang = problem.supported_languages?.[0] || 'python3';
-      setSourceCode(starters[defaultLang] || getDefaultStarter(defaultLang));
-      setLanguage(defaultLang);
+      // Load starter code. For Python we can regenerate a correct starter from
+      // the problem metadata when the stored starter for the active language is
+      // missing/empty, so the editor never silently falls back to a generic
+      // skeleton that disagrees with the configured function metadata.
+      const activeLang = language || problem.supported_languages?.[0] || 'python3';
+      const storedStarter = problem.starter_code?.[activeLang];
+
+      if (activeLang === 'python3') {
+        setSourceCode(
+          (storedStarter && storedStarter.trim())
+            ? storedStarter
+            : generatePythonStarterCode(
+                problem.function_name || 'solve',
+                problem.class_name || null,
+                problem.function_signature || null,
+              ),
+        );
+      } else {
+        setSourceCode(storedStarter || getDefaultStarter(activeLang));
+      }
+
+      setLanguage(activeLang);
     }
     setRunResults(null);
     lastSavedCodeRef.current = '';
