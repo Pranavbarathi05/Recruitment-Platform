@@ -2848,7 +2848,8 @@ class TestHarnessGeneration:
             )
 
     def test_cpp_harness_legacy_without_signature_preserved(self):
-        """Legacy raw-json::Value path still works when no signature is given."""
+        """Legacy path (no signature) materializes mutable native args before
+        the call, so vector<T>&-style candidate parameters bind correctly."""
         from services.harness import generate_cpp_harness
         result = generate_cpp_harness(
             candidate_code="class Solution {\npublic:\n    int solve(int n) { return n; }\n};",
@@ -2858,7 +2859,37 @@ class TestHarnessGeneration:
             test_expected=[5],
             function_signature=None,
         )
-        assert "json::Value _result = _obj.solve(args.to_array()[0]);" in result
+        # Arguments must be materialized into named native locals first...
+        assert "int _arg0 = jsonToInt(args.to_array()[0]);" in result
+        # ...and the call must use those locals, never a raw json::Value.
+        assert "json::Value _result = nativeToJson(_obj.solve(_arg0));" in result
+        assert "_obj.solve(args.to_array()" not in result
+
+    def test_cpp_harness_legacy_vector_ref_arg_binds(self):
+        """Regression: legacy harness for a candidate taking vector<int>& must
+        pass a named mutable std::vector<int> (a temporary cannot bind to a
+        non-const reference)."""
+        from services.harness import generate_cpp_harness
+        candidate = (
+            "vector<int> solve(vector<int>& nums, int target) {\n"
+            "    for (int i = 0; i < (int)nums.size(); i++)\n"
+            "        for (int j = i + 1; j < (int)nums.size(); j++)\n"
+            "            if (nums[i] + nums[j] == target) return {i, j};\n"
+            "    return {};\n"
+            "}"
+        )
+        result = generate_cpp_harness(
+            candidate_code=candidate,
+            function_name="solve",
+            class_name=None,
+            test_arguments=[[[2, 7, 11, 15], 9]],
+            test_expected=[[0, 1]],
+            function_signature=None,
+        )
+        assert "std::vector<int> _arg0 = jsonToVectorInt(args.to_array()[0]);" in result
+        assert "int _arg1 = jsonToInt(args.to_array()[1]);" in result
+        assert "nativeToJson(solve(_arg0, _arg1))" in result
+        assert "solve(args.to_array()" not in result
 
     def test_java_harness_includes_candidate_code(self):
         """Java harness includes the candidate's solution code."""
@@ -3315,6 +3346,36 @@ class TestCodeExecutorWithHarness:
         source_sent = call_args[1]["source_code"]
         assert "import json" in source_sent  # Python harness includes this
         assert "TEST_ARGS" in source_sent
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_legacy_cpp_includes_actual_output(self, mock_exec):
+        """Regression: a passing legacy C++ test result must carry the actual
+        output from the harness ('actual' -> actual_output), not null."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="cpp", execution_time_ms=5,
+            tests=[{"passed": True, "actual_output": [0, 1],
+                    "status": "accepted", "execution_time_ms": 5}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [[2, 7, 11, 15], 9],
+            "expected_output": [0, 1],
+            "is_public": True,
+        }]
+        result = run_code_public(
+            "vector<int> solve(vector<int>& nums, int target) { return {0, 1}; }",
+            "cpp",
+            test_cases,
+            function_name="solve",
+            class_name=None,
+            function_signature=None,  # legacy path (no signature)
+        )
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+        assert result["results"][0]["actual_output"] == [0, 1]
 
     @patch("services.code_executor.execute_code_sync")
     def test_evaluate_submission_with_harness(self, mock_exec):

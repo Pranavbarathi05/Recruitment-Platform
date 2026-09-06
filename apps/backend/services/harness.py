@@ -576,6 +576,27 @@ static json::Value vectorVectorStringToJson(const std::vector<std::vector<std::s
     for (size_t i = 0; i < v.size(); i++) r.aval.push_back(vectorStringToJson(v[i]));
     return r;
 }
+
+// --- Overloaded native -> json::Value conversion -------------------------
+// Lets harness call sites convert a candidate's return value to JSON without
+// knowing its static type at generation time (overload resolution picks the
+// right converter at compile time). The json::Value identity overload keeps
+// legacy json::Value-style candidates working.
+// Emitted last so every converter it delegates to is already declared.
+
+static json::Value nativeToJson(const json::Value& v) { return v; }
+static json::Value nativeToJson(int v) { return intToJson(v); }
+static json::Value nativeToJson(long long v) { return longLongToJson(v); }
+static json::Value nativeToJson(double v) { return doubleToJson(v); }
+static json::Value nativeToJson(bool v) { return boolToJson(v); }
+static json::Value nativeToJson(const std::string& v) { return stringToJson(v); }
+static json::Value nativeToJson(const std::vector<int>& v) { return vectorIntToJson(v); }
+static json::Value nativeToJson(const std::vector<long long>& v) { return vectorLongLongToJson(v); }
+static json::Value nativeToJson(const std::vector<double>& v) { return vectorDoubleToJson(v); }
+static json::Value nativeToJson(const std::vector<std::string>& v) { return vectorStringToJson(v); }
+static json::Value nativeToJson(const std::vector<bool>& v) { return vectorBoolToJson(v); }
+static json::Value nativeToJson(const std::vector<std::vector<int>>& v) { return vectorVectorIntToJson(v); }
+static json::Value nativeToJson(const std::vector<std::vector<std::string>>& v) { return vectorVectorStringToJson(v); }
 """
 
 
@@ -584,6 +605,63 @@ static json::Value vectorVectorStringToJson(const std::vector<std::vector<std::s
 # ============================================================
 
 # Normalized type -> json::Value -> native conversion helper
+def _cpp_legacy_arg_spec(arg: Any) -> tuple:
+    """Infer (native C++ type, json::Value -> native converter) for one JSON
+    argument value of a legacy (signature-less) problem.
+
+    Legacy problems have no function_signature, so the native parameter type
+    is inferred from the JSON argument shape:
+      null           -> int          (e.g. nullptr args)
+      bool           -> bool
+      number         -> double if fractional else int
+      string         -> string
+      list of strings-> vector<string>
+      list of lists  -> vector<vector<int>> or vector<vector<string>>
+      other list     -> vector<int>, vector<double>, or vector<long long>
+                        (ints that exceed int range use long long)
+    """
+    if arg is None:
+        return ("int", "jsonToInt")
+    if isinstance(arg, bool):
+        return ("bool", "jsonToBool")
+    if isinstance(arg, str):
+        return ("std::string", "jsonToString")
+    if isinstance(arg, (int, float)):
+        if isinstance(arg, float) and not arg.is_integer():
+            return ("double", "jsonToDouble")
+        if isinstance(arg, int) and not (-2**31 <= arg < 2**31):
+            return ("long long", "jsonToLongLong")
+        return ("int", "jsonToInt")
+    if isinstance(arg, list):
+        if arg and all(isinstance(x, str) for x in arg):
+            return ("std::vector<std::string>", "jsonToVectorString")
+        if arg and all(isinstance(x, list) for x in arg):
+            if arg[0] and all(isinstance(x, str) for x in arg[0]):
+                return (
+                    "std::vector<std::vector<std::string>>",
+                    "jsonToVectorVectorString",
+                )
+            return ("std::vector<std::vector<int>>", "jsonToVectorVectorInt")
+        if arg and all(isinstance(x, bool) for x in arg):
+            return ("std::vector<bool>", "jsonToVectorBool")
+        if arg and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in arg):
+            has_float = any(
+                isinstance(x, float) and not x.is_integer() for x in arg
+            )
+            exceeds_int = any(
+                isinstance(x, int) and not (-2**31 <= x < 2**31) for x in arg
+            )
+            if has_float:
+                return ("std::vector<double>", "jsonToVectorDouble")
+            if exceeds_int:
+                return ("std::vector<long long>", "jsonToVectorLongLong")
+            return ("std::vector<int>", "jsonToVectorInt")
+        # Mixed/unknown shape: fall back to int vector (jsonToInt handles
+        # number/string/bool members defensively).
+        return ("std::vector<int>", "jsonToVectorInt")
+    return ("int", "jsonToInt")
+
+
 _CPP_JSON_TO_NATIVE = {
     "int": "jsonToInt",
     "long long": "jsonToLongLong",
@@ -833,20 +911,35 @@ def generate_cpp_harness(
             lines.append(f"            {native_return} _result_native = {function_name}({args_call});")
         lines.append(f"            json::Value _result = {_CPP_NATIVE_TO_JSON[normalized_return]}(_result_native);")
     else:
-        # Legacy path: pass raw json::Value objects straight through.
-        if class_name:
-            lines.append(f"            {class_name} _obj;")
-            if len(test_arguments) > 0 and len(test_arguments[0]) > 0:
-                args_call = ", ".join(f"args.to_array()[{i}]" for i in range(len(test_arguments[0])))
+        # Legacy path (no function_signature). The candidate function uses
+        # real native types (e.g. vector<int>&), so raw json::Value values
+        # cannot be passed directly: a temporary cannot bind to a non-const
+        # reference. Materialize each JSON argument into a mutable native
+        # local first, inferring the native type from the JSON argument
+        # shape (the legacy DB rows carry no signature metadata), then call
+        # the candidate function with those natives and convert the returned
+        # json::Value straight into the result protocol.
+        if len(test_arguments) > 0 and len(test_arguments[0]) > 0:
+            arg_decls = []
+            for i, arg in enumerate(test_arguments[0]):
+                native_type, conv = _cpp_legacy_arg_spec(arg)
+                arg_decls.append(
+                    f"            {native_type} _arg{i} = {conv}(args.to_array()[{i}]);"
+                )
+            args_call = ", ".join(f"_arg{i}" for i in range(len(test_arguments[0])))
+            invocation = f"{function_name}({args_call})"
+            if class_name:
+                invocation = f"_obj.{invocation}"
+                lines.extend([f"            {class_name} _obj;", *arg_decls])
             else:
-                args_call = ""
-            lines.append(f"            json::Value _result = _obj.{function_name}({args_call});")
+                lines.extend(arg_decls)
+            lines.append(
+                f"            json::Value _result = nativeToJson({invocation});"
+            )
         else:
-            if len(test_arguments) > 0 and len(test_arguments[0]) > 0:
-                args_call = ", ".join(f"args.to_array()[{i}]" for i in range(len(test_arguments[0])))
-            else:
-                args_call = ""
-            lines.append(f"            json::Value _result = {function_name}({args_call});")
+            if class_name:
+                lines.append(f"            {class_name} _obj;")
+            lines.append(f"            json::Value _result = {function_name}();")
 
     lines.extend([
         "            bool _passed = (json::stringify(_result) == json::stringify(expected));",
@@ -918,11 +1011,11 @@ class JsonValue {
         StringBuilder sb = new StringBuilder();
         for (char c : s.toCharArray()) {
             switch (c) {
-                case '\"': sb.append("\\\\\""); break;
-                case '\\\\\\\\': sb.append("\\\\\\\\\\\\\\\\\"); break;
-                case '\\n': sb.append("\\\\n"); break;
-                case '\\r': sb.append("\\\\r"); break;
-                case '\\t': sb.append("\\\\t"); break;
+                case 34: sb.append((char) 92); sb.append(c); break;
+                case 92: sb.append((char) 92); sb.append(c); break;
+                case 10: sb.append((char) 92); sb.append('n'); break;
+                case 13: sb.append((char) 92); sb.append('r'); break;
+                case 9:  sb.append((char) 92); sb.append('t'); break;
                 default: sb.append(c);
             }
         }
@@ -1458,8 +1551,39 @@ def generate_java_harness(
     # Main so the generated calls can reference them unqualified.
     emit_helpers = parsed_sig is not None
 
+    # Hoist candidate `import` statements to the top of the generated file.
+    # Java forbids imports after any type declaration, and the harness
+    # prepends its own classes (JSON library), so candidate imports taken
+    # verbatim would make the file uncompilable.
+    candidate_imports = []
+    candidate_body_lines = []
+    brace_depth = 0
+    for ln in candidate_code.split("\n"):
+        stripped = ln.strip()
+        if stripped.startswith("import ") and stripped.endswith(";"):
+            if stripped not in candidate_imports:
+                candidate_imports.append(stripped)
+            continue
+        # Only one public top-level type is allowed per Java file, and the
+        # harness compiles the candidate inside Main.java. Strip the `public`
+        # modifier from candidate declarations at brace depth 0 so
+        # `public class Solution {...}` remains valid in the generated file
+        # while staying `public` in the candidate-visible starter code.
+        if brace_depth == 0 and stripped.startswith("public "):
+            ln = ln.replace("public ", "", 1)
+        brace_depth += ln.count("{") - ln.count("}")
+        if brace_depth < 0:
+            brace_depth = 0
+        candidate_body_lines.append(ln)
+    candidate_code = "\n".join(candidate_body_lines)
+
+    header_imports = ["import java.util.*;"]
+    for imp in candidate_imports:
+        if imp != "import java.util.*;":
+            header_imports.append(imp)
+
     lines = [
-        "import java.util.*;",
+        *header_imports,
         "",
         "// === Minimal JSON Library ===",
         _JAVA_JSON_LIB,

@@ -35,6 +35,24 @@ logger = logging.getLogger(__name__)
 # Judge0 configuration
 JUDGE0_BASE_URL = os.getenv("JUDGE0_BASE_URL", "http://localhost:2358")
 JUDGE0_AUTH_TOKEN = os.getenv("JUDGE0_AUTH_TOKEN", "")
+# Judge0 API auth header name. Must match AUTHN_HEADER in judge0.conf
+# (default for this deployment: X-Judge0-Token — same as gateway-api).
+JUDGE0_AUTH_HEADER = os.getenv("JUDGE0_AUTH_HEADER", "X-Judge0-Token")
+# Per-submission max file size (KB). Must not exceed MAX_MAX_FILE_SIZE in
+# judge0.conf (4096 in this deployment); larger values are rejected with 422.
+JUDGE0_MAX_FILE_SIZE_KB = int(os.getenv("JUDGE0_MAX_FILE_SIZE_KB", "4096"))
+# Do NOT send `enable_per_process_and_thread_time_limit/memory_limit: false`
+# explicitly: this Judge0 build returns Internal Error (status 13) when those
+# flags are explicitly false (verified empirically); omitting them uses the
+# server defaults and executes correctly.
+# JVM address-space floor (KB): Java (OpenJDK 13) cannot even start under
+# lower rlimit-AS caps (heap + 1 GB compressed-class space pre-reserved at
+# startup; javac also needs the full reservation), so Java submissions always
+# request at least this much address space. Must stay <= MAX_MEMORY_LIMIT in
+# judge0.conf (8388608). Empirically verified: 2 GB/4 GB fail, 8 GB works.
+JUDGE0_JAVA_MEMORY_LIMIT_KB = int(
+    os.getenv("JUDGE0_JAVA_MEMORY_LIMIT_KB", str(8 * 1024 * 1024))
+)
 JUDGE0_POLL_INTERVAL = float(os.getenv("JUDGE0_POLL_INTERVAL", "0.5"))
 JUDGE0_MAX_POLL_TIME = float(os.getenv("JUDGE0_MAX_POLL_TIME", "30.0"))
 
@@ -125,9 +143,9 @@ def _b64decode(text: str) -> str:
 
 
 def _get_auth_headers() -> dict:
-    """Get Judge0 authentication headers."""
+    """Get Judge0 authentication headers (header name configurable via JUDGE0_AUTH_HEADER)."""
     if JUDGE0_AUTH_TOKEN:
-        return {"X-Auth-Token": JUDGE0_AUTH_TOKEN}
+        return {JUDGE0_AUTH_HEADER: JUDGE0_AUTH_TOKEN}
     return {}
 
 
@@ -188,9 +206,7 @@ async def _submit_to_judge0(
         "memory_limit": memory_limit_kb,
         "stack_limit": 131072,
         "max_processes_and_or_threads": 60,
-        "enable_per_process_and_thread_time_limit": False,
-        "enable_per_process_and_thread_memory_limit": False,
-        "max_file_size": 262144,
+        "max_file_size": JUDGE0_MAX_FILE_SIZE_KB,
         "redirect_stderr_to_stdout": False,
         "enable_network": False,
         "number_of_runs": 1,
@@ -291,6 +307,8 @@ async def execute_code(
         CompilerError: If Judge0 is unavailable
     """
     memory_limit_kb = memory_limit_mb * 1024
+    if language == "java":
+        memory_limit_kb = max(memory_limit_kb, JUDGE0_JAVA_MEMORY_LIMIT_KB)
 
     try:
         result = await _submit_to_judge0(
@@ -442,6 +460,11 @@ def execute_code_sync(
         raise CompilerError(f"Unsupported language for Judge0: {language}")
 
     memory_limit_kb = memory_limit_mb * 1024
+    if language == "java":
+        # The JVM pre-reserves heap + compressed-class space at startup and
+        # cannot start under a smaller address-space rlimit; actual RSS stays
+        # far below this. CPU time limits still bound candidate runtime.
+        memory_limit_kb = max(memory_limit_kb, JUDGE0_JAVA_MEMORY_LIMIT_KB)
 
     # Submit synchronously
     payload = {
@@ -453,9 +476,7 @@ def execute_code_sync(
         "memory_limit": memory_limit_kb,
         "stack_limit": 131072,
         "max_processes_and_or_threads": 60,
-        "enable_per_process_and_thread_time_limit": False,
-        "enable_per_process_and_thread_memory_limit": False,
-        "max_file_size": 262144,
+        "max_file_size": JUDGE0_MAX_FILE_SIZE_KB,
         "redirect_stderr_to_stdout": False,
         "enable_network": False,
         "number_of_runs": 1,

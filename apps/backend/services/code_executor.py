@@ -207,7 +207,10 @@ def run_code_public(
                 "is_public": True,
                 "passed": passed,
                 "expected_output": tc.get("expected_output") if not passed else None,
-                "actual_output": actual_output if not passed else None,
+                # actual_output is public-test data (the candidate's own
+                # return value for a public case), so it is shown for both
+                # passing and failing tests.
+                "actual_output": actual_output,
                 "input": tc.get("input"),
                 "arguments": tc.get("arguments"),
                 "stderr": stderr if not passed else None,
