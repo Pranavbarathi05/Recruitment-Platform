@@ -25,6 +25,48 @@ const LANGUAGES = [
   { value: 'java', label: 'Java' },
 ];
 
+/**
+ * Simple per-language starter code fallback.
+ * Used when the backend has no stored starter_code for a language.
+ * Python uses generatePythonStarterCode (type-aware).
+ * C++/Java use simple templates based on function_name only (no type parsing).
+ */
+function getStarterForLanguage(language, functionName, className, functionSignature) {
+  switch (language) {
+    case 'python3':
+      return generatePythonStarterCode(functionName, className, functionSignature);
+    case 'cpp': {
+      const params = ['arg1', 'arg2'].join(', ');
+      if (className && className.trim()) {
+        return (
+          'class ' + className.trim() + ' {\n' +
+          'public:\n' +
+          '    int ' + functionName + '(' + params + ') {\n' +
+          '        // Write your solution here\n' +
+          '    }\n' +
+          '};\n'
+        );
+      }
+      return 'int ' + functionName + '(' + params + ') {\n    // Write your solution here\n}\n';
+    }
+    case 'java': {
+      const params = ['arg1', 'arg2'].join(', ');
+      if (className && className.trim()) {
+        return (
+          'class ' + className.trim() + ' {\n' +
+          '    public int ' + functionName + '(' + params + ') {\n' +
+          '        // Write your solution here\n' +
+          '    }\n' +
+          '}\n'
+        );
+      }
+      return 'public int ' + functionName + '(' + params + ') {\n    // Write your solution here\n}\n';
+    }
+    default:
+      return '';
+  }
+}
+
 const CodingTest = () => {
   const { attemptId } = useParams();
   const navigate = useNavigate();
@@ -115,7 +157,18 @@ const CodingTest = () => {
               ),
         );
       } else {
-        setSourceCode(storedStarter || getDefaultStarter(activeLang));
+        // C++/Java: prefer stored starter from backend; fall back to simple
+        // inline template (no type parsing).
+        setSourceCode(
+          storedStarter && storedStarter.trim()
+            ? storedStarter
+            : getStarterForLanguage(
+                activeLang,
+                problem.function_name || 'solve',
+                problem.class_name || null,
+                problem.function_signature || null,
+              ),
+        );
       }
 
       setLanguage(activeLang);
@@ -123,6 +176,72 @@ const CodingTest = () => {
     setRunResults(null);
     lastSavedCodeRef.current = '';
   }, [currentProblemIndex, problems]);
+
+  // Per-(problem, language) typed-code drafts. Lets switching away and back
+  // restore the candidate's own edits instead of re-showing the starter.
+  const [languageDrafts, setLanguageDrafts] = useState({});
+
+  // Regenerate starter code when language changes.
+  // Priority: (1) candidate-typed draft for this language; (2) admin-stored
+  // starter; (3) generated starter (Python from metadata, C++/Java simple
+  // fallback, no type parsing).
+  useEffect(() => {
+    if (problems.length === 0 || currentProblemIndex >= problems.length) return;
+
+    const problem = problems[currentProblemIndex];
+    const draft = languageDrafts[problem.id]?.[language];
+    if (draft && draft.trim()) {
+      setSourceCode(draft);
+      return;
+    }
+
+    const storedStarter = problem.starter_code?.[language];
+    if (storedStarter && storedStarter.trim()) {
+      setSourceCode(storedStarter);
+      return;
+    }
+
+    if (language === 'python3') {
+      setSourceCode(
+        generatePythonStarterCode(
+          problem.function_name || 'solve',
+          problem.class_name || null,
+          problem.function_signature || null,
+        ),
+      );
+    } else {
+      setSourceCode(
+        getStarterForLanguage(
+          language,
+          problem.function_name || 'solve',
+          problem.class_name || null,
+          problem.function_signature || null,
+        ),
+      );
+    }
+  }, [language, currentProblemIndex, problems, languageDrafts]);
+
+  // Persist typed code per (problem, language). This is what allows switching
+  // away from a language and back to restore the candidate's own edits instead
+  // of re-showing the starter.
+  useEffect(() => {
+    if (problems.length === 0 || currentProblemIndex >= problems.length) return;
+
+    const problem = problems[currentProblemIndex];
+    setLanguageDrafts((prev) => {
+      const byProblem = prev[problem.id] || {};
+      if (byProblem[language] !== sourceCode) {
+        return {
+          ...prev,
+          [problem.id]: {
+            ...byProblem,
+            [language]: sourceCode,
+          },
+        };
+      }
+      return prev;
+    });
+  }, [sourceCode, language, currentProblemIndex, problems]);
 
   // Autosave (debounced 2 seconds)
   useEffect(() => {
@@ -175,18 +294,6 @@ const CodingTest = () => {
     return () => clearInterval(interval);
   }, [timeRemaining > 0]);
 
-  const getDefaultStarter = (lang) => {
-    switch (lang) {
-      case 'python3':
-        return '# Write your solution here\n\ndef solve():\n    pass\n';
-      case 'cpp':
-        return '#include <iostream>\nusing namespace std;\n\nint main() {\n    // Write your solution here\n    return 0;\n}\n';
-      case 'java':
-        return 'public class Main {\n    public static void main(String[] args) {\n        // Write your solution here\n    }\n}\n';
-      default:
-        return '';
-    }
-  };
 
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60);

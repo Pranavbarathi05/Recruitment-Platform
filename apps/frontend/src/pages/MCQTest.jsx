@@ -111,10 +111,12 @@ const AssessmentWorkspace = () => {
           const subs = {};
           problems.forEach((p) => {
             if (p.draft) {
-              states[p.id] = { code: p.draft.source_code, language: p.draft.language || 'python3' };
+              const lang = p.draft.language || 'python3';
+              states[p.id] = { code: p.draft.source_code, language: lang, drafts: { [lang]: p.draft.source_code } };
             } else {
               const defaultLang = p.supported_languages?.[0] || 'python3';
-              states[p.id] = { code: getDefaultStarter(defaultLang, p), language: defaultLang };
+              const starter = getDefaultStarter(defaultLang, p);
+              states[p.id] = { code: starter, language: defaultLang, drafts: { [defaultLang]: starter } };
             }
             if (p.submission_status) {
               subs[p.id] = { status: p.submission_status };
@@ -386,15 +388,26 @@ const AssessmentWorkspace = () => {
               setCodingRunResults(null); // clear results when switching problems
             }}
             language={currentCodingState.language}
-            setLanguage={(lang) => setCodingStates((prev) => ({
-              ...prev,
-              [currentCodingProblem.id]: { ...prev[currentCodingProblem.id], language: lang },
-            }))}
+            setLanguage={(lang) => setCodingStates((prev) => {
+              const st = prev[currentCodingProblem.id] || { code: '', language: 'python3', drafts: {} };
+              if (lang === st.language) return prev;
+              // Save current code under the outgoing language, then load the new
+              // language's own code: its typed draft if any, else its starter.
+              const drafts = { ...st.drafts, [st.language]: st.code };
+              const nextCode = drafts[lang] !== undefined ? drafts[lang] : getDefaultStarter(lang, currentCodingProblem);
+              return {
+                ...prev,
+                [currentCodingProblem.id]: { ...st, language: lang, code: nextCode, drafts },
+              };
+            })}
             sourceCode={currentCodingState.code}
-            setSourceCode={(code) => setCodingStates((prev) => ({
-              ...prev,
-              [currentCodingProblem.id]: { ...prev[currentCodingProblem.id], code },
-            }))}
+            setSourceCode={(code) => setCodingStates((prev) => {
+              const st = prev[currentCodingProblem.id] || { code: '', language: 'python3', drafts: {} };
+              return {
+                ...prev,
+                [currentCodingProblem.id]: { ...st, code, drafts: { ...st.drafts, [st.language]: code } },
+              };
+            })}
             running={codingRunning}
             submitting={codingSubmitting}
             runResults={codingRunResults}

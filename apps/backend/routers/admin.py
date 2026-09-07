@@ -563,6 +563,20 @@ def get_assessment_results(
                 "domainName": domain_map.get(q.get("domain_id"), ""),
             })
 
+        # coding_problems are global/domain-independent (domain_id was removed in
+        # migration 007). Do NOT select domain_id from coding_problems. The MCQ
+        # question domain context is already captured via `domain_map` above.
+        coding_problem_ids = attempt.get("selected_coding_problem_ids") or []
+        coding_problems_map = {}
+        if coding_problem_ids:
+            cp_resp = (
+                supabase_client.table("coding_problems")
+                .select("id, title")
+                .in_("id", coding_problem_ids)
+                .execute()
+            )
+            coding_problems_map = {p["id"]: p for p in (cp_resp.data or [])}
+
         max_score = attempt["max_score"] if attempt.get("max_score") else 1
         score = attempt.get("score", 0) if attempt.get("score") is not None else 0
         percentage = round((score / max_score) * 100) if max_score > 0 else 0
@@ -580,32 +594,28 @@ def get_assessment_results(
         )
         coding_subs = coding_subs_resp.data or []
 
-        # Fetch coding problem details for each submission
-        coding_problem_ids = list({s["problem_id"] for s in coding_subs})
-        coding_problems_map = {}
-        if coding_problem_ids:
-            cp_resp = (
-                supabase_client.table("coding_problems")
-                .select("id, title, domain_id")
-                .in_("id", coding_problem_ids)
-                .execute()
-            )
-            coding_problems_map = {p["id"]: p for p in (cp_resp.data or [])}
-
+        # Build results for each frozen coding problem. A single submission must
+        # never be reused for multiple problems: each problem_id in
+        # selected_coding_problem_ids gets its own result entry, and only problems
+        # that have at least one submission appear with submission data. Problems
+        # with no submission contribute 0 points.
+        sub_map = {s["problem_id"]: s for s in coding_subs}
         coding_results = []
-        for sub in coding_subs:
-            cp = coding_problems_map.get(sub["problem_id"], {})
-            coding_results.append({
-                "problem_title": cp.get("title", ""),
-                "language": sub["language"],
-                "source_code": sub["source_code"],
-                "status": sub["status"],
-                "score": sub.get("score", 0),
-                "max_score": sub.get("max_score", 0),
-                "tests_passed": sub.get("tests_passed", 0),
-                "tests_total": sub.get("tests_total", 0),
-                "execution_time_ms": sub.get("execution_time_ms"),
-            })
+        for pid in coding_problem_ids:
+            sub = sub_map.get(pid)
+            cp = coding_problems_map.get(pid, {})
+            if sub:
+                coding_results.append({
+                    "problem_title": cp.get("title", ""),
+                    "language": sub["language"],
+                    "source_code": sub["source_code"],
+                    "status": sub["status"],
+                    "score": sub.get("score", 0),
+                    "max_score": sub.get("max_score", 0),
+                    "tests_passed": sub.get("tests_passed", 0),
+                    "tests_total": sub.get("tests_total", 0),
+                    "execution_time_ms": sub.get("execution_time_ms"),
+                })
 
         return {
             "attempt_id": attempt_id,

@@ -2998,7 +2998,9 @@ class TestHarnessGeneration:
                 test_arguments=[[1, 2]],
                 test_expected=[3],
                 function_signature="public int sub(int a, int b)",
-            )    def test_java_harness_legacy_without_signature_preserved(self):
+            )
+
+    def test_java_harness_legacy_without_signature_preserved(self):
         """Legacy Java path materializes native args from JSON when no signature
         is given, so int[]/int candidates receive typed natives instead of raw
         JsonValue arguments (which would not compile)."""
@@ -4219,3 +4221,202 @@ class TestAssessmentDeleteAndBulk:
         data = response.json()
         assert data["deleted_count"] == 0
         app.dependency_overrides.clear()
+
+
+class TestCodingScoringPerProblem:
+    """Verify that _score_coding scores each selected coding problem
+    independently. One problem's submission must never be counted for
+    another problem.
+
+    Regression: an attempt with 2 coding problems where only 1 was
+    submitted showed coding_score = full_points for BOTH problems
+    (the single submission was incorrectly counted twice).
+    """
+
+    def _score_coding(self, mock_supabase, attempt_id, problem_ids, submissions, points_map=None):
+        """Call _score_coding with mocked supabase and return the result."""
+        from routers.assessment import _score_coding
+
+        # Use side_effect to return different values for sequential calls.
+        # Call order in _score_coding:
+        #   1. assessment_attempts.select(...).eq(...).execute() -> problem_ids
+        #   2. (if problem_ids) coding_problems.select(...).in_(...).execute() -> points
+        #   3. coding_submissions.select(...).eq(...).execute() -> submissions
+        #   4. assessment_attempts.update(...).eq(...).execute() -> []
+        calls = []
+        calls.append(_make_mock_response([{"selected_coding_problem_ids": problem_ids}]))
+        if problem_ids and points_map is not None:
+            calls.append(_make_mock_response([{"id": pid, "points": pts} for pid, pts in points_map.items()]))
+        else:
+            calls.append(_make_mock_response([]))
+        calls.append(_make_mock_response(submissions))
+        calls.append(_make_mock_response([{}]))
+
+        def execute_side_effect(*args, **kwargs):
+            return calls.pop(0)
+
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.side_effect = execute_side_effect
+        mock_supabase.table.return_value.select.return_value.in_.return_value.execute.side_effect = execute_side_effect
+        mock_supabase.table.return_value.update.return_value.eq.return_value.execute.side_effect = execute_side_effect
+
+        return _score_coding(attempt_id)
+
+    def test_one_of_two_submitted_earns_only_its_points(self, mock_supabase):
+        """2 problems (A=2pts, B=2pts). Only A submitted and passed.
+        Result: A=2/2, B=0/2, coding_score=2/4."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[
+                {"problem_id": PROBLEM_A, "score": 2, "max_score": 2, "status": "passed"},
+            ],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        assert result["score"] == 2, f"Expected score=2, got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4, got {result['max_score']}"
+
+    def test_submit_only_problem_B(self, mock_supabase):
+        """2 problems (A=2pts, B=2pts). Only B submitted and passed.
+        Result: A=0/2, B=2/2, coding_score=2/4."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[
+                {"problem_id": PROBLEM_B, "score": 2, "max_score": 2, "status": "passed"},
+            ],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        assert result["score"] == 2, f"Expected score=2, got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4, got {result['max_score']}"
+
+    def test_submit_neither(self, mock_supabase):
+        """2 problems (A=2pts, B=2pts). Neither submitted.
+        Result: A=0/2, B=0/2, coding_score=0/4."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        assert result["score"] == 0, f"Expected score=0, got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4, got {result['max_score']}"
+
+    def test_submit_both_correctly(self, mock_supabase):
+        """2 problems (A=2pts, B=2pts). Both submitted and passed.
+        Result: A=2/2, B=2/2, coding_score=4/4."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[
+                {"problem_id": PROBLEM_A, "score": 2, "max_score": 2, "status": "passed"},
+                {"problem_id": PROBLEM_B, "score": 2, "max_score": 2, "status": "passed"},
+            ],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        assert result["score"] == 4, f"Expected score=4, got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4, got {result['max_score']}"
+
+    def test_one_correct_one_wrong(self, mock_supabase):
+        """2 problems (A=2pts, B=2pts). A passed, B failed (non-passing submission).
+        Result: A=2/2, B=0/2, coding_score=2/4."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[
+                {"problem_id": PROBLEM_A, "score": 2, "max_score": 2, "status": "passed"},
+                {"problem_id": PROBLEM_B, "score": 0, "max_score": 2, "status": "failed"},
+            ],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        assert result["score"] == 2, f"Expected score=2, got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4, got {result['max_score']}"
+
+    def test_one_correct_one_compile_error(self, mock_supabase):
+        """2 problems (A=2pts, B=2pts). A passed, B has compile error.
+        Result: A=2/2, B=0/2, coding_score=2/4."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[
+                {"problem_id": PROBLEM_A, "score": 2, "max_score": 2, "status": "passed"},
+                {"problem_id": PROBLEM_B, "score": 0, "max_score": 2, "status": "error"},
+            ],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        assert result["score"] == 2, f"Expected score=2, got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4, got {result['max_score']}"
+
+    def test_single_problem_submitted(self, mock_supabase):
+        """1 problem (A=10pts). Submitted and passed.
+        Result: A=10/10, coding_score=10/10."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A],
+            submissions=[
+                {"problem_id": PROBLEM_A, "score": 10, "max_score": 10, "status": "passed"},
+            ],
+            points_map={PROBLEM_A: 10},
+        )
+        assert result["score"] == 10, f"Expected score=10, got {result['score']}"
+        assert result["max_score"] == 10, f"Expected max_score=10, got {result['max_score']}"
+
+    def test_no_submissions_no_problems(self, mock_supabase):
+        """Empty attempt (no problems, no submissions).
+        Result: coding_score=0/0."""
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[],
+            submissions=[],
+            points_map={},
+        )
+        assert result["score"] == 0, f"Expected score=0, got {result['score']}"
+        assert result["max_score"] == 0, f"Expected max_score=0, got {result['max_score']}"
+
+    def test_submission_for_unselected_problem_ignored(self, mock_supabase):
+        """A submission exists for a problem NOT in selected_coding_problem_ids.
+        It must be ignored. Only selected problems count."""
+        PROBLEM_A = "aaaa1111-1111-1111-1111-111111111111"
+        PROBLEM_B = "bbbb2222-2222-2222-2222-222222222222"
+        PROBLEM_C = "cccc3333-3333-3333-3333-333333333333"  # NOT selected
+
+        result = self._score_coding(
+            mock_supabase,
+            MOCK_ATTEMPT_ID,
+            problem_ids=[PROBLEM_A, PROBLEM_B],
+            submissions=[
+                {"problem_id": PROBLEM_A, "score": 2, "max_score": 2, "status": "passed"},
+                {"problem_id": PROBLEM_C, "score": 10, "max_score": 10, "status": "passed"},
+            ],
+            points_map={PROBLEM_A: 2, PROBLEM_B: 2},
+        )
+        # PROBLEM_C's submission must be ignored
+        assert result["score"] == 2, f"Expected score=2 (only A), got {result['score']}"
+        assert result["max_score"] == 4, f"Expected max_score=4 (A+B), got {result['max_score']}"

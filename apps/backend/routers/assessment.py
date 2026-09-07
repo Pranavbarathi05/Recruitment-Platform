@@ -105,35 +105,56 @@ def _score_mcq(attempt_id: str) -> dict:
 
 
 def _score_coding(attempt_id: str) -> dict:
-    """Score the coding section of an attempt. Returns {score, max_score}."""
+    """Score the coding section of an attempt. Returns {score, max_score}.
+
+    Each problem in selected_coding_problem_ids is scored independently:
+    - If the candidate submitted a passing solution, that problem earns its points.
+    - If no submission exists or the submission did not pass, the problem earns 0.
+    One problem's submission/result is NEVER copied to another problem.
+    """
+    # Fetch the frozen problem list for this attempt
+    attempt_resp = (
+        supabase_client.table("assessment_attempts")
+        .select("selected_coding_problem_ids")
+        .eq("id", attempt_id)
+        .execute()
+    )
+    problem_ids = (attempt_resp.data or [{}])[0].get("selected_coding_problem_ids") or []
+
+    # Fetch problem points for each selected problem
+    problem_points = {}
+    if problem_ids:
+        probs_resp = (
+            supabase_client.table("coding_problems")
+            .select("id, points")
+            .in_("id", problem_ids)
+            .execute()
+        )
+        problem_points = {p["id"]: p.get("points", 10) for p in (probs_resp.data or [])}
+
+    # Fetch all submissions for this attempt
     subs_resp = (
         supabase_client.table("coding_submissions")
-        .select("problem_id, score, max_score")
+        .select("problem_id, score, max_score, status")
         .eq("attempt_id", attempt_id)
         .execute()
     )
     submissions = subs_resp.data or []
 
-    total_score = sum(s.get("score", 0) for s in submissions)
-    total_max = sum(s.get("max_score", 0) for s in submissions)
+    # Build a map: problem_id -> best passing submission score
+    # Only "passed" submissions count. Non-passing submissions earn 0.
+    sub_map = {}
+    for sub in submissions:
+        pid = sub["problem_id"]
+        if sub.get("status") == "passed" and pid not in sub_map:
+            sub_map[pid] = sub.get("score", 0)
 
-    # If no submissions exist, compute max_score from the frozen problem list
-    if total_max == 0:
-        attempt_resp = (
-            supabase_client.table("assessment_attempts")
-            .select("selected_coding_problem_ids")
-            .eq("id", attempt_id)
-            .execute()
-        )
-        problem_ids = (attempt_resp.data or [{}])[0].get("selected_coding_problem_ids") or []
-        if problem_ids:
-            probs_resp = (
-                supabase_client.table("coding_problems")
-                .select("id, points")
-                .in_("id", problem_ids)
-                .execute()
-            )
-            total_max = sum(p.get("points", 10) for p in (probs_resp.data or []))
+    total_score = 0
+    total_max = 0
+    for pid in problem_ids:
+        points = problem_points.get(pid, 10)
+        total_max += points
+        total_score += sub_map.get(pid, 0)
 
     supabase_client.table("assessment_attempts").update(
         {"coding_score": total_score, "coding_max_score": total_max}
