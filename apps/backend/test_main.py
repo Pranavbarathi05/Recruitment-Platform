@@ -2888,7 +2888,7 @@ class TestHarnessGeneration:
         )
         assert "std::vector<int> _arg0 = jsonToVectorInt(args.to_array()[0]);" in result
         assert "int _arg1 = jsonToInt(args.to_array()[1]);" in result
-        assert "nativeToJson(solve(_arg0, _arg1))" in result
+        assert "nativeToJson(_obj.solve(_arg0, _arg1))" in result
         assert "solve(args.to_array()" not in result
 
     def test_java_harness_includes_candidate_code(self):
@@ -2998,10 +2998,10 @@ class TestHarnessGeneration:
                 test_arguments=[[1, 2]],
                 test_expected=[3],
                 function_signature="public int sub(int a, int b)",
-            )
-
-    def test_java_harness_legacy_without_signature_preserved(self):
-        """Legacy raw-JsonValue Java path still works when no signature is given."""
+            )    def test_java_harness_legacy_without_signature_preserved(self):
+        """Legacy Java path materializes native args from JSON when no signature
+        is given, so int[]/int candidates receive typed natives instead of raw
+        JsonValue arguments (which would not compile)."""
         from services.harness import generate_java_harness
         result = generate_java_harness(
             candidate_code="class Solution {\n    public int solve(int n) { return n; }\n}",
@@ -3011,7 +3011,80 @@ class TestHarnessGeneration:
             test_expected=[5],
             function_signature=None,
         )
-        assert "JsonValue _result = _obj.solve(tcArgs);" in result
+        # Native args are inferred from JSON shape and materialized before the call.
+        assert "int _arg0 = jsonToInt(tcArgs.get(0));" in result
+        assert "Solution _obj = new Solution();" in result
+        assert "nativeToJson(_obj.solve(_arg0))" in result
+        # Raw JsonValue must not be passed to the native method.
+        assert "_obj.solve(tcArgs" not in result
+        assert "JsonValue _result = _obj.solve(tcArgs)" not in result
+        # Return value is converted back via nativeToJson.
+        assert "JsonValue _result = nativeToJson(_obj.solve(_arg0))" in result
+
+    def test_java_legacy_two_sum_regression(self):
+        """Regression: legacy Java (function_signature=None) with int[] solve(int[], int).
+
+
+        The harness must materialize native typed args from JSON and convert the
+        int[] return value back to JsonValue via nativeToJson, not pass raw
+        JsonValue arguments to the candidate method."""
+        from services.harness import generate_java_harness
+        code = (
+            "class Solution {\n"
+            "    public int[] solve(int[] nums, int target) {\n"
+            "        for (int i = 0; i < nums.length; i++) {\n"
+            "            for (int j = i + 1; j < nums.length; j++) {\n"
+            "                if (nums[i] + nums[j] == target) return new int[]{i, j};\n"
+            "            }\n"
+            "        }\n"
+            "        return new int[]{};\n"
+            "    }\n"
+            "}\n"
+        )
+        result = generate_java_harness(
+            candidate_code=code,
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[[2, 7, 11, 15], 9]],
+            test_expected=[[0, 1]],
+            function_signature=None,
+        )
+        # Native argument materialization from JSON for each parameter.
+        assert "int[] _arg0 = jsonToIntArray(tcArgs.get(0));" in result
+        assert "int _arg1 = jsonToInt(tcArgs.get(1));" in result
+        assert "Solution _obj = new Solution();" in result
+        assert "nativeToJson(_obj.solve(_arg0, _arg1))" in result
+        assert "JsonValue _result = nativeToJson(_obj.solve(_arg0, _arg1))" in result
+        # Raw JsonValue must not be passed to the native method.
+        assert "_obj.solve(tcArgs" not in result
+
+    def test_java_legacy_two_sum_wrong_answer(self):
+        """Legacy Java legacy path with a wrong Two Sum answer still runs and
+        marks the case as failed via the existing JSON result protocol."""
+        from services.harness import generate_java_harness
+        code = (
+            "class Solution {\n"
+            "    public int[] solve(int[] nums, int target) {\n"
+            "        return new int[]{99, 99};\n"
+            "    }\n"
+            "}\n"
+        )
+        result = generate_java_harness(
+            candidate_code=code,
+            function_name="solve",
+            class_name="Solution",
+            test_arguments=[[[2, 7, 11, 15], 9]],
+            test_expected=[[0, 1]],
+            function_signature=None,
+        )
+
+
+        assert "int[] _arg0 = jsonToIntArray(tcArgs.get(0));" in result
+        assert "int _arg1 = jsonToInt(tcArgs.get(1));" in result
+        assert "Solution _obj = new Solution();" in result
+        assert "nativeToJson(_obj.solve(_arg0, _arg1))" in result
+        assert "JsonValue _result = nativeToJson(" in result
+        assert "_obj.solve(tcArgs" not in result
 
     @pytest.mark.parametrize(
         "signature,args,expected,native_ret,to_json_fn",

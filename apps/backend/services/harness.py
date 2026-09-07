@@ -1215,6 +1215,52 @@ def _normalize_java_type(t: str) -> str:
     return t
 
 
+def _java_legacy_arg_spec(arg: Any) -> tuple:
+    """Infer (native Java type, JsonValue -> native converter) for one JSON
+    argument value of a legacy (signature-less) Java problem.
+
+    Legacy problems have no function_signature, so the native parameter type
+    is inferred from the JSON argument shape:
+      null           -> int
+      bool           -> boolean
+      number         -> double if fractional else int
+      string         -> String
+      list of strings-> String[]
+      list of ints   -> int[]
+      list of doubles-> double[]
+      list of longs  -> long[]
+      other list     -> int[] (jsonToInt handles members defensively)
+    """
+    if arg is None:
+        return ("int", "jsonToInt")
+    if isinstance(arg, bool):
+        return ("boolean", "jsonToBoolean")
+    if isinstance(arg, str):
+        return ("String", "jsonToString")
+    if isinstance(arg, (int, float)):
+        if isinstance(arg, float) and not arg.is_integer():
+            return ("double", "jsonToDouble")
+        if isinstance(arg, int) and not (-2**31 <= arg < 2**31):
+            return ("long", "jsonToLong")
+        return ("int", "jsonToInt")
+    if isinstance(arg, list):
+        if arg and all(isinstance(x, str) for x in arg):
+            return ("String[]", "jsonToStringArray")
+        if arg and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in arg):
+            has_float = any(isinstance(x, float) and not x.is_integer() for x in arg)
+            exceeds_int = any(isinstance(x, int) and not (-2**31 <= x < 2**31) for x in arg)
+            if has_float:
+                return ("double[]", "jsonToDoubleArray")
+            if exceeds_int:
+                return ("long[]", "jsonToLongArray")
+            return ("int[]", "jsonToIntArray")
+        if arg and all(isinstance(x, bool) for x in arg):
+            return ("boolean[]", "jsonToBooleanArray")
+        # Mixed/unknown shape: fall back to int[] (jsonToInt handles members).
+        return ("int[]", "jsonToIntArray")
+    return ("int", "jsonToInt")
+
+
 def _parse_java_signature(signature: Optional[str]):
     """Parse a Java function signature into
     (return_type, function_name, [(param_type, param_name), ...], is_static).
@@ -1425,6 +1471,26 @@ def _generate_java_marshal_helpers() -> str:
         if (v != null) for (int i = 0; i < v.length; i++) r.aval.add(stringArrayToJson(v[i]));
         return r;
     }
+
+    // --- Overloaded native -> JsonValue conversion -------------------------
+    // Lets the harness call sites convert a candidate's return value to JSON
+    // without knowing its static type at generation time (overload resolution
+    // picks the right converter at compile time). The identity overload keeps
+    // legacy JsonValue-style candidates working.
+
+    static JsonValue nativeToJson(int v) { return intToJson(v); }
+    static JsonValue nativeToJson(long v) { return longToJson(v); }
+    static JsonValue nativeToJson(double v) { return doubleToJson(v); }
+    static JsonValue nativeToJson(boolean v) { return booleanToJson(v); }
+    static JsonValue nativeToJson(String v) { return stringToJson(v); }
+    static JsonValue nativeToJson(int[] v) { return intArrayToJson(v); }
+    static JsonValue nativeToJson(long[] v) { return longArrayToJson(v); }
+    static JsonValue nativeToJson(double[] v) { return doubleArrayToJson(v); }
+    static JsonValue nativeToJson(boolean[] v) { return booleanArrayToJson(v); }
+    static JsonValue nativeToJson(String[] v) { return stringArrayToJson(v); }
+    static JsonValue nativeToJson(int[][] v) { return intMatrixToJson(v); }
+    static JsonValue nativeToJson(String[][] v) { return stringMatrixToJson(v); }
+    static JsonValue nativeToJson(JsonValue v) { return v; }
 """
 
 
@@ -1545,11 +1611,13 @@ def generate_java_harness(
                 f"{', '.join(sorted(_JAVA_NATIVE_TO_JSON))}"
             )
 
-    # The marshal helpers are only needed on the typed (signature-driven)
-    # path; the legacy raw-JsonValue path omits them so legacy output is
-    # preserved byte-for-byte. When present they are static methods inside
-    # Main so the generated calls can reference them unqualified.
-    emit_helpers = parsed_sig is not None
+    # The marshal helpers are needed on both the typed (signature-driven)
+    # path and the legacy path, because the legacy path now materializes
+    # native-typed arguments from JSON and converts the native return value
+    # back to JsonValue via nativeToJson. They are static methods inside Main
+    # so the generated calls can reference them unqualified. For correctness
+    # and to avoid duplicate declarations we always emit them once.
+    emit_helpers = True  # parsed_sig is not None or legacy path needs helpers too
 
     # Hoist candidate `import` statements to the top of the generated file.
     # Java forbids imports after any type declaration, and the harness
@@ -1654,24 +1722,49 @@ def generate_java_harness(
             )
         lines.append(f"                JsonValue _result = {_JAVA_NATIVE_TO_JSON[normalized_return]}(_result_native);")
     elif class_name:
-        lines.append(f"                {class_name} _obj = new {class_name}();")
+        # Legacy path (no function_signature). Infer native Java types from the
+        # JSON argument shape (legacy DB rows carry no signature metadata),
+        # materialize each JSON argument into a typed local, invoke on an
+        # instance of the class, and convert the returned native value back
+        # to JsonValue via nativeToJson.
         if len(test_arguments) > 0 and len(test_arguments[0]) > 0:
-            # For single arg, pass directly; for multiple, pass as array elements
-            if len(test_arguments[0]) == 1:
-                arg_call = "tcArgs"
-            else:
-                arg_call = ", ".join(f"tcArgs.get({i})" for i in range(len(test_arguments[0])))
+            arg_decls = []
+            for i, arg in enumerate(test_arguments[0]):
+                java_type, conv = _java_legacy_arg_spec(arg)
+                arg_decls.append(
+                    f"                {java_type} _arg{i} = {conv}(tcArgs.get({i}));"
+                )
+            args_call = ", ".join(f"_arg{i}" for i in range(len(test_arguments[0])))
+            lines.append(f"                {class_name} _obj = new {class_name}();")
+            lines.extend(arg_decls)
+            lines.append(f"                JsonValue _result = nativeToJson(_obj.{function_name}({args_call}));")
         else:
-            arg_call = ""
-        lines.append(f"                JsonValue _result = _obj.{function_name}({arg_call});")
+            lines.append(f"                {class_name} _obj = new {class_name}();")
+            lines.append(f"                JsonValue _result = nativeToJson(_obj.{function_name}());")
     else:
-        if len(test_arguments) > 0 and len(test_arguments[0]) == 1:
-            arg_call = "tcArgs"
-        elif len(test_arguments) > 0 and len(test_arguments[0]) > 1:
-            arg_call = ", ".join(f"tcArgs.get({i})" for i in range(len(test_arguments[0])))
+        # Legacy path (no function_signature). Infer native Java types from the
+        # JSON argument shape (legacy DB rows carry no signature metadata),
+        # materialize each JSON argument into a typed local, invoke on an
+        # instance of the class, and convert the returned native value back
+        # to JsonValue via nativeToJson.
+        #
+        # When class_name is not set in the problem metadata, fall back to the
+        # LeetCode-style "Solution" class.
+        legacy_class_name = class_name or "Solution"
+        if len(test_arguments) > 0 and len(test_arguments[0]) > 0:
+            arg_decls = []
+            for i, arg in enumerate(test_arguments[0]):
+                java_type, conv = _java_legacy_arg_spec(arg)
+                arg_decls.append(
+                    f"                {java_type} _arg{i} = {conv}(tcArgs.get({i}));"
+                )
+            args_call = ", ".join(f"_arg{i}" for i in range(len(test_arguments[0])))
+            lines.append(f"                {legacy_class_name} _obj = new {legacy_class_name}();")
+            lines.extend(arg_decls)
+            lines.append(f"                JsonValue _result = nativeToJson(_obj.{function_name}({args_call}));")
         else:
-            arg_call = ""
-        lines.append(f"                JsonValue _result = {function_name}({arg_call});")
+            lines.append(f"                {legacy_class_name} _obj = new {legacy_class_name}();")
+            lines.append(f"                JsonValue _result = nativeToJson(_obj.{function_name}());")
 
     lines.extend([
         '                boolean _passed = JsonValue.stringify(_result).equals(JsonValue.stringify(expected));',
