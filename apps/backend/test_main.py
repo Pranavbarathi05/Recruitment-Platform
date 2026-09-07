@@ -2888,7 +2888,7 @@ class TestHarnessGeneration:
         )
         assert "std::vector<int> _arg0 = jsonToVectorInt(args.to_array()[0]);" in result
         assert "int _arg1 = jsonToInt(args.to_array()[1]);" in result
-        assert "nativeToJson(_obj.solve(_arg0, _arg1))" in result
+        assert "nativeToJson(solve(_arg0, _arg1))" in result
         assert "solve(args.to_array()" not in result
 
     def test_java_harness_includes_candidate_code(self):

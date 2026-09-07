@@ -4,6 +4,7 @@ import { useAuth } from '../hooks/useAuth';
 import CodeEditor from '../components/CodeEditor';
 import TestResultsPanel from '../components/TestResultsPanel';
 import { runCodeLocally, isClientRunnable } from '../execution/runner';
+import { generatePythonStarterCode } from '../utils/codingStarterCode';
 
 /**
  * Combined Assessment Workspace
@@ -25,17 +26,175 @@ const CODING_LANGUAGES = [
   { value: 'java', label: 'Java' },
 ];
 
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+
+// ---- Starter generation (mirrors the backend harness contract) ----
+//
+// The candidate writes ONLY the function/method; the hidden harness invokes it
+// (apps/backend/services/harness.py, and the mirror in execution/harness.js):
+//
+//   python3: class_name set -> _instance = ClassName(); _instance.fn(...)
+//            class_name null -> free call fn(...)
+//   cpp:     class_name set -> ClassName _obj; _obj.fn(...)
+//            class_name null -> free call fn(...) with native args materialized
+//                               from the JSON test data
+//   java:    the harness ALWAYS instantiates class_name or "Solution" and calls
+//            the instance method _obj.fn(...) (legacy fallback included)
+//
+// Types: function_signature verbatim when configured; otherwise inferred from
+// the first public test case's arguments/expected_output using the SAME
+// JSON-shape rules as the backend's legacy arg specs (_cpp_legacy_arg_spec /
+// _java_legacy_arg_spec), so the starter and the harness always agree.
+
+function inferCppType(v) {
+  if (v === null || v === undefined) return 'int';
+  if (typeof v === 'boolean') return 'bool';
+  if (typeof v === 'string') return 'std::string';
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v)) return 'double';
+    if (v < INT32_MIN || v > INT32_MAX) return 'long long';
+    return 'int';
+  }
+  if (Array.isArray(v)) {
+    if (v.length && v.every((x) => typeof x === 'string')) return 'std::vector<std::string>';
+    if (v.length && v.every((x) => Array.isArray(x))) {
+      if (v[0] && v[0].length && v[0].every((x) => typeof x === 'string')) {
+        return 'std::vector<std::vector<std::string>>';
+      }
+      return 'std::vector<std::vector<int>>';
+    }
+    if (v.length && v.every((x) => typeof x === 'boolean')) return 'std::vector<bool>';
+    if (v.length && v.every((x) => typeof x === 'number')) {
+      if (v.some((x) => !Number.isInteger(x))) return 'std::vector<double>';
+      if (v.some((x) => x < INT32_MIN || x > INT32_MAX)) return 'std::vector<long long>';
+      return 'std::vector<int>';
+    }
+    return 'std::vector<int>';
+  }
+  return 'int';
+}
+
+function inferJavaType(v) {
+  if (v === null || v === undefined) return 'int';
+  if (typeof v === 'boolean') return 'boolean';
+  if (typeof v === 'string') return 'String';
+  if (typeof v === 'number') {
+    if (!Number.isInteger(v)) return 'double';
+    if (v < INT32_MIN || v > INT32_MAX) return 'long';
+    return 'int';
+  }
+  if (Array.isArray(v)) {
+    if (v.length && v.every((x) => typeof x === 'string')) return 'String[]';
+    if (v.length && v.every((x) => typeof x === 'number')) {
+      if (v.some((x) => !Number.isInteger(x))) return 'double[]';
+      if (v.some((x) => x < INT32_MIN || x > INT32_MAX)) return 'long[]';
+      return 'int[]';
+    }
+    if (v.length && v.every((x) => typeof x === 'boolean')) return 'boolean[]';
+    return 'int[]';
+  }
+  return 'int';
+}
+
+function inferLangType(lang, v) {
+  return lang === 'cpp' ? inferCppType(v) : inferJavaType(v);
+}
+
+function getStarterTypes(problem, lang) {
+  // Parameter arity/types: first public test case with arguments.
+  const tcs = problem?.test_cases || [];
+  const firstWithArgs = tcs.find(
+    (tc) => Array.isArray(tc.arguments) && tc.arguments.length > 0
+  );
+  const args = firstWithArgs ? firstWithArgs.arguments : [];
+  const params = args.map((v, i) => ({ type: inferLangType(lang, v), name: `arg${i + 1}` }));
+  // Return type: shape of the first expected output.
+  const retType = tcs.length ? inferLangType(lang, tcs[0].expected_output) : (lang === 'cpp' ? 'int' : 'int');
+  return { params, retType };
+}
+
+function getStarterParamsText(params) {
+  return params.map((p) => `${p.type} ${p.name}`).join(', ');
+}
+
 const getDefaultStarter = (lang, problem) => {
   // Use problem's per-language starter code if available
-  if (problem?.starter_code?.[lang]) {
+  if (problem?.starter_code?.[lang] && problem.starter_code[lang].trim()) {
     return problem.starter_code[lang];
   }
-  // Fallback defaults
-  switch (lang) {
-    case 'python3': return '# Write your solution here\nclass Solution:\n    def solve(self, *args):\n        pass\n';
-    case 'cpp': return 'class Solution {\npublic:\n    // Write your solution here\n};\n';
-    case 'java': return 'class Solution {\n    // Write your solution here\n}\n';
-    default: return '';
+
+  const functionName = problem?.function_name || 'solve';
+  const className = problem?.class_name || null;
+  const signature = (problem?.function_signature || '').trim();
+
+  // --- Python ---
+  if (lang === 'python3') {
+    if (signature) {
+      // Existing metadata mechanism: parses names, honors class_name.
+      try {
+        return generatePythonStarterCode(functionName, className, signature);
+      } catch {
+        /* fall through to inference */
+      }
+    }
+    const { params } = getStarterTypes(problem, lang);
+    const names = params.map((p) => p.name).join(', ');
+    if (className) {
+      return (
+        `class ${className}:\n` +
+        `    def ${functionName}(self, ${names}):\n` +
+        `        # Write your solution here\n` +
+        `        pass\n`
+      );
+    }
+    return (
+      `def ${functionName}(${names}):\n` +
+      `    # Write your solution here\n` +
+      `    pass\n`
+    );
+  }
+
+  // --- C++ ---
+  if (lang === 'cpp') {
+    const body = (indent) => `${indent}// Write your solution here`;
+    if (signature) {
+      const head = signature.replace(/;\s*$/, '');
+      if (className) {
+        return (
+          `class ${className} {\npublic:\n` +
+          `    ${head} {\n        ${body('')}\n    }\n` +
+          `};\n`
+        );
+      }
+      return `${head} {\n    ${body('')}\n}\n`;
+    }
+    const { params, retType } = getStarterTypes(problem, lang);
+    const paramsText = getStarterParamsText(params);
+    if (className) {
+      return (
+        `class ${className} {\npublic:\n` +
+        `    ${retType} ${functionName}(${paramsText}) {\n` +
+        `        ${body('')}\n    }\n` +
+        `};\n`
+      );
+    }
+    return `${retType} ${functionName}(${paramsText}) {\n    ${body('')}\n}\n`;
+  }
+
+  // --- Java (harness always invokes an instance method on class_name or "Solution") ---
+  {
+    const javaClassName = className || 'Solution';
+    let method;
+    if (signature) {
+      method = signature.replace(/;\s*$/, '').trim();
+      if (!/^public\b/.test(method)) method = `public ${method}`;
+      method = `${method} {\n        // Write your solution here\n    }`;
+    } else {
+      const { params, retType } = getStarterTypes(problem, lang);
+      method = `public ${retType} ${functionName}(${getStarterParamsText(params)}) {\n        // Write your solution here\n    }`;
+    }
+    return `class ${javaClassName} {\n    ${method}\n}\n`;
   }
 };
 
