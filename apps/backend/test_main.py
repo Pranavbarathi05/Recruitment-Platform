@@ -252,6 +252,19 @@ class TestAssessmentConfig:
         with pytest.raises(Exception):
             AssessmentConfigUpdate(max_domains=3)  # Too high
 
+    def test_config_update_accepts_descriptive_count(self, client, mock_supabase):
+        """descriptive_question_count must be >= 0."""
+        from schemas.assessment import AssessmentConfigUpdate
+        # Valid: 0
+        cfg = AssessmentConfigUpdate(descriptive_question_count=0)
+        assert cfg.descriptive_question_count == 0
+        # Valid: positive
+        cfg = AssessmentConfigUpdate(descriptive_question_count=5)
+        assert cfg.descriptive_question_count == 5
+        # Invalid: negative
+        with pytest.raises(Exception):
+            AssessmentConfigUpdate(descriptive_question_count=-1)
+
 
 # ---------------------------------------------------------------------------
 # Assessment — requires auth
@@ -4420,3 +4433,168 @@ class TestCodingScoringPerProblem:
         # PROBLEM_C's submission must be ignored
         assert result["score"] == 2, f"Expected score=2 (only A), got {result['score']}"
         assert result["max_score"] == 4, f"Expected max_score=4 (A+B), got {result['max_score']}"
+
+
+# ============================================================
+# DESCRIPTIVE QUESTION TESTS
+# ============================================================
+
+MOCK_DESC_ID = "dddd1111-1111-1111-1111-111111111111"
+MOCK_DESC_ID_2 = "dddd2222-2222-2222-2222-222222222222"
+
+
+def _make_descriptive(desc_id=MOCK_DESC_ID, domain_ids=None):
+    return {
+        "id": desc_id,
+        "question_text": f"Describe the architecture of {desc_id}",
+        "image_url": None,
+        "word_limit": 500,
+        "domain_ids": domain_ids or [MOCK_DOMAIN_1_ID],
+        "is_active": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+class TestDescriptiveSchemas:
+    """Schema validation for descriptive questions."""
+
+    def test_descriptive_create_minimal(self):
+        from schemas.assessment import DescriptiveCreate
+        q = DescriptiveCreate(question_text="What is X?")
+        assert q.question_text == "What is X?"
+        assert q.image_url is None
+        assert q.word_limit is None
+        assert q.domain_ids == []
+        assert q.is_active is True
+
+    def test_descriptive_create_full(self):
+        from schemas.assessment import DescriptiveCreate
+        q = DescriptiveCreate(
+            question_text="Explain Y",
+            image_url="https://example.com/img.png",
+            word_limit=300,
+            domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID],
+            is_active=False,
+        )
+        assert q.word_limit == 300
+        assert len(q.domain_ids) == 2
+        assert q.is_active is False
+
+    def test_descriptive_create_rejects_empty_text(self):
+        from schemas.assessment import DescriptiveCreate
+        with pytest.raises(Exception):
+            DescriptiveCreate(question_text="")
+
+    def test_descriptive_create_rejects_zero_word_limit(self):
+        from schemas.assessment import DescriptiveCreate
+        with pytest.raises(Exception):
+            DescriptiveCreate(question_text="Q", word_limit=0)
+
+    def test_descriptive_update_partial(self):
+        from schemas.assessment import DescriptiveUpdate
+        u = DescriptiveUpdate(word_limit=100)
+        assert u.question_text is None
+        assert u.word_limit == 100
+        assert u.domain_ids is None
+
+    def test_descriptive_answer_save(self):
+        from schemas.assessment import DescriptiveAnswerSaveRequest
+        a = DescriptiveAnswerSaveRequest(question_id=MOCK_DESC_ID, answer_text="My answer")
+        assert a.answer_text == "My answer"
+
+    def test_descriptive_answer_save_default_empty(self):
+        from schemas.assessment import DescriptiveAnswerSaveRequest
+        a = DescriptiveAnswerSaveRequest(question_id=MOCK_DESC_ID)
+        assert a.answer_text == ""
+
+
+class TestDescriptiveAdminCRUD:
+    """Admin CRUD for descriptive questions via mocked Supabase."""
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_list_empty(self, mock_sb):
+        mock_sb.table.return_value.select.return_value.order.return_value.execute.return_value = _make_mock_response([])
+        from routers.descriptive_admin import list_descriptive_questions
+        from core.auth import AuthUser
+        result = list_descriptive_questions(admin=AuthUser(id=MOCK_PROFILE_ID))
+        assert result == []
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_create_minimal(self, mock_sb):
+        created = _make_descriptive()
+        mock_sb.table.return_value.insert.return_value.execute.return_value = _make_mock_response([created])
+        from routers.descriptive_admin import create_descriptive_question
+        from schemas.assessment import DescriptiveCreate
+        from core.auth import AuthUser
+        result = create_descriptive_question(
+            payload=DescriptiveCreate(question_text="What is X?"),
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+        assert result["question_text"] == "Describe the architecture of dddd1111-1111-1111-1111-111111111111"
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_update_fields(self, mock_sb):
+        existing = _make_descriptive()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = _make_mock_response([existing])
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _make_mock_response([{**existing, "word_limit": 200}])
+        from routers.descriptive_admin import update_descriptive_question
+        from schemas.assessment import DescriptiveUpdate
+        from core.auth import AuthUser
+        result = update_descriptive_question(
+            question_id=MOCK_DESC_ID,
+            payload=DescriptiveUpdate(word_limit=200),
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+        assert result["word_limit"] == 200
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_delete_success(self, mock_sb):
+        existing = _make_descriptive()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = _make_mock_response([existing])
+        # No attempts referencing this question
+        mock_sb.table.return_value.select.return_value.contains.return_value.limit.return_value.execute.return_value = _make_mock_response([])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        from routers.descriptive_admin import delete_descriptive_question
+        from core.auth import AuthUser
+        result = delete_descriptive_question(
+            question_id=MOCK_DESC_ID,
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+        assert result["status"] == "deleted"
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_delete_blocked_by_attempt_reference(self, mock_sb):
+        existing = _make_descriptive()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = _make_mock_response([existing])
+        # Attempt references this question
+        mock_sb.table.return_value.select.return_value.contains.return_value.limit.return_value.execute.return_value = _make_mock_response([{"id": MOCK_ATTEMPT_ID}])
+        from routers.descriptive_admin import delete_descriptive_question
+        from core.auth import AuthUser
+        with pytest.raises(HTTPException) as exc_info:
+            delete_descriptive_question(
+                question_id=MOCK_DESC_ID,
+                admin=AuthUser(id=MOCK_PROFILE_ID),
+            )
+        assert exc_info.value.status_code == 409
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_list_enriches_domain_names(self, mock_sb):
+        q = _make_descriptive(domain_ids=[MOCK_DOMAIN_1_ID])
+        mock_sb.table.return_value.select.return_value.order.return_value.execute.return_value = _make_mock_response([q])
+        mock_sb.table.return_value.select.return_value.in_.return_value.execute.return_value = _make_mock_response(
+            [{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev"}]
+        )
+        from routers.descriptive_admin import list_descriptive_questions
+        from core.auth import AuthUser
+        result = list_descriptive_questions(admin=AuthUser(id=MOCK_PROFILE_ID))
+        assert result[0]["domain_names"] == ["Web Dev"]
+
+
+class TestDescriptiveInAssessment:
+    """Descriptive question integration in assessment start."""
+
+    def test_config_default_descriptive_count(self):
+        """Config without descriptive_question_count defaults to 0."""
+        config = _make_config()
+        assert config.get("descriptive_question_count", 0) == 0

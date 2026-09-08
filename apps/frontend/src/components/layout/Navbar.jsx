@@ -56,12 +56,14 @@ const Navbar = ({
   const navLinks = isAuthenticated
     ? [
         { name: 'Home', href: '/' },
+        { name: 'Instructions', href: '/instructions' },
         { name: 'Domains', href: '/domains' },
         { name: 'Dashboard', href: '/dashboard' },
         ...(isAdmin ? [{ name: 'Admin', href: '/admin' }] : []),
       ]
     : [
         { name: 'Home', href: '/' },
+        { name: 'Instructions', href: '/instructions' },
         { name: 'Login', href: '/login' },
       ];
 

@@ -3,7 +3,7 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import { Navbar } from './components';
 import ProtectedRoute from './components/ProtectedRoute';
-import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, SubmissionConfirmed, AdminPanel, AdminResults, AdminCoding } from './pages';
+import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, SubmissionConfirmed, AdminPanel, AdminResults, AdminCoding, AdminDescriptive, Instructions } from './pages';
 
 /**
  * Main App Component
@@ -103,6 +103,15 @@ function App() {
                   </ProtectedRoute>
                 }
               />
+              <Route
+                path="/admin/descriptive"
+                element={
+                  <ProtectedRoute>
+                    <AdminDescriptive />
+                  </ProtectedRoute>
+                }
+              />
+              <Route path="/instructions" element={<Instructions />} />
             </Routes>
           </main>
         </div>

@@ -228,6 +228,12 @@ const AssessmentWorkspace = () => {
   const [codingSubmissions, setCodingSubmissions] = useState({});
   const [hasCoding, setHasCoding] = useState(false);
 
+  // Descriptive state
+  const [descriptiveQuestions, setDescriptiveQuestions] = useState([]);
+  const [descriptiveAnswers, setDescriptiveAnswers] = useState({});
+  const [descriptiveIndex, setDescriptiveIndex] = useState(0);
+  const [hasDescriptive, setHasDescriptive] = useState(false);
+
   const autosaveTimerRef = useRef(null);
   const lastSavedRef = useRef({}); // { [problemId]: lastSavedCode }
 
@@ -248,6 +254,9 @@ const AssessmentWorkspace = () => {
           mcqData = await mcqResp.json();
           setMcqQuestions(mcqData.questions || []);
           setMcqAnswers(mcqData.answers || {});
+          setDescriptiveQuestions(mcqData.descriptive_questions || []);
+          setDescriptiveAnswers(mcqData.descriptive_answers || {});
+          setHasDescriptive((mcqData.descriptive_questions || []).length > 0);
           setAttemptData(mcqData);
           setHasMcq((mcqData.questions || []).length > 0);
 
@@ -285,9 +294,11 @@ const AssessmentWorkspace = () => {
           setCodingSubmissions(subs);
         }
 
-        // Default to MCQ if available, else Coding
+        // Default to first available section
         if (mcqData && (mcqData.questions || []).length > 0) {
           setActiveTab('mcq');
+        } else if ((mcqData?.descriptive_questions || []).length > 0) {
+          setActiveTab('descriptive');
         } else {
           setActiveTab('coding');
         }
@@ -351,6 +362,20 @@ const AssessmentWorkspace = () => {
         fetch(`${apiUrl}/assessment/attempt/${attemptId}/answers`, {
           method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
           body: JSON.stringify({ question_id: questionId, selected_option: option }),
+        }).catch(() => {});
+      }
+      return next;
+    });
+  }, [attemptId, apiUrl]);
+
+  // ========== DESCRIPTIVE: SAVE ANSWER ==========
+  const saveDescriptiveAnswer = useCallback(async (questionId, text) => {
+    setDescriptiveAnswers((prev) => {
+      const next = { ...prev, [questionId]: text };
+      if (attemptId) {
+        fetch(`${apiUrl}/assessment/attempt/${attemptId}/descriptive-answers`, {
+          method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
+          body: JSON.stringify({ question_id: questionId, answer_text: text }),
         }).catch(() => {});
       }
       return next;
@@ -497,6 +522,16 @@ const AssessmentWorkspace = () => {
                 MCQ ({mcqQuestions.length})
               </button>
             )}
+            {hasDescriptive && (
+              <button
+                onClick={() => setActiveTab('descriptive')}
+                className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  activeTab === 'descriptive' ? 'bg-blue-600 text-white' : 'text-theme-muted hover:text-theme-primary'
+                }`}
+              >
+                Descriptive ({descriptiveQuestions.length})
+              </button>
+            )}
             {hasCoding && (
               <button
                 onClick={() => setActiveTab('coding')}
@@ -533,6 +568,17 @@ const AssessmentWorkspace = () => {
             currentIndex={mcqIndex}
             setCurrentIndex={setMcqIndex}
             saveAnswer={saveMcqAnswer}
+          />
+        )}
+
+        {/* Descriptive Section */}
+        {activeTab === 'descriptive' && (
+          <DescriptiveSection
+            questions={descriptiveQuestions}
+            answers={descriptiveAnswers}
+            currentIndex={descriptiveIndex}
+            setCurrentIndex={setDescriptiveIndex}
+            saveAnswer={saveDescriptiveAnswer}
           />
         )}
 
@@ -630,6 +676,97 @@ function MCQSection({ questions, answers, currentIndex, setCurrentIndex, saveAns
           </div>
         </div>
 
+        <div className="flex justify-between items-center">
+          <button onClick={() => setCurrentIndex((p) => Math.max(0, p - 1))} disabled={currentIndex === 0}
+            className="px-6 py-2 rounded-lg bg-theme-secondary text-theme-primary disabled:opacity-50">Previous</button>
+          <div className="hidden md:flex flex-wrap gap-1 max-w-md">
+            {questions.map((qq, i) => (
+              <button key={qq.id} onClick={() => setCurrentIndex(i)}
+                className={`w-8 h-8 rounded text-sm font-medium ${
+                  i === currentIndex ? 'bg-blue-600 text-white' : answers[qq.id] ? 'bg-green-600 text-white' : 'bg-theme-secondary text-theme-muted'
+                }`}>{i + 1}</button>
+            ))}
+          </div>
+          {currentIndex < questions.length - 1 ? (
+            <button onClick={() => setCurrentIndex((p) => p + 1)}
+              className="px-6 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold">Next</button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// DESCRIPTIVE SUB-COMPONENT
+// ============================================================
+
+function DescriptiveSection({ questions, answers, currentIndex, setCurrentIndex, saveAnswer }) {
+  if (questions.length === 0) {
+    return (
+      <div className="h-full flex items-center justify-center text-theme-muted">
+        <p>No descriptive questions in this assessment.</p>
+      </div>
+    );
+  }
+
+  const q = questions[currentIndex];
+  const answeredCount = Object.keys(answers).length;
+  const currentText = answers[q.id] || '';
+  const wordCount = currentText.trim() ? currentText.trim().split(/\s+/).length : 0;
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Question area */}
+      <div className="flex-1 overflow-y-auto p-6">
+        <div className="max-w-3xl mx-auto">
+          {/* Progress bar */}
+          <div className="flex items-center gap-4 mb-6">
+            <span className="text-sm text-theme-muted">
+              Question {currentIndex + 1} of {questions.length}
+            </span>
+            <span className="text-sm text-green-400">
+              {answeredCount} answered
+            </span>
+          </div>
+
+          {/* Question text */}
+          <div className="bg-theme-secondary rounded-lg p-6 mb-4">
+            <p className="text-theme-primary whitespace-pre-wrap text-lg leading-relaxed">{q.question_text}</p>
+          </div>
+
+          {/* Image */}
+          {q.image_url && (
+            <div className="mb-4">
+              <img src={q.image_url} alt="Question image" className="max-h-80 rounded-lg border border-theme-secondary" />
+            </div>
+          )}
+
+          {/* Answer textarea */}
+          <div className="mt-4">
+            <label className="block text-sm font-medium text-theme-primary mb-2">Your Answer</label>
+            <textarea
+              value={currentText}
+              onChange={(e) => saveAnswer(q.id, e.target.value)}
+              rows={10}
+              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm resize-y min-h-[200px]"
+              placeholder="Type your answer here..."
+            />
+            <div className="flex justify-between mt-2 text-sm text-theme-muted">
+              <span>{wordCount} words</span>
+              {q.word_limit && (
+                <span className={wordCount > q.word_limit ? 'text-red-400' : ''}>
+                  Word limit: {q.word_limit}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Navigation */}
+      <div className="shrink-0 bg-theme-secondary border-t border-theme-border px-6 py-3">
         <div className="flex justify-between items-center">
           <button onClick={() => setCurrentIndex((p) => Math.max(0, p - 1))} disabled={currentIndex === 0}
             className="px-6 py-2 rounded-lg bg-theme-secondary text-theme-primary disabled:opacity-50">Previous</button>

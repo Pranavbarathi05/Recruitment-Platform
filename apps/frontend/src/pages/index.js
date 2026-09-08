@@ -10,3 +10,5 @@ export { default as SubmissionConfirmed } from './SubmissionConfirmed';
 export { default as AdminPanel } from './AdminPanel';
 export { default as AdminResults } from './AdminResults';
 export { default as AdminCoding } from './AdminCoding';
+export { default as AdminDescriptive } from './AdminDescriptive';
+export { default as Instructions } from './Instructions';

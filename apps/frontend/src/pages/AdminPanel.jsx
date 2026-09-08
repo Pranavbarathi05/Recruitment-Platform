@@ -169,6 +169,11 @@ const AdminPanel = () => {
       setConfigError('Coding problems must be even when using 2 domains.');
       return;
     }
+    const dc = configForm.descriptive_question_count;
+    if (dc !== undefined && dc !== null && dc < 0) {
+      setConfigError('Descriptive questions cannot be negative.');
+      return;
+    }
 
     try {
       // Filter out undefined values so we only send changed fields
@@ -485,12 +490,20 @@ const AdminPanel = () => {
       <div className="max-w-6xl mx-auto">
         <div className="flex items-center justify-between mb-8">
           <h1 className="text-3xl font-bold text-theme-primary">Admin Panel</h1>
-          <button
-            onClick={() => navigate('/admin/coding')}
-            className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-semibold transition-colors"
-          >
-            💻 Coding Problems
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => navigate('/admin/descriptive')}
+              className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg text-sm font-semibold transition-colors"
+            >
+              📝 Descriptive
+            </button>
+            <button
+              onClick={() => navigate('/admin/coding')}
+              className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-semibold transition-colors"
+            >
+              💻 Coding Problems
+            </button>
+          </div>
         </div>
 
         {message && (
@@ -621,6 +634,20 @@ const AdminPanel = () => {
                           />
                         </div>
                         <div>
+                          <label className="text-xs text-theme-muted mb-1 block">Descriptive Questions</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={configForm.descriptive_question_count ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
+                              setConfigForm({ ...configForm, descriptive_question_count: val });
+                            }}
+                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                            required
+                          />
+                        </div>
+                        <div>
                           <label className="text-xs text-theme-muted mb-1 block">Max Domains (1 or 2)</label>
                           <input
                             type="number"
@@ -656,7 +683,7 @@ const AdminPanel = () => {
                           </span>
                         </div>
                         <button
-                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, coding_problem_count: cfg.coding_problem_count ?? 0, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
+                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, coding_problem_count: cfg.coding_problem_count ?? 0, descriptive_question_count: cfg.descriptive_question_count ?? 0, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
                           className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
                         >
                           Edit
@@ -665,6 +692,7 @@ const AdminPanel = () => {
                       <div className="grid grid-cols-2 gap-2 mt-3 text-xs text-theme-muted">
                         <span>MCQ Questions: {cfg.total_questions}</span>
                         <span>Coding Problems: {cfg.coding_problem_count ?? 0}</span>
+                        <span>Descriptive: {cfg.descriptive_question_count ?? 0}</span>
                         <span>Duration: {cfg.duration_minutes}m</span>
                         <span>Max Domains: {cfg.max_domains}</span>
                       </div>

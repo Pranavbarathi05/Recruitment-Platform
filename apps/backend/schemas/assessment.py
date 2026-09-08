@@ -80,6 +80,32 @@ class AssessmentConfigUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     total_questions: Optional[int] = Field(None, gt=0)
     coding_problem_count: Optional[int] = Field(None, ge=0)
+    descriptive_question_count: Optional[int] = Field(None, ge=0)
     duration_minutes: Optional[int] = Field(None, gt=0)
     max_domains: Optional[int] = Field(None, ge=1, le=2)
     is_active: Optional[bool] = None
+
+
+# ---------------------------------------------------------------------------
+# Descriptive questions
+# ---------------------------------------------------------------------------
+
+class DescriptiveCreate(BaseModel):
+    question_text: str = Field(..., min_length=1)
+    image_url: Optional[str] = None
+    word_limit: Optional[int] = Field(None, gt=0)
+    domain_ids: list[str] = Field(default_factory=list)
+    is_active: bool = True
+
+
+class DescriptiveUpdate(BaseModel):
+    question_text: Optional[str] = Field(None, min_length=1)
+    image_url: Optional[str] = None
+    word_limit: Optional[int] = Field(None, gt=0)
+    domain_ids: Optional[list[str]] = None
+    is_active: Optional[bool] = None
+
+
+class DescriptiveAnswerSaveRequest(BaseModel):
+    question_id: str
+    answer_text: str = Field(default="")

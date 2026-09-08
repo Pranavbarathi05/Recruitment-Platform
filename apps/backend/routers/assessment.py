@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
 from core.supabase import supabase_client
-from schemas.assessment import AssessmentStartRequest, AnswerSaveRequest
+from schemas.assessment import AssessmentStartRequest, AnswerSaveRequest, DescriptiveAnswerSaveRequest
 
 router = APIRouter(prefix="/assessment", tags=["Assessment"])
 
@@ -239,6 +239,7 @@ def start_assessment(
     config = _get_active_config()
     total_mcq = config["total_questions"]
     coding_problem_count = config.get("coding_problem_count", 0)
+    descriptive_question_count = config.get("descriptive_question_count", 0)
     duration_minutes = config["duration_minutes"]
     max_domains = config["max_domains"]
 
@@ -371,7 +372,29 @@ def start_assessment(
         coding_problem_count
     )
 
-    # 7. Create ONE combined attempt
+    # 7. Select descriptive questions (active, overlapping chosen domains)
+    selected_descriptive_ids = []
+    if descriptive_question_count > 0:
+        desc_resp = (
+            supabase_client.table("descriptive_questions")
+            .select("id")
+            .eq("is_active", True)
+            .overlaps("domain_ids", domain_ids)
+            .execute()
+        )
+        available_desc = desc_resp.data or []
+        if len(available_desc) < descriptive_question_count:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Only {len(available_desc)} active descriptive questions "
+                    f"available for selected domains, need {descriptive_question_count}"
+                ),
+            )
+        sampled_desc = random.sample(available_desc, descriptive_question_count)
+        selected_descriptive_ids = [d["id"] for d in sampled_desc]
+
+    # 8. Create ONE combined attempt
     now = _utcnow()
     expires_at = now + timedelta(minutes=duration_minutes)
 
@@ -383,6 +406,8 @@ def start_assessment(
         "total_questions": len(selected_question_ids),
         "selected_coding_problem_ids": selected_coding_ids,
         "total_coding_problems": len(selected_coding_ids),
+        "selected_descriptive_question_ids": selected_descriptive_ids,
+        "total_descriptive_questions": len(selected_descriptive_ids),
         "duration_minutes": duration_minutes,
         "started_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
@@ -396,6 +421,7 @@ def start_assessment(
         "attempt_id": attempt["id"],
         "total_mcq_questions": attempt["total_questions"],
         "total_coding_problems": attempt["total_coding_problems"],
+        "total_descriptive_questions": attempt["total_descriptive_questions"],
         "duration_minutes": attempt["duration_minutes"],
         "domain_ids": domain_ids,
         "expires_at": attempt["expires_at"],
@@ -409,11 +435,7 @@ def get_current_attempt(current_user: AuthUser = Depends(get_current_user)):
     """Get the candidate's most recent in-progress attempt (combined MCQ+Coding)."""
     result = (
         supabase_client.table("assessment_attempts")
-        .select(
-            "id, profile_id, status, domain_ids, selected_question_ids, total_questions, "
-            "selected_coding_problem_ids, total_coding_problems, "
-            "duration_minutes, started_at, expires_at, submitted_at, created_at"
-        )
+        .select("*")
         .eq("profile_id", current_user.id)
         .eq("status", "in_progress")
         .order("started_at", desc=True)
@@ -437,11 +459,7 @@ def get_attempt(attempt_id: str, current_user: AuthUser = Depends(get_current_us
     """Get attempt details (no scoring data for candidates)."""
     result = (
         supabase_client.table("assessment_attempts")
-        .select(
-            "id, profile_id, status, domain_ids, selected_question_ids, total_questions, "
-            "selected_coding_problem_ids, total_coding_problems, "
-            "duration_minutes, started_at, expires_at, submitted_at, created_at"
-        )
+        .select("*")
         .eq("id", attempt_id)
         .execute()
     )
@@ -486,50 +504,73 @@ def get_attempt_questions(
         raise HTTPException(status_code=400, detail="Assessment time has expired")
 
     question_ids = attempt["selected_question_ids"]
-    if not question_ids:
-        return {
-            "attempt_id": attempt_id,
-            "total_questions": attempt["total_questions"],
-            "duration_minutes": attempt["duration_minutes"],
-            "expires_at": attempt.get("expires_at"),
-            "questions": [],
-            "answers": {},
+    desc_ids = attempt.get("selected_descriptive_question_ids") or []
+
+    # Fetch MCQ questions (empty list if none selected)
+    questions = []
+    answers_map = {}
+    if question_ids:
+        questions_resp = (
+            supabase_client.table("mcq_questions")
+            .select("id, domain_id, question_text, option_a, option_b, option_c, option_d")
+            .in_("id", question_ids)
+            .execute()
+        )
+        q_map = {q["id"]: q for q in (questions_resp.data or [])}
+        ordered = [q_map[qid] for qid in question_ids if qid in q_map]
+
+        domains_resp = (
+            supabase_client.table("domains")
+            .select("id, name")
+            .in_("id", attempt["domain_ids"])
+            .execute()
+        )
+        domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
+        for q in ordered:
+            q["domainName"] = domain_map.get(q.get("domain_id"), "")
+
+        answers_resp = (
+            supabase_client.table("assessment_answers")
+            .select("question_id, selected_option")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        )
+        answers_map = {a["question_id"]: a["selected_option"] for a in (answers_resp.data or [])}
+        questions = ordered
+
+    # Fetch descriptive questions (empty list if none selected)
+    descriptive_questions = []
+    descriptive_answers_map = {}
+    if desc_ids:
+        desc_resp = (
+            supabase_client.table("descriptive_questions")
+            .select("id, question_text, image_url, word_limit")
+            .in_("id", desc_ids)
+            .execute()
+        )
+        desc_q_map = {q["id"]: q for q in (desc_resp.data or [])}
+        descriptive_questions = [desc_q_map[qid] for qid in desc_ids if qid in desc_q_map]
+
+        desc_answers_resp = (
+            supabase_client.table("assessment_descriptive_answers")
+            .select("question_id, answer_text")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        )
+        descriptive_answers_map = {
+            a["question_id"]: a["answer_text"] for a in (desc_answers_resp.data or [])
         }
-
-    questions_resp = (
-        supabase_client.table("mcq_questions")
-        .select("id, domain_id, question_text, option_a, option_b, option_c, option_d")
-        .in_("id", question_ids)
-        .execute()
-    )
-    q_map = {q["id"]: q for q in (questions_resp.data or [])}
-    ordered = [q_map[qid] for qid in question_ids if qid in q_map]
-
-    domains_resp = (
-        supabase_client.table("domains")
-        .select("id, name")
-        .in_("id", attempt["domain_ids"])
-        .execute()
-    )
-    domain_map = {d["id"]: d["name"] for d in (domains_resp.data or [])}
-    for q in ordered:
-        q["domainName"] = domain_map.get(q.get("domain_id"), "")
-
-    answers_resp = (
-        supabase_client.table("assessment_answers")
-        .select("question_id, selected_option")
-        .eq("attempt_id", attempt_id)
-        .execute()
-    )
-    answers_map = {a["question_id"]: a["selected_option"] for a in (answers_resp.data or [])}
 
     return {
         "attempt_id": attempt_id,
         "total_questions": attempt["total_questions"],
+        "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
         "duration_minutes": attempt["duration_minutes"],
         "expires_at": attempt.get("expires_at"),
-        "questions": ordered,
+        "questions": questions,
         "answers": answers_map,
+        "descriptive_questions": descriptive_questions,
+        "descriptive_answers": descriptive_answers_map,
     }
 
 
@@ -581,6 +622,62 @@ def save_answer(
             "attempt_id": attempt_id,
             "question_id": payload.question_id,
             "selected_option": payload.selected_option,
+            "answered_at": now,
+        }).execute()
+
+    return {"status": "saved"}
+
+
+# ---------------------------------------------------------------------------
+
+@router.put("/attempt/{attempt_id}/descriptive-answers")
+def save_descriptive_answer(
+    attempt_id: str,
+    payload: DescriptiveAnswerSaveRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Save/update a descriptive question answer."""
+    attempt_resp = (
+        supabase_client.table("assessment_attempts")
+        .select("*")
+        .eq("id", attempt_id)
+        .execute()
+    )
+    if not attempt_resp.data:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    attempt = attempt_resp.data[0]
+    if attempt["profile_id"] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if attempt["status"] != "in_progress":
+        raise HTTPException(status_code=400, detail="Attempt is not in progress")
+    if _is_expired(attempt):
+        _score_attempt(attempt_id)
+        raise HTTPException(status_code=400, detail="Assessment time has expired")
+
+    desc_ids = attempt.get("selected_descriptive_question_ids") or []
+    if payload.question_id not in desc_ids:
+        raise HTTPException(status_code=400, detail="Question not part of this attempt")
+
+    existing = (
+        supabase_client.table("assessment_descriptive_answers")
+        .select("id")
+        .eq("attempt_id", attempt_id)
+        .eq("question_id", payload.question_id)
+        .execute()
+    )
+
+    now = _utcnow().isoformat()
+    if existing.data:
+        supabase_client.table("assessment_descriptive_answers").update({
+            "answer_text": payload.answer_text,
+            "answered_at": now,
+        }).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase_client.table("assessment_descriptive_answers").insert({
+            "attempt_id": attempt_id,
+            "question_id": payload.question_id,
+            "answer_text": payload.answer_text,
             "answered_at": now,
         }).execute()
 
