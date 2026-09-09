@@ -116,15 +116,22 @@ const AdminDescriptive = () => {
     try {
       const formData = new FormData();
       formData.append('file', imageFile);
+      const authHeaders = getAuthHeaders();
+      // Do NOT forward Content-Type — let the browser set
+      // multipart/form-data; boundary=... automatically.
+      delete authHeaders['Content-Type'];
       const resp = await fetch(`${apiUrl}/admin/descriptive-questions/upload-image`, {
         method: 'POST',
-        headers: getAuthHeaders(),
+        headers: authHeaders,
         credentials: 'include',
         body: formData,
       });
       if (!resp.ok) {
-        const err = await resp.json();
-        throw new Error(err.detail || 'Failed to upload image');
+        const err = await resp.json().catch(() => ({}));
+        const detail = Array.isArray(err.detail)
+          ? err.detail.map((e) => e.msg || e).join('; ')
+          : err.detail || 'Failed to upload image';
+        throw new Error(detail);
       }
       const data = await resp.json();
       return data.image_url;
