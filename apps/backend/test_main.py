@@ -6162,8 +6162,11 @@ class TestHandsOnQuestionsEndpoint:
             assert r.status_code == 200
             results = r.json()["hands_on_results"]
             assert len(results) == 1
-            assert results[0]["verified"] is True
+            # Evidence is returned (pre-fills the read-only form) but the
+            # outcome is not: verified/score are never sent to candidates.
             assert results[0]["submitted_input"] == "' OR 1=1 --"
+            assert "verified" not in results[0]
+            assert "score" not in results[0]
         finally:
             client.app.dependency_overrides.clear()
 
@@ -6244,12 +6247,12 @@ class TestHandsOnSubmitVerification:
             r = self._submit(client)
             assert r.status_code == 200
             data = r.json()
-            assert data["verified"] is True
-            assert data["score"] == 100
-            assert data["points"] == 100
-            # The expected flag must never appear in the response
+            # Neutral ack: the candidate is never told the outcome.
+            assert data == {"status": "submitted"}
+            assert "verified" not in data and "score" not in data
+            assert "points" not in data
             assert self.EXPECTED_FLAG not in json.dumps(r.json())
-            # Row persisted with verified=True and full score
+            # Row persisted with verified=True and full score (admin-visible)
             hr = mock_supabase._table_chains["assessment_hands_on_results"]
             insert_payload = hr.insert.call_args.args[0]
             assert insert_payload["verified"] is True
@@ -6265,8 +6268,9 @@ class TestHandsOnSubmitVerification:
             r = self._submit(client, flag=self.WRONG_FLAG)
             assert r.status_code == 200
             data = r.json()
-            assert data["verified"] is False
-            assert data["score"] == 0
+            # Identical neutral ack for wrong flags — no correctness leak
+            assert data == {"status": "submitted"}
+            assert "verified" not in data and "score" not in data
             hr = mock_supabase._table_chains["assessment_hands_on_results"]
             insert_payload = hr.insert.call_args.args[0]
             assert insert_payload["verified"] is False
@@ -6286,7 +6290,7 @@ class TestHandsOnSubmitVerification:
                       "submitted_flag": self.EXPECTED_FLAG},
             )
             assert r.status_code == 200
-            assert r.json()["verified"] is True  # flag alone decides
+            assert r.json() == {"status": "submitted"}  # flag alone decides, outcome hidden
             hr = mock_supabase._table_chains["assessment_hands_on_results"]
             insert_payload = hr.insert.call_args.args[0]
             assert insert_payload["submitted_input"] == weird_sql
@@ -6299,7 +6303,12 @@ class TestHandsOnSubmitVerification:
         try:
             r = self._submit(client, flag=f"  {self.EXPECTED_FLAG}  \n")
             assert r.status_code == 200
-            assert r.json()["verified"] is True
+            # Stored flag is the trimmed value; outcome hidden from candidate
+            assert r.json() == {"status": "submitted"}
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            insert_payload = hr.insert.call_args.args[0]
+            assert insert_payload["verified"] is True
+            assert insert_payload["submitted_flag"] == self.EXPECTED_FLAG
         finally:
             client.app.dependency_overrides.clear()
 
@@ -6309,7 +6318,11 @@ class TestHandsOnSubmitVerification:
         try:
             r = self._submit(client, flag=self.EXPECTED_FLAG.lower())
             assert r.status_code == 200
-            assert r.json()["verified"] is False
+            # Case-mismatch stores verified=False but the ack stays neutral
+            assert r.json() == {"status": "submitted"}
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            insert_payload = hr.insert.call_args.args[0]
+            assert insert_payload["verified"] is False
         finally:
             client.app.dependency_overrides.clear()
 
@@ -6319,7 +6332,9 @@ class TestHandsOnSubmitVerification:
         try:
             r = self._submit(client, flag="   ")
             assert r.status_code == 200
-            assert r.json()["verified"] is False
+            assert r.json() == {"status": "submitted"}
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            assert hr.insert.call_args.args[0]["verified"] is False
         finally:
             client.app.dependency_overrides.clear()
 
@@ -6329,12 +6344,15 @@ class TestHandsOnSubmitVerification:
         try:
             r = self._submit(client, flag="")
             assert r.status_code == 200
-            assert r.json()["verified"] is False
+            assert r.json() == {"status": "submitted"}
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            assert hr.insert.call_args.args[0]["verified"] is False
         finally:
             client.app.dependency_overrides.clear()
 
-    def test_resubmission_updates_same_row(self, client, mock_supabase):
-        """UNIQUE(attempt_id, question_id): resubmission updates, never duplicates."""
+    def test_second_submission_conflict_409(self, client, mock_supabase):
+        """ONE submission per (attempt, question): second PUT gets 409 and
+        never reaches scoring — refresh/another tab/direct API all blocked."""
         self._set_auth_override()
         self._configure_mocks(
             mock_supabase, self._attempt(),
@@ -6342,19 +6360,53 @@ class TestHandsOnSubmitVerification:
         )
         try:
             r = self._submit(client)
-            assert r.status_code == 200
-            assert r.json()["verified"] is True
+            assert r.status_code == 409
+            assert "already been submitted" in r.json()["detail"]
+            # Nothing was written: no update, no insert — the stored result is
+            # immutable through this endpoint.
             hr = mock_supabase._table_chains["assessment_hands_on_results"]
             hr.insert.assert_not_called()
-            hr.update.assert_called_once()
-            update_payload = hr.update.call_args.args[0]
-            assert update_payload["verified"] is True
-            assert update_payload["score"] == 100
+            hr.update.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_second_submission_with_correct_flag_still_409(self, client, mock_supabase):
+        """Even a second submission carrying the CORRECT flag is rejected —
+        no retry window, no re-rolling an incorrect result."""
+        self._set_auth_override()
+        self._configure_mocks(
+            mock_supabase, self._attempt(),
+            existing_result={"id": "res-1", "verified": False, "score": 0},
+        )
+        try:
+            r = self._submit(client, flag=self.EXPECTED_FLAG)
+            assert r.status_code == 409
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            hr.update.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_resubmission_updates_same_row(self, client, mock_supabase):
+        """UNIQUE(attempt_id, question_id): replaced by one-submission
+        enforcement — a second submission is a 409, not an update."""
+        self._set_auth_override()
+        self._configure_mocks(
+            mock_supabase, self._attempt(),
+            existing_result={"id": "res-1", "verified": False, "score": 0},
+        )
+        try:
+            r = self._submit(client)
+            assert r.status_code == 409
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            hr.insert.assert_not_called()
+            hr.update.assert_not_called()
         finally:
             client.app.dependency_overrides.clear()
 
     def test_first_correct_wins_not_downgraded(self, client, mock_supabase):
-        """A verified result is never downgraded by a later wrong submission."""
+        """With one-submission enforcement there is no resubmission path, but
+        the stored (already verified) result must still be intact after a
+        rejected second attempt — it is never modified through this endpoint."""
         self._set_auth_override()
         self._configure_mocks(
             mock_supabase, self._attempt(),
@@ -6362,9 +6414,10 @@ class TestHandsOnSubmitVerification:
         )
         try:
             r = self._submit(client, flag=self.WRONG_FLAG, sql="different evidence")
-            assert r.status_code == 200
-            assert r.json()["verified"] is True
-            assert r.json()["score"] == 100
+            assert r.status_code == 409
+            # Stored verified result is untouched
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            hr.update.assert_not_called()
         finally:
             client.app.dependency_overrides.clear()
 

@@ -819,14 +819,28 @@ def get_attempt_questions(
         ho_map = {q["id"]: q for q in (ho_resp.data or [])}
         hands_on_questions = [ho_map[qid] for qid in hands_ids if qid in ho_map]
 
-        # Candidate's own submissions (verified/score only — never secrets)
+        # Candidate's own submissions — evidence only (their SQL input and
+        # flag, so the read-only form can be pre-filled on reload).
+        # verified/score are deliberately excluded: the candidate is never
+        # told whether their flag was correct (admins see it via the admin
+        # response endpoint). Rows are projected explicitly so those fields
+        # can never leak through even if the query shape changes.
         ho_results_resp = (
             supabase_client.table("assessment_hands_on_results")
-            .select("question_id, submitted_input, submitted_flag, verified, score, started_at, completed_at")
+            .select("question_id, submitted_input, submitted_flag, started_at, completed_at")
             .eq("attempt_id", attempt_id)
             .execute()
         )
-        hands_on_results = ho_results_resp.data or []
+        hands_on_results = [
+            {
+                "question_id": r.get("question_id"),
+                "submitted_input": r.get("submitted_input"),
+                "submitted_flag": r.get("submitted_flag"),
+                "started_at": r.get("started_at"),
+                "completed_at": r.get("completed_at"),
+            }
+            for r in (ho_results_resp.data or [])
+        ]
 
     # admin_remark is admin-only. Never include it in candidate responses.
     return {
@@ -1026,7 +1040,14 @@ def submit_hands_on(
         candidate-provided score is never trusted (the schema has no such
         field in the request at all).
 
-    Returns only {verified, score, points} — never the expected flag.
+    Each challenge may be submitted exactly ONCE per (attempt, question):
+    a second submission — via refresh, another tab, or a direct API call —
+    is rejected with 409 before any scoring happens.
+
+    Returns only {status: "submitted"}. The candidate is deliberately NOT
+    told whether the flag was correct, and never sees the score, the
+    verification result, or the expected flag. Admins see all of it via
+    the admin response endpoint.
     """
     attempt_resp = (
         supabase_client.table("assessment_attempts")
@@ -1050,6 +1071,21 @@ def submit_hands_on(
     if payload.question_id not in hands_ids:
         raise HTTPException(status_code=400, detail="Challenge not part of this attempt")
 
+    # ONE submission per (attempt, question). Enforced server-side BEFORE any
+    # scoring: refresh/re-opened tabs/direct API calls all land here and get
+    # 409. The candidate can never overwrite or re-roll a stored result.
+    existing = (
+        supabase_client.table("assessment_hands_on_results")
+        .select("id")
+        .eq("attempt_id", attempt_id)
+        .eq("question_id", payload.question_id)
+        .execute()
+    )
+    if existing.data:
+        raise HTTPException(
+            status_code=409, detail="Challenge has already been submitted"
+        )
+
     # Load the challenge server-side. expected_flag is only ever read here.
     question_resp = (
         supabase_client.table("hands_on_questions")
@@ -1068,45 +1104,16 @@ def submit_hands_on(
     score = points if verified else 0
 
     now = _utcnow().isoformat()
-    existing = (
-        supabase_client.table("assessment_hands_on_results")
-        .select("id, verified, score")
-        .eq("attempt_id", attempt_id)
-        .eq("question_id", payload.question_id)
-        .execute()
-    )
-
-    if existing.data:
-        prev = existing.data[0]
-        # First-correct-wins: a previously verified result is never downgraded
-        # by a later (possibly wrong) resubmission.
-        verified = verified or bool(prev.get("verified"))
-        if verified and not prev.get("verified"):
-            score = points
-        elif verified:
-            score = max(int(prev.get("score") or 0), score)
-        supabase_client.table("assessment_hands_on_results").update({
-            "submitted_input": payload.submitted_input or "",
-            "submitted_flag": submitted_flag,
-            "verified": verified,
-            "score": score,
-            "completed_at": now if verified else None,
-        }).eq("id", prev["id"]).execute()
-    else:
-        supabase_client.table("assessment_hands_on_results").insert({
-            "attempt_id": attempt_id,
-            "question_id": payload.question_id,
-            "submitted_input": payload.submitted_input or "",
-            "submitted_flag": submitted_flag,
-            "verified": verified,
-            "score": score,
-            "started_at": now,
-            "completed_at": now if verified else None,
-        }).execute()
-
-    return {
-        "status": "saved",
+    supabase_client.table("assessment_hands_on_results").insert({
+        "attempt_id": attempt_id,
+        "question_id": payload.question_id,
+        "submitted_input": payload.submitted_input or "",
+        "submitted_flag": submitted_flag,
         "verified": verified,
         "score": score,
-        "points": points,
-    }
+        "started_at": now,
+        "completed_at": now if verified else None,
+    }).execute()
+
+    # Neutral ack only: no verified, no score, no points, no expected flag.
+    return {"status": "submitted"}

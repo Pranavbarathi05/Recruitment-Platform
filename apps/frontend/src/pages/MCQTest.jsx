@@ -404,12 +404,31 @@ const AssessmentWorkspace = () => {
   }, [codingProblems, codingIndex, codingStates]);
 
   // ========== HANDS-ON: SUBMIT (evidence + flag) ==========
+  // One submission per challenge: the backend rejects a second PUT with 409
+  // and returns a neutral ack (never verified/score), so the candidate is
+  // not told whether their flag was correct.
   const submitHandsOn = useCallback(async (questionId, submittedInput, submittedFlag) => {
     const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/hands-on`, {
       method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
       body: JSON.stringify({ question_id: questionId, submitted_input: submittedInput, submitted_flag: submittedFlag }),
     });
     const data = await resp.json().catch(() => ({}));
+    if (resp.status === 409) {
+      // Backend enforces one submission per challenge: a 409 means a result
+      // already exists (refresh, second tab, direct API call). Lock the form
+      // with the neutral confirmation — never reveal correctness or score.
+      setHandsOnResults((prev) => ({
+        ...prev,
+        [questionId]: {
+          ...(prev[questionId] || {}),
+          question_id: questionId,
+          submitted_input: submittedInput,
+          submitted_flag: (submittedFlag || '').trim(),
+          submitted_at: new Date().toISOString(),
+        },
+      }));
+      return { status: 'already_submitted' };
+    }
     if (!resp.ok) {
       throw new Error(data.detail || 'Failed to submit challenge');
     }
@@ -420,9 +439,7 @@ const AssessmentWorkspace = () => {
         question_id: questionId,
         submitted_input: submittedInput,
         submitted_flag: (submittedFlag || '').trim(),
-        verified: data.verified,
-        score: data.score,
-        completed_at: data.verified ? new Date().toISOString() : null,
+        submitted_at: new Date().toISOString(),
       },
     }));
     return data;
@@ -894,7 +911,10 @@ function HandsOnSection({ questions, results, onSubmit }) {
   const [flagInput, setFlagInput] = useState(result?.submitted_flag || '');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const [savedResult, setSavedResult] = useState(result || null);
+  // One submission per challenge: a stored result (from the questions
+  // endpoint or from a successful submit) locks the form permanently.
+  const [submitted, setSubmitted] = useState(!!result);
+  const submittedRef = useRef(!!result);
 
   if (questions.length === 0 || !q) {
     return (
@@ -906,18 +926,13 @@ function HandsOnSection({ questions, results, onSubmit }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (submitting) return;
+    if (submitting || submittedRef.current) return;
     setSubmitting(true);
     setError('');
     try {
-      const data = await onSubmit(q.id, sqlInput, flagInput);
-      setSavedResult((prev) => ({
-        ...(prev || {}),
-        submitted_input: sqlInput,
-        submitted_flag: (flagInput || '').trim(),
-        verified: data.verified,
-        score: data.score,
-      }));
+      await onSubmit(q.id, sqlInput, flagInput);
+      submittedRef.current = true;
+      setSubmitted(true);
     } catch (err) {
       setError(err.message || 'Failed to submit');
     } finally {
@@ -935,9 +950,9 @@ function HandsOnSection({ questions, results, onSubmit }) {
             <div className="flex items-center gap-2 flex-shrink-0">
               <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
               <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
-              {savedResult && (
-                <span className={`text-xs px-2 py-0.5 rounded font-semibold ${savedResult.verified ? 'bg-green-900/50 text-green-300' : 'bg-yellow-900/50 text-yellow-300'}`}>
-                  {savedResult.verified ? '✓ Completed' : 'Attempted'}
+              {submitted && (
+                <span className="text-xs px-2 py-0.5 rounded font-semibold bg-blue-900/50 text-blue-300">
+                  Submitted
                 </span>
               )}
             </div>
@@ -976,7 +991,9 @@ function HandsOnSection({ questions, results, onSubmit }) {
               value={sqlInput}
               onChange={(e) => setSqlInput(e.target.value)}
               rows={5}
-              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono resize-y"
+              disabled={submitted}
+              readOnly={submitted}
+              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono resize-y disabled:opacity-60"
               placeholder="Paste the SQL input/payload you used..."
             />
             <p className="text-xs text-theme-muted mt-1">
@@ -989,7 +1006,9 @@ function HandsOnSection({ questions, results, onSubmit }) {
             <input
               value={flagInput}
               onChange={(e) => setFlagInput(e.target.value)}
-              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono"
+              disabled={submitted}
+              readOnly={submitted}
+              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono disabled:opacity-60"
               placeholder="FLAG{...}"
             />
           </div>
@@ -997,21 +1016,21 @@ function HandsOnSection({ questions, results, onSubmit }) {
           {error && (
             <p className="text-sm text-red-300 bg-red-900/30 border border-red-500 rounded px-3 py-2 mb-3">{error}</p>
           )}
-          {savedResult && !error && (
-            <p className={`text-sm rounded px-3 py-2 mb-3 border ${savedResult.verified ? 'text-green-300 bg-green-900/30 border-green-500' : 'text-yellow-300 bg-yellow-900/30 border-yellow-500'}`}>
-              {savedResult.verified
-                ? `✓ Correct — score ${savedResult.score} / ${q.points}`
-                : '✗ Incorrect flag — score 0. You can try again.'}
+          {submitted && (
+            <p className="text-sm text-theme-secondary bg-theme-tertiary border border-theme-border rounded px-3 py-2 mb-3">
+              Challenge submitted. Your response has been recorded.
             </p>
           )}
 
-          <button
-            type="submit"
-            disabled={submitting}
-            className="w-full px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50"
-          >
-            {submitting ? 'Submitting...' : 'Submit Challenge'}
-          </button>
+          {!submitted && (
+            <button
+              type="submit"
+              disabled={submitting}
+              className="w-full px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50"
+            >
+              {submitting ? 'Submitting...' : 'Submit Challenge'}
+            </button>
+          )}
         </form>
       </div>
     </div>

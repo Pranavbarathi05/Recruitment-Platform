@@ -233,8 +233,8 @@ def main():
               str(start.get("total_descriptive_questions")))
         check("start has selected_descriptive_question_ids",
               bool(start.get("selected_descriptive_question_ids")))
-        check("start total_hands_on_questions == 0 (no challenge exists yet)",
-              start.get("total_hands_on_questions") == 0,
+        check("start total_hands_on_questions == 1 (active challenge selected)",
+              start.get("total_hands_on_questions") == 1,
               str(start.get("total_hands_on_questions")))
 
         db_attempt = (sb.table("assessment_attempts").select("*")
@@ -318,40 +318,32 @@ def main():
               str(r.json().get("total_hands_on_questions")))
 
         # ============================================================
-        # 9.5. HANDS-ON (pre-submit): challenge server + SQLi + flag round-trip
+        # 9.5. HANDS-ON (pre-submit): drive the ACTUALLY-SELECTED challenge
+        # like a real candidate — SQLi against its configured challenge_url,
+        # then the one-shot evidence+flag submission round-trip.
         # ============================================================
-        import importlib.util
-        cs_spec = importlib.util.spec_from_file_location(
-            "challenge_server",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "challenge_server", "challenge_server.py"))
-        cs_mod = importlib.util.module_from_spec(cs_spec)
-        cs_spec.loader.exec_module(cs_mod)
+        # Candidate questions endpoint returns hands-on metadata — never the flag
+        r = cand_s.get(f"{BASE}/assessment/attempt/{attempt_id}/questions")
+        qd2 = r.json()
+        ho_meta = qd2.get("hands_on_questions") or []
+        check("candidate sees hands-on challenge metadata", len(ho_meta) == 1,
+              str(len(ho_meta)))
+        check("candidate response has no expected_flag", "expected_flag" not in json.dumps(qd2))
 
-        cs_db = os.path.join(tempfile.gettempdir(), f"live_e2e_sqli_{stamp}_{rng}.db")
-        cs_mod.init_db(cs_db)
-        cs_proc = subprocess.Popen(
-            [os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          ".venv/bin/python"),
-             os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "challenge_server", "challenge_server.py"),
-             "--port", "8093", "--db", cs_db],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        try:
-            # Wait for the challenge server to come up
-            cs_up = False
-            for _ in range(30):
-                try:
-                    if httpx.get("http://127.0.0.1:8093/health", timeout=2).status_code == 200:
-                        cs_up = True
-                        break
-                except Exception:
-                    time.sleep(0.3)
-            check("challenge server starts + /health ok", cs_up)
+        if ho_meta:
+            selected_id = ho_meta[0]["id"]
+            # Admin-side read of the selected challenge (service role, test only):
+            # its real URL and points — never exposed to candidates.
+            sel_row = (sb.table("hands_on_questions").select("challenge_url, points")
+                       .eq("id", selected_id).single().execute().data)
+            challenge_url = (sel_row.get("challenge_url") or "").rstrip("/")
+            challenge_points = int(sel_row.get("points") or 0)
+            check("challenge server reachable at configured challenge_url",
+                  httpx.get(challenge_url + "/", timeout=5).status_code == 200,
+                  challenge_url)
 
-            # ACTUAL SQL INJECTION against the challenge website (real HTTP)
-            r = httpx.post("http://127.0.0.1:8093/login",
+            # ACTUAL SQL INJECTION against the selected challenge (real HTTP)
+            r = httpx.post(challenge_url + "/login",
                            data={"username": "' OR 1=1 --", "password": "x"},
                            timeout=10)
             page = r.text
@@ -361,71 +353,58 @@ def main():
             flag_match = _re.search(r"FLAG\{[^}]*\}", page)
             discovered_flag = flag_match.group(0) if flag_match else ""
             check("SQLi prints flag", bool(discovered_flag), page[-200:] if not discovered_flag else "")
+        else:
+            discovered_flag = ""
+            challenge_url = ""
+            challenge_points = 0
+            check("challenge server reachable at configured challenge_url", False, "no challenge selected")
+            check("SQLi reveals administrator", False, "no challenge selected")
+            check("SQLi prints login info", False, "no challenge selected")
+            check("SQLi prints flag", False, "no challenge selected")
 
-            # Create an active hands-on challenge for the attempt domains
-            ho_title = f"Live E2E SQLi {stamp}{rng}"
-            r = admin_s.post(f"{BASE}/admin/hands-on-questions", json={
-                "title": ho_title,
-                "description": "Gain access to the administrator account and retrieve the protected flag.",
-                "domain_ids": dq_domains,
-                "challenge_type": "sql_injection_employee_portal",
-                "difficulty": "medium",
-                "points": 100,
-                "challenge_url": "http://127.0.0.1:8093",
-                "expected_flag": discovered_flag,
-                "is_active": True,
-            })
-            check("admin creates hands-on challenge", r.status_code == 201,
-                  r.text[:200] if r.status_code != 201 else "")
-            ho_id = r.json().get("id") if r.status_code == 201 else None
+        # Single submission: candidate sends flag ONCE. The response is a
+        # neutral ack — no verified/score (outcome is never revealed).
+        r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/hands-on",
+                       json={"question_id": selected_id,
+                             "submitted_input": "' OR 1=1 --",
+                             "submitted_flag": discovered_flag})
+        check("hands-on submission accepted (neutral ack)",
+              r.status_code == 200 and r.json().get("status") == "submitted"
+              and "verified" not in r.json() and "score" not in r.json(),
+              r.text[:120] if r.status_code != 200 else "")
+        check("submission response never contains the expected flag",
+              discovered_flag not in json.dumps(r.json()))
 
-            # Candidate questions endpoint returns hands-on metadata — never the flag
-            r = cand_s.get(f"{BASE}/assessment/attempt/{attempt_id}/questions")
-            qd2 = r.json()
-            ho_meta = qd2.get("hands_on_questions") or []
-            check("candidate sees hands-on challenge metadata", len(ho_meta) == 1,
-                  str(len(ho_meta)))
-            check("candidate response has no expected_flag", "expected_flag" not in json.dumps(qd2))
-            check("candidate questions response has no challenge flag",
-                  discovered_flag not in json.dumps(qd2))
+        # ONE submission per challenge: a second PUT — even with the
+        # correct flag — must be rejected with 409.
+        r2 = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/hands-on",
+                        json={"question_id": selected_id,
+                              "submitted_input": "retry",
+                              "submitted_flag": discovered_flag})
+        check("second submission rejected with 409",
+              r2.status_code == 409, f"got {r2.status_code}: {r2.text[:120]}")
 
-            # Wrong flag → verified=false, score 0
-            r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/hands-on",
-                           json={"question_id": ho_meta[0]["id"],
-                                 "submitted_input": "' OR 1=1 --",
-                                 "submitted_flag": "FLAG{wrong}"})
-            check("wrong flag → verified false / score 0",
-                  r.status_code == 200 and r.json().get("verified") is False
-                  and r.json().get("score") == 0,
-                  r.text[:120] if r.status_code != 200 else "")
-
-            # Correct (discovered) flag → full score
-            r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/hands-on",
-                           json={"question_id": ho_meta[0]["id"],
-                                 "submitted_input": "' OR 1=1 --",
-                                 "submitted_flag": discovered_flag})
-            check("correct flag → verified true / full score",
-                  r.status_code == 200 and r.json().get("verified") is True
-                  and r.json().get("score") == 100,
-                  r.text[:120] if r.status_code != 200 else "")
-            check("verification response never contains the expected flag",
-                  discovered_flag not in json.dumps(r.json()))
-
-            # Result persisted with evidence
-            ho_rows = (sb.table("assessment_hands_on_results")
-                       .select("*").eq("attempt_id", attempt_id).execute().data)
-            check("hands-on result persisted with evidence",
-                  len(ho_rows) == 1 and ho_rows[0]["submitted_input"] == "' OR 1=1 --"
-                  and ho_rows[0]["verified"] is True and ho_rows[0]["score"] == 100,
-                  str(len(ho_rows)))
-
-        finally:
-            cs_proc.terminate()
-            try:
-                os.remove(cs_db)
-            except OSError:
-                pass
-
+        # Rejected second submission must NOT have mutated anything, and the
+        # original result must retain its authoritative outcome.
+        ho_rows = (sb.table("assessment_hands_on_results")
+                   .select("*").eq("attempt_id", attempt_id).execute().data)
+        check("result row immutable after rejected second submission",
+              len(ho_rows) == 1 and ho_rows[0]["submitted_input"] == "' OR 1=1 --",
+              str(len(ho_rows)))
+        check("hands-on result persisted with evidence + correct flag scored",
+              ho_rows and ho_rows[0]["verified"] is True
+              and ho_rows[0]["score"] == challenge_points,
+              f"verified={ho_rows[0].get('verified') if ho_rows else None} "
+              f"score={ho_rows[0].get('score') if ho_rows else None} "
+              f"expected_points={challenge_points}")
+        r = cand_s.get(f"{BASE}/assessment/attempt/{attempt_id}/questions")
+        post_results = r.json().get("hands_on_results") or []
+        check("candidate result view carries evidence, never the outcome",
+              len(post_results) == 1
+              and post_results[0].get("submitted_flag") == discovered_flag
+              and "verified" not in post_results[0]
+              and "score" not in post_results[0],
+              str(post_results)[:160])
 
         # ============================================================
         # 10. Submit
@@ -448,7 +427,7 @@ def main():
         check("start after submit blocked (409)", r.status_code == 409,
               f"{r.status_code} {r.text[:120]}")
         r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/answers",
-                       json={"question_id": (qs.get("questions") or [{}])[0].get("id"),
+                       json={"question_id": mcq_q["id"],
                              "selected_option": "B"})
         check("answer save after submit rejected (400)", r.status_code == 400,
               str(r.status_code))
