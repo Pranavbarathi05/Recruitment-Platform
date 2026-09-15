@@ -14,6 +14,7 @@ The generated program is what gets sent to Judge0.
 
 import json
 import logging
+import math
 import re
 from typing import Any, List, Optional
 
@@ -730,6 +731,33 @@ def _split_top_level(text: str, sep: str = ",") -> list:
     return [p for p in parts if p]
 
 
+def _is_c_style_signature(signature: Optional[str], allow_bracket_arrays: bool = False) -> bool:
+    """Detect C-style signatures that are not valid for the C++/Java typed paths.
+
+    Problems share ONE `function_signature` field across languages, but the
+    syntax differs per language. A C signature like
+    'int removeDuplicates(int* nums, int numsSize)' is not valid typed C++ or
+    Java: feeding it to those parsers either silently mis-normalizes (C++
+    strips '*' and passes an int where the candidate expects vector<int>&) or
+    fails loudly (Java rejects 'int*'). Such signatures must never reach the
+    C++/Java typed paths — those harnesses fall back to their existing legacy
+    shape-inference behavior instead.
+
+    Detected C-style markers:
+      - any '*' pointer parameter/return (e.g. 'int* nums')
+      - bracket array parameters (e.g. 'int arr[]'); for Java, 'int[]' etc.
+        ARE valid typed syntax, so pass allow_bracket_arrays=True there.
+    """
+    if not signature:
+        return False
+    s = signature.strip().rstrip(";").strip()
+    if "*" in s:
+        return True
+    if not allow_bracket_arrays and re.search(r"[A-Za-z_]\w*\s*\[\s*\]", s):
+        return True
+    return False
+
+
 def _normalize_cpp_type(t: str) -> str:
     """Normalize a C++ type to a canonical spelling.
 
@@ -817,6 +845,15 @@ def generate_cpp_harness(
     #
     # When NO signature is provided (legacy problems / callers), the legacy
     # raw json::Value invocation is preserved unchanged.
+    #
+    # Language-aware guard: the shared metadata field may hold another
+    # language's signature (e.g. a C 'int* nums, int numsSize' signature on a
+    # multi-language problem). That is not valid typed C++ here — _normalize_
+    # cpp_type would silently strip '*' and pass an int where the candidate
+    # expects vector<int>& — so it is ignored and the legacy shape-inferred
+    # invocation is used, exactly as for signature-less problems.
+    if _is_c_style_signature(function_signature):
+        function_signature = None
     parsed_sig = _parse_cpp_signature(function_signature)
     sig_params = []
     sig_return = None
@@ -1575,6 +1612,14 @@ def generate_java_harness(
     # mismatched signatures fail loudly instead of passing raw JsonValue into a
     # native candidate method. When NO signature is provided (legacy problems /
     # callers) the original raw JsonValue invocation is preserved unchanged.
+    #
+    # Language-aware guard: the shared metadata field may hold another
+    # language's signature (e.g. a C 'int* nums, int numsSize' signature on a
+    # multi-language problem). Pointer syntax is not valid typed Java, so it
+    # is ignored and the legacy shape-inferred invocation is used instead.
+    # Java's own array types ('int[]', 'String[]') remain valid typed syntax.
+    if _is_c_style_signature(function_signature, allow_bracket_arrays=True):
+        function_signature = None
     parsed_sig = _parse_java_signature(function_signature)
     sig_params = []
     sig_return = None
@@ -1791,6 +1836,727 @@ def generate_java_harness(
 
 
 # ============================================================
+# C Harness (explicit signature required; scalar subset)
+# ============================================================
+#
+# C support is deliberately minimal and strict:
+#   - An explicit C `function_signature` is REQUIRED. Parameter types are
+#     never inferred from JSON test cases (unlike the legacy C++/Java paths).
+#   - Scalar types that the JSON test-case architecture represents safely are
+#     supported: int, long long, double, bool/_Bool.
+#   - Exactly one composite pattern is supported: the LeetCode-style in-place
+#     integer array 'int* <name>, int <length>'. The harness derives the length
+#     from the JSON array itself, passes a mutable stack array to the candidate
+#     function, and (optionally) verifies the mutated prefix against an
+#     expected_output of the form {"returns": k, "mutated": [...]}. That dict
+#     form reuses the existing JSONB expected_output field — no schema change.
+#   - Everything else (char*/void*/double* pointers, pointer-to-pointer,
+#     bracket arrays, const-qualified pointers, structs, function pointers,
+#     variadic parameters, C++-only constructs) fails loudly at generation.
+#
+# All test data is marshaled into C literals at generation time, so the
+# generated program needs no JSON parser: for each test case the harness
+# calls the candidate function with literal arguments, compares the return
+# value against the literal expected value, and appends one JSON result
+# object. Candidate stdout is redirected to /dev/null while the solution
+# runs, so printf() in candidate code cannot corrupt the result protocol.
+
+_C_TYPE_ALIASES = {
+    "int": "int",
+    "long long": "long long",
+    "double": "double",
+    "bool": "bool",
+    "_Bool": "bool",
+}
+
+# Storage-class tokens that may legally prefix a C return type in a signature.
+_C_MODIFIER_TOKENS = {"static", "inline", "extern", "register"}
+
+_C_SUPPORTED_TYPES_TEXT = (
+    "int, long long, double, bool/_Bool, plus the in-place array pattern "
+    "'int* nums, int numsSize'"
+)
+
+
+def _normalize_c_type(t: str) -> str:
+    """Normalize a C type token group to a canonical supported spelling."""
+    t = " ".join(t.replace("const", " ").split())
+    return _C_TYPE_ALIASES.get(t, t)
+
+
+def _parse_c_signature(signature: Optional[str]):
+    """Parse a C function signature into (return_type, function_name, [(param_type, param_name|None), ...]).
+
+    Returns None if the signature cannot be parsed structurally. Semantic
+    validation (supported types, no pointers/arrays/variadics) happens in
+    generate_c_harness so each failure can carry a precise message.
+    Example: 'int add(int a, int b)' -> ('int', 'add', [('int', 'a'), ('int', 'b')])
+    """
+    if not signature:
+        return None
+    s = signature.strip()
+    if s.endswith(";"):
+        s = s[:-1].strip()
+    open_paren = s.find("(")
+    close_paren = s.rfind(")")
+    if open_paren == -1 or close_paren == -1 or close_paren < open_paren:
+        return None
+    if s[close_paren + 1:].strip():
+        return None
+    prefix = s[:open_paren].strip()
+    params_str = s[open_paren + 1:close_paren].strip()
+
+    tokens = [t for t in prefix.split() if t not in _C_MODIFIER_TOKENS]
+    if len(tokens) < 2:
+        return None
+    return_type = " ".join(tokens[:-1])
+    fn_name = tokens[-1]
+    if not re.fullmatch(r"[A-Za-z_]\w*", fn_name):
+        return None
+
+    params = []
+    if params_str and params_str != "void":
+        for part in _split_top_level(params_str, ","):
+            part = part.strip()
+            if not part:
+                return None
+            if part == "...":
+                params.append(("...", None))
+                continue
+            if "*" in part or "[" in part:
+                # Pointer/array parameter: keep verbatim so validation can
+                # reject it with a precise, useful error message.
+                params.append((part, None))
+                continue
+            eq = part.find("=")
+            if eq != -1:
+                part = part[:eq].strip()
+            ptoks = part.split()
+            if len(ptoks) == 1:
+                params.append((ptoks[0], None))
+            else:
+                params.append((" ".join(ptoks[:-1]), ptoks[-1]))
+
+    return return_type, fn_name, params
+
+
+def _c_scalar_literal(value: Any, c_type: str, context: str) -> str:
+    """Marshal one JSON scalar into a C literal of the given supported type.
+
+    Raises ValueError with a precise message when the JSON value cannot be
+    represented safely as the declared C type (generation-time validation,
+    so nothing silently truncates or miscompares at runtime).
+    """
+    if c_type == "bool":
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        raise ValueError(
+            f"{context}: expected a JSON boolean for the C 'bool' value, got {value!r}."
+        )
+    if c_type in ("int", "long long"):
+        if isinstance(value, bool):
+            raise ValueError(
+                f"{context}: a JSON boolean is not a valid '{c_type}' value."
+            )
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError(
+                    f"{context}: {value!r} is fractional and cannot be passed "
+                    f"to a C '{c_type}' value."
+                )
+            value = int(value)
+        if not isinstance(value, int):
+            raise ValueError(
+                f"{context}: expected a JSON number for the C '{c_type}' value, got {value!r}."
+            )
+        if c_type == "int":
+            if not (-(2**31) <= value < 2**31):
+                raise ValueError(
+                    f"{context}: {value} does not fit in a C 'int' "
+                    "(use 'long long' in the function_signature)."
+                )
+            return str(value)
+        if not (-(2**63) <= value < 2**63):
+            raise ValueError(f"{context}: {value} does not fit in a C 'long long'.")
+        if value == -(2**63):
+            return "(-9223372036854775807LL - 1)"  # LLONG_MIN has no direct literal
+        return f"{value}LL"
+    # double
+    if isinstance(value, bool):
+        raise ValueError(f"{context}: a JSON boolean is not a valid 'double' value.")
+    if not isinstance(value, (int, float)):
+        raise ValueError(
+            f"{context}: expected a JSON number for the C 'double' value, got {value!r}."
+        )
+    f = float(value)
+    if not math.isfinite(f):
+        raise ValueError(
+            f"{context}: {value!r} is not a finite number and cannot be marshaled to C."
+        )
+    return repr(f)
+
+
+# Matches exactly the supported in-place array parameter spelling: 'int*'
+# (star placement/whitespace flexible) with an optional parameter name.
+# Anything else — char*, void*, double*, int**, 'const int*', 'int arr[]' —
+# does not match and is rejected by _plan_c_params.
+_C_ARRAY_PTR_RE = re.compile(r"^int\s*\*\s*([A-Za-z_]\w*)?$")
+
+
+def _plan_c_params(sig: str, sig_params) -> list:
+    """
+    Validate parsed C signature parameters and build the harness parameter plan.
+
+    Scalars map 1:1 onto JSON test-case arguments. The single supported
+    composite is the in-place array pattern 'int* <name>, int <length>': the
+    'int' length parameter immediately following an 'int*' parameter consumes
+    no JSON argument — the harness derives it from the JSON array itself.
+
+    Returns a list of entries:
+      {"kind": "scalar", "ctype": <normalized type>, "name": <str|None>}
+      {"kind": "array",  "name": <str|None>, "length_name": <str|None>}
+
+    Raises ValueError with a precise message for variadics, unsupported
+    pointer/array spellings, missing length parameters and non-int lengths.
+    """
+    plan = []
+    i = 0
+    while i < len(sig_params):
+        raw, pname = sig_params[i]
+        if raw == "...":
+            raise ValueError(
+                f"Unsupported C parameter at position {i} of signature {sig!r}: "
+                "variadic ('...') parameters are not supported."
+            )
+        if "*" in raw or "[" in raw:
+            match = _C_ARRAY_PTR_RE.match(" ".join(raw.split()))
+            if match:
+                if i + 1 >= len(sig_params):
+                    raise ValueError(
+                        f"Unsupported C parameter {raw!r} at position {i} of "
+                        f"signature {sig!r}: the in-place array pattern requires "
+                        "an 'int' length parameter immediately after the 'int*' "
+                        "parameter (e.g. 'int f(int* nums, int numsSize)'); no "
+                        "length parameter was found."
+                    )
+                lraw, lname = sig_params[i + 1]
+                lnorm = _normalize_c_type(lraw)
+                if lnorm != "int":
+                    raise ValueError(
+                        f"Unsupported C length parameter {lraw!r} at position "
+                        f"{i + 1} of signature {sig!r}: the length parameter "
+                        "following an 'int*' array parameter must be exactly "
+                        f"'int' (got {lnorm!r})."
+                    )
+                plan.append({
+                    "kind": "array",
+                    "name": match.group(1) or pname,
+                    "length_name": lname,
+                })
+                i += 2
+                continue
+            raise ValueError(
+                f"Unsupported C array/pointer parameter {raw!r} at position {i} "
+                f"of signature {sig!r}: only the in-place array pattern "
+                "'int* <name>, int <length>' is supported. char*/void*/double*/"
+                "pointer-to-pointer/bracket-array/const-qualified parameters "
+                "are not supported (const-qualified pointers cannot back "
+                "in-place mutation)."
+            )
+        normalized = _normalize_c_type(raw)
+        if normalized not in _C_TYPE_ALIASES:
+            raise ValueError(
+                f"Unsupported C parameter type {raw!r} (normalized to "
+                f"{normalized!r}) at parameter {i} of signature {sig!r}. "
+                f"Supported parameter types: {_C_SUPPORTED_TYPES_TEXT}."
+            )
+        plan.append({"kind": "scalar", "ctype": normalized, "name": pname})
+        i += 1
+    return plan
+
+
+def _c_int_array_decl(value: Any, var_name: str, context: str) -> tuple:
+    """Marshal one JSON array of integers into (C stack-array declaration, length).
+
+    Elements are validated with the same strict rules as scalar int arguments
+    (bools/fractionals/overflow rejected). An empty JSON array emits a one-element
+    placeholder array — C has no zero-length arrays — and length 0, so a
+    well-behaved candidate never reads the placeholder element.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{context}: expected a JSON array of integers for the C 'int*' "
+            f"array parameter, got {value!r}."
+        )
+    elements = [
+        _c_scalar_literal(v, "int", f"{context}, element {j}")
+        for j, v in enumerate(value)
+    ]
+    n = len(elements)
+    if n == 0:
+        decl = f"int {var_name}[1] = {{0}}"
+    else:
+        decl = f"int {var_name}[] = {{{', '.join(elements)}}}"
+    return decl, n
+
+
+def _resolve_c_expected(expected: Any, ret_c: str, array_count: int, context: str):
+    """Resolve a test case's expected_output into (expected_value, mutated_or_None).
+
+    Scalar expected outputs (the existing model) check only the return value.
+    For the in-place 'int* array' pattern, expected_output may alternatively be
+    a dict {"returns": <k>, "mutated": [<expected first-k prefix>]} — stored in
+    the existing JSONB field, no schema change. The harness then requires BOTH
+    the returned k and the mutated prefix to match.
+
+    The dict form is intentionally narrow: int return type and exactly one
+    'int*' parameter (otherwise the mutated prefix would be ambiguous).
+    """
+    if isinstance(expected, dict):
+        unknown = set(expected.keys()) - {"returns", "mutated"}
+        if unknown:
+            raise ValueError(
+                f"{context}: unsupported key(s) {sorted(unknown)} in the "
+                "expected_output object. Only {'returns': <k>, 'mutated': "
+                "[<expected first-k prefix>]} is supported ('mutated' optional)."
+            )
+        if "returns" not in expected:
+            raise ValueError(
+                f"{context}: the expected_output object requires a 'returns' "
+                "key holding the expected return value."
+            )
+        if ret_c != "int":
+            raise ValueError(
+                f"{context}: the expected_output object form {'returns', 'mutated'} "
+                "models the in-place array pattern (return value k + mutated "
+                "prefix) and is only supported when the C function returns 'int' "
+                f"(this signature returns {ret_c!r})."
+            )
+        if array_count != 1:
+            raise ValueError(
+                f"{context}: the expected_output object form {'returns', 'mutated'} "
+                "requires the signature to contain exactly one 'int*' array "
+                f"parameter (this signature has {array_count}). With none, use "
+                "the scalar expected_output form; with several, the mutated "
+                "prefix would be ambiguous."
+            )
+        ret_value = expected["returns"]
+        if isinstance(ret_value, bool) or not isinstance(ret_value, int):
+            raise ValueError(
+                f"{context}: 'returns' must be a JSON integer, got {ret_value!r}."
+            )
+        mutated = None
+        if "mutated" in expected:
+            m = expected["mutated"]
+            if not isinstance(m, list):
+                raise ValueError(
+                    f"{context}: 'mutated' must be a JSON array of integers, "
+                    f"got {m!r}."
+                )
+            if len(m) != ret_value:
+                raise ValueError(
+                    f"{context}: 'mutated' has {len(m)} element(s) but 'returns' "
+                    f"is {ret_value}; the expected mutated prefix must be "
+                    "exactly the first k elements (k == returns)."
+                )
+            for j, v in enumerate(m):
+                _c_scalar_literal(v, "int", f"{context} mutated[{j}]")
+            mutated = m
+        return ret_value, mutated
+    # Scalar expected output: existing behavior (return-value check only).
+    return expected, None
+
+
+_C_MAIN_HELPERS = r"""
+// === Result Protocol Helpers ===
+
+#define _RESULTS_BUFSIZE 65536
+
+static char _results_buf[_RESULTS_BUFSIZE];
+static size_t _results_len = 0;
+
+static void _append_results(const char *s) {
+    size_t n = strlen(s);
+    if (_results_len + n < _RESULTS_BUFSIZE) {
+        memcpy(_results_buf + _results_len, s, n);
+        _results_len += n;
+    }
+}
+
+// Serialize a double the same way the C++/Java harnesses do: integral
+// values print as integers, everything else with %.15g precision.
+static void _append_double_json(char *out, size_t outsz, double v) {
+    if (v != v) { snprintf(out, outsz, "null"); return; } /* NaN */
+    if (v == (long long)v && v > -1e15 && v < 1e15) {
+        snprintf(out, outsz, "%lld", (long long)v);
+    } else {
+        snprintf(out, outsz, "%.15g", v);
+    }
+}
+
+// === Candidate stdout isolation ===
+// While the candidate function runs, fd 1 points at /dev/null so printf()
+// in the solution cannot corrupt the JSON result protocol. The original
+// stdout is restored before the protocol is printed. If fd duplication is
+// unavailable the harness degrades gracefully (candidate output remains
+// visible, protocol is still emitted last).
+
+static int _saved_stdout_fd = -1;
+
+static void _silence_candidate_stdout(void) {
+    fflush(stdout);
+    _saved_stdout_fd = dup(STDOUT_FILENO);
+    if (_saved_stdout_fd == -1) return;
+    int _devnull = open("/dev/null", O_WRONLY);
+    if (_devnull == -1) {
+        close(_saved_stdout_fd);
+        _saved_stdout_fd = -1;
+        return;
+    }
+    dup2(_devnull, STDOUT_FILENO);
+    close(_devnull);
+}
+
+static void _restore_stdout(void) {
+    if (_saved_stdout_fd != -1) {
+        fflush(stdout);
+        dup2(_saved_stdout_fd, STDOUT_FILENO);
+        close(_saved_stdout_fd);
+        _saved_stdout_fd = -1;
+    }
+    clearerr(stdout);
+}
+"""
+
+
+def generate_c_harness(
+    candidate_code: str,
+    function_name: str,
+    class_name: Optional[str],
+    test_arguments: List[List[Any]],
+    test_expected: List[Any],
+    function_signature: Optional[str] = None,
+) -> str:
+    """
+    Generate a C program that:
+    1. Defines the candidate's solution function
+    2. For each test case, calls it with marshaled literal arguments
+    3. Compares the return value to the expected value
+    4. Prints results as a JSON array (same protocol as the other harnesses)
+
+    C requires an explicit `function_signature`; parameter types are never
+    inferred from JSON test cases. Only scalar C types (int, long long,
+    double, bool/_Bool) plus the in-place 'int* nums, int numsSize' array
+    pattern are supported; anything else fails loudly here.
+
+    `class_name` is accepted and IGNORED for C: problems are shared across
+    languages and may carry a class_name required by the Python/C++/Java
+    harnesses (e.g. "Solution"); C generates a free function and never uses
+    it.
+    """
+    sig = (function_signature or "").strip()
+    if not sig:
+        raise ValueError(
+            "C problems require an explicit C function_signature "
+            "(e.g. 'int add(int a, int b)'); parameter types cannot be "
+            "inferred from JSON test cases."
+        )
+
+    parsed = _parse_c_signature(sig)
+    if parsed is None:
+        raise ValueError(
+            f"Unsupported C function signature {sig!r}: could not be parsed "
+            "into a return type, function name and parameter list."
+        )
+    sig_return, sig_fn_name, sig_params = parsed
+
+    if sig_fn_name != function_name:
+        raise ValueError(
+            f"Unsupported C function signature {sig!r}: function name "
+            f"{sig_fn_name!r} does not match the requested function {function_name!r}."
+        )
+
+    normalized_return = _normalize_c_type(sig_return)
+    if normalized_return == "void":
+        raise ValueError(
+            f"Unsupported C return type {sig_return!r} in signature {sig!r}: "
+            "a void function produces no value to compare against the "
+            "expected outputs."
+        )
+    if normalized_return not in _C_TYPE_ALIASES:
+        raise ValueError(
+            f"Unsupported C return type {sig_return!r} (normalized to "
+            f"{normalized_return!r}) in signature {sig!r}. Supported types: "
+            f"{_C_SUPPORTED_TYPES_TEXT}."
+        )
+
+    # Validate parameters (scalars + the single supported in-place array
+    # pattern) into a generation plan before touching any test data.
+    try:
+        param_plan = _plan_c_params(sig, sig_params)
+    except ValueError as e:
+        raise ValueError(str(e)) from None
+    array_count = sum(1 for p in param_plan if p["kind"] == "array")
+    # Position of each array parameter within the JSON argument list (scalar
+    # parameters consume one JSON argument; array length parameters consume
+    # none because they are derived from their arrays).
+    array_param_positions = []
+    _pos = 0
+    for p in param_plan:
+        if p["kind"] == "array":
+            array_param_positions.append(_pos)
+            _pos += 1
+        else:
+            _pos += 1
+
+    if len(test_arguments) != len(test_expected):
+        raise ValueError(
+            "test_arguments and test_expected must have the same length "
+            f"(got {len(test_arguments)} and {len(test_expected)})."
+        )
+    # JSON argument count: scalar parameters consume one JSON argument each;
+    # each in-place array's length parameter is derived from the array itself.
+    expected_json_args = sum(1 for p in param_plan if p["kind"] == "scalar") + array_count
+    for idx, args in enumerate(test_arguments):
+        if len(args) != expected_json_args:
+            raise ValueError(
+                f"Test case {idx} has {len(args)} argument(s) but signature "
+                f"{sig!r} consumes {expected_json_args} JSON argument(s) "
+                "(array length parameters are derived from their arrays)."
+            )
+
+    # Resolve expected outputs (scalar or {'returns': k, 'mutated': [...]}).
+    resolved_expected = []
+    for idx, expected in enumerate(test_expected):
+        try:
+            resolved = _resolve_c_expected(expected, normalized_return, array_count,
+                                           f"Test case {idx} expected output")
+        except ValueError as e:
+            raise ValueError(str(e)) from None
+        resolved_expected.append(resolved)
+
+    lines = [
+        "/* Auto-generated C execution harness (services/harness.py). */",
+        "/* The candidate writes only the solution function; this program owns */",
+        "/* invocation, comparison and the JSON result protocol. */",
+        "#include <stdio.h>",
+        "#include <stdlib.h>",
+        "#include <string.h>",
+        "#include <stdbool.h>",
+        "#include <unistd.h>",
+        "#include <fcntl.h>",
+        "",
+        "/* === Candidate Solution === */",
+        candidate_code,
+        "",
+        "/* === Test Harness === */",
+        _C_MAIN_HELPERS,
+        "int main(void) {",
+        "    _silence_candidate_stdout();",
+        '    _append_results("[");',
+    ]
+
+    ret_c = normalized_return  # canonical C spelling ('bool' covers _Bool)
+    for idx, (args, (expected, mutated)) in enumerate(
+        zip(test_arguments, resolved_expected)
+    ):
+        # Walk the JSON arguments alongside the parameter plan: scalar
+        # parameters consume one JSON argument; each 'int*' array consumes its
+        # JSON array and derives the following 'int' length parameter.
+        decl_lines = []
+        call_args = []
+        arg_pos = 0
+        array_var = None  # stack array backing the (single) 'int*' parameter
+        for p in param_plan:
+            if p["kind"] == "array":
+                arr_value = args[arg_pos]
+                arg_pos += 1
+                var = f"_arg{idx}_{len(call_args)}"
+                decl, n = _c_int_array_decl(
+                    arr_value, var, f"Test case {idx}, parameter {len(call_args)}"
+                )
+                decl_lines.append(decl + ";")
+                call_args.append(var)
+                array_var = var
+                # Length parameter (must directly follow the 'int*' parameter).
+                call_args.append(str(n))
+            else:
+                call_args.append(
+                    _c_scalar_literal(
+                        args[arg_pos], p["ctype"],
+                        f"Test case {idx}, parameter {arg_pos}",
+                    )
+                )
+                arg_pos += 1
+
+        expected_literal = _c_scalar_literal(
+            expected, ret_c, f"Test case {idx} expected output"
+        )
+        mutated_literal = None
+        if mutated is not None:
+            # A mutated prefix longer than the input array can never be
+            # produced by an in-place algorithm; reading past the input would
+            # also be undefined behavior, so reject it at generation time.
+            input_len = len(args[array_param_positions[0]])
+            if len(mutated) > input_len:
+                raise ValueError(
+                    f"Test case {idx} expected output: 'mutated' has "
+                    f"{len(mutated)} element(s) but the input array only has "
+                    f"{input_len}; an in-place result cannot be longer than "
+                    "its input."
+                )
+            mutated_literal = ", ".join(
+                _c_scalar_literal(v, "int", f"Test case {idx} mutated[{j}]")
+                for j, v in enumerate(mutated)
+            )
+
+        block = ["    {"]
+        block.extend(f"        {d}" for d in decl_lines)
+        block.extend([
+            f"        {ret_c} _actual = {sig_fn_name}({', '.join(call_args)});",
+            f"        {ret_c} _expected = {expected_literal};",
+        ])
+        if mutated is not None:
+            # Verify BOTH the returned k and the mutated first-k prefix. The
+            # loop reads exactly len(mutated) == k elements of each array;
+            # k <= input length was validated above, so no out-of-bounds read.
+            if mutated:
+                block.extend([
+                    f"        int _mutated[] = {{{mutated_literal}}};",
+                    "        int _mutated_passed = 1;",
+                    f"        for (int _m = 0; _m < {len(mutated)}; _m++) {{",
+                    f"            if ({array_var}[_m] != _mutated[_m]) {{",
+                    "                _mutated_passed = 0;",
+                    "            }",
+                    "        }",
+                    "        int _passed = (_actual == _expected) && _mutated_passed;",
+                ])
+            else:
+                # k == 0: nothing to compare, the return value alone decides.
+                block.append("        int _passed = (_actual == _expected);")
+        else:
+            block.append("        int _passed = (_actual == _expected);")
+        block.append("        char _entry[192];")
+        if ret_c == "double":
+            block.extend([
+                "        char _actual_json[64];",
+                "        _append_double_json(_actual_json, sizeof(_actual_json), _actual);",
+                '        snprintf(_entry, sizeof(_entry), "{\\"passed\\": %s, \\"actual\\": %s}", '
+                '_passed ? "true" : "false", _actual_json);',
+            ])
+        elif ret_c == "int":
+            block.append(
+                '        snprintf(_entry, sizeof(_entry), "{\\"passed\\": %s, \\"actual\\": %d}", '
+                '_passed ? "true" : "false", _actual);'
+            )
+        elif ret_c == "long long":
+            block.append(
+                '        snprintf(_entry, sizeof(_entry), "{\\"passed\\": %s, \\"actual\\": %lld}", '
+                '_passed ? "true" : "false", _actual);'
+            )
+        else:  # bool
+            block.append(
+                '        snprintf(_entry, sizeof(_entry), "{\\"passed\\": %s, \\"actual\\": %s}", '
+                '_passed ? "true" : "false", _actual ? "true" : "false");'
+            )
+        block.extend([
+            '        if (_results_len > 1) _append_results(",");',
+            "        _append_results(_entry);",
+            "    }",
+        ])
+        lines.extend(block)
+
+    lines.extend([
+        '    _append_results("]");',
+        "    _restore_stdout();",
+        '    printf("%s\\n", _results_buf);',
+        "    return 0;",
+        "}",
+    ])
+    return "\n".join(lines)
+
+
+def generate_c_starter_code(
+    function_name: str,
+    function_signature: Optional[str] = None,
+) -> str:
+    """
+    Generate a candidate-visible C starter from the explicit function
+    signature. The candidate sees ONLY the function skeleton — no main(),
+    no I/O, no harness code (the generated harness owns invocation).
+
+    Raises ValueError when the signature is missing/unparseable/unsupported
+    so misconfigured problems surface loudly instead of showing a misleading
+    skeleton.
+    """
+    if not function_name:
+        raise ValueError("function_name is required for C starter code")
+
+    sig = (function_signature or "").strip()
+    if not sig:
+        raise ValueError(
+            "C starter code requires an explicit C function_signature "
+            "(e.g. 'int add(int a, int b)'); C parameter types cannot be "
+            "inferred from JSON test cases."
+        )
+
+    parsed = _parse_c_signature(sig)
+    if parsed is None:
+        raise ValueError(
+            f"Unsupported C function signature {sig!r}: could not be parsed "
+            "into a return type, function name and parameter list."
+        )
+    sig_return, sig_fn_name, sig_params = parsed
+
+    if sig_fn_name != function_name:
+        raise ValueError(
+            f"C function_signature {sig!r} declares function {sig_fn_name!r}, "
+            f"but the problem's function_name is {function_name!r}."
+        )
+
+    normalized_return = _normalize_c_type(sig_return)
+    if normalized_return not in _C_TYPE_ALIASES:
+        raise ValueError(
+            f"Unsupported C return type {sig_return!r} in signature {sig!r}. "
+            f"Supported types: {_C_SUPPORTED_TYPES_TEXT}."
+        )
+    param_parts = []
+    uses_bool = normalized_return == "bool"
+    try:
+        param_plan = _plan_c_params(sig, sig_params)
+    except ValueError as e:
+        raise ValueError(str(e)) from None
+    # Render the signature verbatim (canonical scalar spellings + the verbatim
+    # in-place array pattern) with parameter names filled in where absent.
+    json_pos = 0
+    param_parts = []
+    for i, p in enumerate(param_plan):
+        pt, pname = sig_params[i]
+        if p["kind"] == "array":
+            name = p["name"] or f"arg{i + 1}"
+            param_parts.append(f"int* {name}")
+            lname = p["length_name"] or f"{name}Size"
+            param_parts.append(f"int {lname}")
+            json_pos += 1  # the array; the length is derived
+            continue
+        normalized = p["ctype"]
+        if normalized == "bool":
+            uses_bool = True
+        name = pname if pname else f"arg{i + 1}"
+        param_parts.append(f"{normalized} {name}")
+        json_pos += 1
+
+    params_text = ", ".join(param_parts) or "void"
+    header_include = "#include <stdbool.h>\n\n" if uses_bool else ""
+    return (
+        f"{header_include}"
+        f"{normalized_return} {sig_fn_name}({params_text}) {{\n"
+        f"    // Write your solution here\n"
+        f"}}\n"
+    )
+
+
+# ============================================================
 # Main Entry Point
 # ============================================================
 
@@ -1808,7 +2574,7 @@ def generate_harness(
 
     Args:
         candidate_code: The candidate's solution function/class code
-        language: Programming language (python3, cpp, java)
+        language: Programming language (python3, cpp, java, c)
         function_name: Name of the solution function
         class_name: Name of the solution class (if applicable)
         test_arguments: List of argument lists, one per test case
@@ -1829,6 +2595,11 @@ def generate_harness(
         )
     elif language == "java":
         return generate_java_harness(
+            candidate_code, function_name, class_name,
+            test_arguments, test_expected, function_signature,
+        )
+    elif language == "c":
+        return generate_c_harness(
             candidate_code, function_name, class_name,
             test_arguments, test_expected, function_signature,
         )

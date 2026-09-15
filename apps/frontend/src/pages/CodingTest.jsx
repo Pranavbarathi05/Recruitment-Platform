@@ -23,6 +23,7 @@ const LANGUAGES = [
   { value: 'python3', label: 'Python 3' },
   { value: 'cpp', label: 'C++' },
   { value: 'java', label: 'Java' },
+  { value: 'c', label: 'C' },
 ];
 
 /**
@@ -61,6 +62,23 @@ function getStarterForLanguage(language, functionName, className, functionSignat
         );
       }
       return 'public int ' + functionName + '(' + params + ') {\n    // Write your solution here\n}\n';
+    }
+    case 'c': {
+      // C runs server-side only and the backend harness requires an explicit
+      // C function_signature; show it verbatim so the starter always agrees
+      // with the harness invocation.
+      const cSignature = (functionSignature || '').trim().replace(/;\s*$/, '');
+      if (cSignature) {
+        const usesBool = /\b(_Bool|bool)\b/.test(cSignature);
+        return (
+          (usesBool ? '#include <stdbool.h>\n\n' : '') +
+          cSignature + ' {\n    // Write your solution here\n}\n'
+        );
+      }
+      return (
+        '// This problem needs a C function_signature (e.g. int add(int a, int b)).\n' +
+        'int ' + functionName + '(void) {\n    // Write your solution here\n}\n'
+      );
     }
     default:
       return '';
@@ -580,7 +598,7 @@ const CodingTest = () => {
           {/* Code Editor */}
           <div className="flex-1">
             <CodeEditor
-              language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : 'java'}
+              language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : language === 'c' ? 'c' : 'java'}
               value={sourceCode}
               onChange={(val) => setSourceCode(val || '')}
               height="100%"

@@ -16,7 +16,8 @@ import { generatePythonStarterCode } from '../utils/codingStarterCode';
  */
 
 const DIFFICULTIES = ['easy', 'medium', 'hard'];
-const LANGUAGES = ['python3', 'cpp', 'java'];
+const LANGUAGES = ['python3', 'cpp', 'java', 'c'];
+const LANGUAGE_LABELS = { python3: 'Python 3', cpp: 'C++', java: 'Java', c: 'C' };
 
 const AdminCoding = () => {
   const { getAuthHeaders } = useAuth();
@@ -547,6 +548,38 @@ const AdminCoding = () => {
                       These fields describe the function contract. The Python starter below is the candidate-visible
                       boilerplate; the test harness and invocation code stay behind the scenes.
                     </p>
+
+                    {/* Supported Languages (per-problem opt-in) */}
+                    <div className="mt-3">
+                      <label className={labelClass}>Supported Languages</label>
+                      <div className="flex flex-wrap gap-4 mt-1">
+                        {LANGUAGES.map((lang) => (
+                          <label key={lang} className="flex items-center gap-2 text-sm text-theme-primary">
+                            <input
+                              type="checkbox"
+                              checked={problemForm.supported_languages.includes(lang)}
+                              onChange={(e) => setProblemForm({
+                                ...problemForm,
+                                supported_languages: e.target.checked
+                                  ? [...problemForm.supported_languages, lang]
+                                  : problemForm.supported_languages.filter((l) => l !== lang),
+                              })}
+                              className="rounded"
+                            />
+                            {LANGUAGE_LABELS[lang] || lang}
+                          </label>
+                        ))}
+                      </div>
+                      <p className="text-xs text-theme-muted mt-1">
+                        C runs server-side only and requires an explicit C function_signature
+                        (e.g. "int add(int a, int b)"); supported C types: int, long long, double, bool,
+                        plus the in-place array pattern "int f(int* nums, int numsSize)" — the array
+                        length is derived from the JSON test argument, and an expected_output of
+                        {"{"}"returns: k, mutated: [prefix]{"}"} additionally verifies the mutated array prefix.
+                        The shared function_signature field may hold C syntax: C++/Java automatically
+                        ignore C-style signatures and fall back to type inference from the test cases.
+                      </p>
+                    </div>
                   </div>
 
                   {/* Starter Code (per language) */}
@@ -563,7 +596,7 @@ const AdminCoding = () => {
                     </div>
                     {LANGUAGES.filter((l) => problemForm.supported_languages.includes(l)).map((lang) => (
                       <div key={lang} className="mb-2">
-                        <label className={labelClass}>{lang} {lang === 'python3' ? '(candidate-visible)' : ''}</label>
+                        <label className={labelClass}>{LANGUAGE_LABELS[lang] || lang} {lang === 'python3' ? '(candidate-visible)' : ''}</label>
                         <textarea
                           value={problemForm.starter_code?.[lang] || ''}
                           onChange={(e) => setProblemForm({
@@ -660,6 +693,10 @@ const AdminCoding = () => {
                           placeholder='[0,1]'
                           required
                         />
+                        <p className="text-xs text-theme-muted mt-1">
+                          C in-place array problems: use {'{'}"returns": k, "mutated": [prefix]{'}'} to also
+                          verify the first k elements after the call (e.g. {'{'}"returns": 2, "mutated": [1,2]{'}'}).
+                        </p>
                       </div>
                     </div>
                     <div className="flex gap-3 items-end">

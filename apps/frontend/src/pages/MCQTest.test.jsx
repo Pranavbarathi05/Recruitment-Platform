@@ -14,7 +14,7 @@ vi.mock('../hooks/useAuth', () => ({
 }));
 
 vi.mock('../components/CodeEditor', () => ({
-  default: () => <textarea data-testid="code-editor" readOnly />,
+  default: ({ value }) => <textarea data-testid="code-editor" readOnly value={value} />,
 }));
 
 const FUTURE = new Date(Date.now() + 3600_000).toISOString();
@@ -222,5 +222,69 @@ describe('Coding Run — client-side execution', () => {
     // must never reach the client executor.
     const HIDDEN = { id: 'hidden-1', arguments: [99], expected_output: 9801, is_public: false };
     expect(payload.testCases.some((tc) => tc.id === HIDDEN.id)).toBe(false);
+  });
+});
+
+describe('Coding — C language support', () => {
+  const C_PROBLEM = {
+    id: 'prob-c',
+    title: 'Add Two',
+    difficulty: 'easy',
+    points: 10,
+    description: 'Add two ints.',
+    function_name: 'add',
+    class_name: null,
+    function_signature: 'int add(int a, int b)',
+    supported_languages: ['python3', 'c'],
+    time_limit_ms: 2000,
+    test_cases: [{ id: 'tc-c1', arguments: [2, 3], expected_output: 5 }],
+  };
+
+  it('shows C in the language dropdown when supported_languages includes c', async () => {
+    renderWorkspace([C_PROBLEM]);
+    await screen.findByRole('button', { name: /run code/i });
+
+    const option = screen.getByRole('option', { name: 'C' });
+    expect(option).toBeInTheDocument();
+  });
+
+  it('does not show C when the problem does not support it', async () => {
+    renderWorkspace([PROBLEM_ONE]); // python3/cpp/java only
+    await screen.findByRole('button', { name: /run code/i });
+
+    expect(screen.queryByRole('option', { name: 'C' })).not.toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'C++' })).toBeInTheDocument();
+  });
+
+  it('selecting C shows the signature-based C starter and uses the server run endpoint', async () => {
+    renderWorkspace([C_PROBLEM]);
+    await screen.findByRole('button', { name: /run code/i });
+
+    // Switch language to C
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'c' } });
+
+    const editor = await screen.findByTestId('code-editor');
+    const starter = editor.value || '';
+    // Starter is generated from the explicit C signature, function-only
+    expect(starter).toContain('int add(int a, int b)');
+    expect(starter).not.toContain('main(');
+    expect(starter).not.toContain('scanf');
+
+    fireEvent.click(screen.getByRole('button', { name: /run code/i }));
+
+    // C is server-side only: the run endpoint IS called...
+    await vi.waitFor(() => {
+      const runFetches = globalThis.fetch.mock.calls.filter(([url]) =>
+        String(url).includes('/coding/attempt/attempt-1/run')
+      );
+      expect(runFetches.length).toBeGreaterThan(0);
+    });
+    // ...with language 'c' in the payload...
+    const runCall = globalThis.fetch.mock.calls.find(([url]) =>
+      String(url).includes('/coding/attempt/attempt-1/run')
+    );
+    expect(JSON.parse(runCall[1].body).language).toBe('c');
+    // ...and the browser executor is never used for C.
+    expect(runCodeLocally).not.toHaveBeenCalled();
   });
 });

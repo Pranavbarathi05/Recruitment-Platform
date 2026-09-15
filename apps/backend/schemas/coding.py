@@ -7,7 +7,7 @@ import json
 # Supported languages
 # ============================================================
 
-VALID_CODING_LANGUAGES = ["python3", "cpp", "java"]
+VALID_CODING_LANGUAGES = ["python3", "cpp", "java", "c"]
 VALID_DIFFICULTIES = ["easy", "medium", "hard"]
 
 

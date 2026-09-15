@@ -5939,6 +5939,7 @@ class TestAdminResultsDescriptive:
             client.app.dependency_overrides.clear()
 
 
+<<<<<<< HEAD
 # =====================================================================
 # HANDS-ON CHALLENGE TESTS
 # =====================================================================
@@ -7003,3 +7004,779 @@ class TestSubmissionLifecycle:
         )
         assert response.status_code == 400
         assert "not in progress" in response.json()["detail"]
+=======
+# ===========================================================================
+# C Language Support (minimal additive feature)
+# ===========================================================================
+
+
+class TestCLanguageIdMapping:
+    """C maps to Judge0 language ID 50; existing mappings stay untouched."""
+
+    def test_c_maps_to_judge0_id_50(self):
+        from services.compiler import JUDGE0_LANGUAGE_IDS
+        assert JUDGE0_LANGUAGE_IDS["c"] == 50
+
+    def test_existing_language_mappings_unchanged(self):
+        from services.compiler import JUDGE0_LANGUAGE_IDS
+        assert JUDGE0_LANGUAGE_IDS["python3"] == 71
+        assert JUDGE0_LANGUAGE_IDS["cpp"] == 54
+        assert JUDGE0_LANGUAGE_IDS["java"] == 62
+
+
+class TestCCodingValidation:
+    """Schema-level validation accepts C and keeps rejecting junk languages."""
+
+    def test_c_accepted_in_supported_languages(self):
+        from schemas.coding import CodingProblemCreate
+        problem = CodingProblemCreate(
+            title="T", slug="t", description="D",
+            supported_languages=["python3", "cpp", "java", "c"],
+        )
+        assert "c" in problem.supported_languages
+
+    def test_c_accepted_by_run_request(self):
+        from schemas.coding import CodingRunRequest
+        req = CodingRunRequest(
+            problem_id="p1", language="c", source_code="int add(int a, int b) { return a + b; }",
+        )
+        assert req.language == "c"
+
+    def test_c_accepted_by_submit_request(self):
+        from schemas.coding import CodingSubmitRequest
+        req = CodingSubmitRequest(
+            problem_id="p1", language="c", source_code="int add(int a, int b) { return a + b; }",
+        )
+        assert req.language == "c"
+
+    def test_c_accepted_by_draft_request(self):
+        from schemas.coding import CodingDraftSaveRequest
+        req = CodingDraftSaveRequest(
+            problem_id="p1", language="c", source_code="int add(int a, int b) { return a + b; }",
+        )
+        assert req.language == "c"
+
+    def test_unsupported_language_still_rejected(self):
+        import pytest
+        from schemas.coding import CodingRunRequest
+        with pytest.raises(ValueError):
+            CodingRunRequest(problem_id="p1", language="brainfuck", source_code="x")
+
+
+class TestCHarnessGeneration:
+    """Dedicated C harness: dispatch, generation, and loud failures."""
+
+    def _generate(self, **overrides):
+        from services.harness import generate_c_harness
+        kwargs = dict(
+            candidate_code="int add(int a, int b) { return a + b; }",
+            function_name="add",
+            class_name=None,
+            test_arguments=[[2, 3], [10, -3], [0, 0]],
+            test_expected=[5, 7, 0],
+            function_signature="int add(int a, int b)",
+        )
+        kwargs.update(overrides)
+        return generate_c_harness(**kwargs)
+
+    def test_generate_harness_dispatches_to_c(self):
+        from services.harness import generate_harness, generate_c_harness
+        result = generate_harness(
+            candidate_code="int add(int a, int b) { return a + b; }",
+            language="c",
+            function_name="add",
+            class_name=None,
+            test_arguments=[[2, 3]],
+            test_expected=[5],
+            function_signature="int add(int a, int b)",
+        )
+        expected = generate_c_harness(
+            candidate_code="int add(int a, int b) { return a + b; }",
+            function_name="add",
+            class_name=None,
+            test_arguments=[[2, 3]],
+            test_expected=[5],
+            function_signature="int add(int a, int b)",
+        )
+        assert result == expected
+
+    def test_c_harness_generation_works(self):
+        result = self._generate()
+        assert "int main(void)" in result
+        assert "int _actual = add(2, 3);" in result
+        assert "int _expected = 5;" in result
+        # Same result protocol as the other harnesses
+        assert "passed" in result and "actual" in result
+        # No JSON parser needed: test data is marshaled to C literals
+        assert "json::" not in result and "json.h" not in result
+
+    def test_c_harness_multiple_test_cases(self):
+        result = self._generate()
+        assert "add(2, 3)" in result
+        assert "add(10, -3)" in result
+        assert "add(0, 0)" in result
+        assert "int _expected = 5;" in result
+        assert "int _expected = 7;" in result
+        assert "int _expected = 0;" in result
+
+    def test_c_harness_scalar_types(self):
+        result = self._generate(
+            candidate_code="long long f(long long a, double b, bool c) { return 0; }",
+            function_name="f",
+            test_arguments=[[1, 2.5, True]],
+            test_expected=[7],
+            function_signature="long long f(long long a, double b, bool c)",
+        )
+        assert "long long _actual = f(1LL, 2.5, true);" in result
+        assert "long long _expected = 7LL;" in result
+
+    def test_c_harness_stdout_isolation_helpers_present(self):
+        result = self._generate()
+        assert "_silence_candidate_stdout" in result
+        assert "/dev/null" in result
+
+    def test_c_harness_missing_signature_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="explicit C function_signature"):
+            self._generate(function_signature=None)
+
+    def test_c_harness_empty_signature_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="explicit C function_signature"):
+            self._generate(function_signature="   ")
+
+    def test_c_harness_invalid_signature_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="could not be parsed"):
+            self._generate(function_signature="int add")
+
+    def test_c_harness_mismatched_function_name_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="does not match"):
+            self._generate(function_signature="int sub(int a, int b)")
+
+    def test_c_harness_pointer_parameter_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="array/pointer"):
+            self._generate(
+                candidate_code="int len(const char *s) { return 0; }",
+                function_name="len",
+                test_arguments=[["abc"]],
+                test_expected=[3],
+                function_signature="int len(const char *s)",
+            )
+
+    def test_c_harness_array_parameter_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="array/pointer"):
+            self._generate(
+                function_name="sum",
+                test_arguments=[[[1, 2, 3]]],
+                test_expected=[6],
+                function_signature="int sum(int arr[], int n)",
+            )
+
+    def test_c_harness_char_pointer_still_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="array/pointer"):
+            self._generate(
+                candidate_code="int len(const char *s) { return 0; }",
+                function_name="len2",
+                test_arguments=[["abc"]],
+                test_expected=[3],
+                function_signature="int len2(char* s, int n)",
+            )
+
+    def test_c_harness_int_pointer_without_length_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="length parameter"):
+            self._generate(
+                function_name="f",
+                test_arguments=[[[1]]],
+                test_expected=[1],
+                function_signature="int f(int* a)",
+            )
+
+    def test_c_harness_int_pointer_non_int_length_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="must be exactly 'int'"):
+            self._generate(
+                function_name="f",
+                test_arguments=[[[1]]],
+                test_expected=[1],
+                function_signature="int f(int* a, long long n)",
+            )
+
+    def test_c_harness_int_pointer_const_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="array/pointer"):
+            self._generate(
+                function_name="f",
+                test_arguments=[[[1]]],
+                test_expected=[1],
+                function_signature="int f(const int* a, int n)",
+            )
+
+    def test_c_harness_unsupported_scalar_type_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="Unsupported C parameter type"):
+            self._generate(
+                function_name="f",
+                test_arguments=[["a"]],
+                test_expected=[1],
+                function_signature="int f(char c)",
+            )
+
+    def test_c_harness_variadic_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="variadic"):
+            self._generate(
+                function_name="f",
+                function_signature="int f(int n, ...)",
+            )
+
+    def test_c_harness_void_return_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="void"):
+            self._generate(function_signature="void add(int a, int b)")
+
+    def test_c_harness_unsupported_return_type_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="Unsupported C return type"):
+            self._generate(
+                function_name="g",
+                test_arguments=[[]],
+                test_expected=[None],
+                function_signature="char* g(void)",
+            )
+
+    def test_c_harness_class_name_ignored(self):
+        """Problems are shared across languages and may carry a class_name
+        required by Python/C++/Java (e.g. 'Solution'); C ignores it and
+        generates a free function."""
+        result = self._generate(class_name="Solution")
+        # 'Solution' appears only as the literal word in a banner comment,
+        # never as a C class definition or qualified invocation.
+        assert "class Solution" not in result
+        assert "Solution(" not in result
+        assert "Solution::" not in result
+        assert self._generate(class_name=None) == result
+
+    def test_c_harness_argument_count_mismatch_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="argument"):
+            self._generate(test_arguments=[[1]])
+
+    def test_c_harness_test_data_type_mismatch_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="JSON number"):
+            self._generate(test_arguments=[["x", 2]], test_expected=[5])
+
+    def test_c_harness_double_return_serializes_fractional(self):
+        result = self._generate(
+            candidate_code="double half(double x) { return x / 2.0; }",
+            function_name="half",
+            test_arguments=[[3.0]],
+            test_expected=[1.5],
+            function_signature="double half(double x)",
+        )
+        assert "double _actual = half(3.0);" in result
+        assert "_append_double_json" in result
+
+    def test_c_harness_bool_return_serializes(self):
+        result = self._generate(
+            candidate_code="bool isEven(int n) { return n % 2 == 0; }",
+            function_name="isEven",
+            test_arguments=[[4]],
+            test_expected=[True],
+            function_signature="bool isEven(int n)",
+        )
+        assert "bool _actual = isEven(4);" in result
+        assert "bool _expected = true;" in result
+
+    def test_c_harness_long_long_min_literal_compiles_safe(self):
+        result = self._generate(
+            candidate_code="long long f(long long n) { return n; }",
+            function_name="f",
+            test_arguments=[[-(2**63)]],
+            test_expected=[0],
+            function_signature="long long f(long long n)",
+        )
+        assert "(-9223372036854775807LL - 1)" in result
+
+
+class TestCStarterCode:
+    """C starter generation mirrors the harness contract."""
+
+    def test_c_starter_from_signature(self):
+        from services.harness import generate_c_starter_code
+        starter = generate_c_starter_code("add", "int add(int a, int b)")
+        assert starter == (
+            "int add(int a, int b) {\n"
+            "    // Write your solution here\n"
+            "}\n"
+        )
+        assert "main(" not in starter
+        assert "scanf" not in starter and "printf" not in starter
+
+    def test_c_starter_bool_includes_stdbool(self):
+        from services.harness import generate_c_starter_code
+        starter = generate_c_starter_code("isValid", "bool isValid(int n)")
+        assert starter.startswith("#include <stdbool.h>")
+        assert "bool isValid(int n)" in starter
+
+    def test_c_starter_missing_signature_rejected(self):
+        import pytest
+        from services.harness import generate_c_starter_code
+        with pytest.raises(ValueError, match="explicit C function_signature"):
+            generate_c_starter_code("add", None)
+
+    def test_c_starter_unsupported_type_rejected(self):
+        import pytest
+        from services.harness import generate_c_starter_code
+        with pytest.raises(ValueError, match="array/pointer"):
+            generate_c_starter_code("len", "int len(char* s)")
+
+    def test_c_starter_array_pattern_renders(self):
+        from services.harness import generate_c_starter_code
+        starter = generate_c_starter_code(
+            "removeDuplicates", "int removeDuplicates(int* nums, int numsSize)")
+        assert starter == (
+            "int removeDuplicates(int* nums, int numsSize) {\n"
+            "    // Write your solution here\n"
+            "}\n"
+        )
+
+    def test_c_starter_array_pattern_fills_missing_names(self):
+        from services.harness import generate_c_starter_code
+        starter = generate_c_starter_code("f", "int f(int*, int)")
+        assert starter.startswith("int f(int* arg1, int arg1Size)")
+
+    def test_c_starter_array_without_length_rejected(self):
+        import pytest
+        from services.harness import generate_c_starter_code
+        with pytest.raises(ValueError, match="length parameter"):
+            generate_c_starter_code("f", "int f(int* a)")
+
+
+class TestCInPlaceArrayHarness:
+    """LeetCode-style in-place integer arrays: 'int* nums, int numsSize'.
+
+    The harness derives the length from the JSON array, passes a mutable
+    stack array, and (via the {'returns': k, 'mutated': [...]} expected_output
+    form) verifies BOTH the return value and the mutated first-k prefix.
+    """
+
+    REMOVE_DUP_SIG = "int removeDuplicates(int* nums, int numsSize)"
+    REMOVE_DUP_SOL = (
+        "int removeDuplicates(int* nums, int numsSize) {\n"
+        "    if (numsSize == 0) { return 0; }\n"
+        "    int j = 0;\n"
+        "    for (int i = 1; i < numsSize; i++) {\n"
+        "        if (nums[i] != nums[j]) { j++; nums[j] = nums[i]; }\n"
+        "    }\n"
+        "    return j + 1;\n"
+        "}"
+    )
+
+    def _generate(self, **kwargs):
+        from services.harness import generate_c_harness
+        params = {
+            "candidate_code": self.REMOVE_DUP_SOL,
+            "function_name": "removeDuplicates",
+            "class_name": None,
+            "test_arguments": [[[1, 1, 2]]],
+            "test_expected": [2],
+            "function_signature": self.REMOVE_DUP_SIG,
+        }
+        params.update(kwargs)
+        return generate_c_harness(**params)
+
+    def test_array_signature_parses_and_generates(self):
+        result = self._generate()
+        assert "int _arg0_0[] = {1, 1, 2};" in result
+        assert "removeDuplicates(_arg0_0, 3)" in result
+        assert "int _actual = removeDuplicates" in result
+
+    def test_c_ignores_class_name_from_shared_metadata(self):
+        """The shared problem metadata carries class_name='Solution' for
+        Python/C++/Java; the C harness must accept it and generate a plain
+        free-function invocation with no Solution class."""
+        result = self._generate(class_name="Solution")
+        # 'Solution' appears only as the literal word in a banner comment,
+        # never as a C class definition or qualified invocation.
+        assert "class Solution" not in result
+        assert "Solution(" not in result
+        assert "removeDuplicates(_arg0_0, 3)" in result
+        # Identical output with and without the class name.
+        assert result == self._generate(class_name=None)
+
+    def test_cpp_and_java_still_use_class_name(self):
+        """Regression guard: the Python/C++/Java harnesses still require and
+        use class_name='Solution' for this shared problem."""
+        from services.harness import generate_cpp_harness, generate_java_harness
+        cpp = generate_cpp_harness(
+            candidate_code="int removeDuplicates(std::vector<int>& nums) { return 0; }",
+            function_name="removeDuplicates",
+            class_name="Solution",
+            test_arguments=[[[1, 1, 2]]],
+            test_expected=[2],
+            function_signature="int removeDuplicates(std::vector<int>& nums)",
+        )
+        assert "Solution _obj;" in cpp
+        java = generate_java_harness(
+            candidate_code="public int removeDuplicates(int[] nums) { return 0; }",
+            function_name="removeDuplicates",
+            class_name="Solution",
+            test_arguments=[[[1, 1, 2]]],
+            test_expected=[2],
+            function_signature="public int removeDuplicates(int[] nums)",
+        )
+        assert "new Solution()" in java
+
+    def test_array_length_derived_from_json_array(self):
+        result = self._generate(test_arguments=[[[1, 1, 2]], [[0, 0, 1, 1, 1, 2, 2, 3, 3, 4]]],
+                                test_expected=[2, 5])
+        assert "removeDuplicates(_arg0_0, 3)" in result
+        assert "removeDuplicates(_arg1_0, 10)" in result
+        # The length parameter consumes no JSON argument: each test case
+        # supplies exactly one JSON array.
+        assert "int _arg0_1 = " not in result
+
+    def test_scalar_expected_checks_return_value_only(self):
+        result = self._generate(test_arguments=[[[1, 1, 2]]], test_expected=[2])
+        assert "int _passed = (_actual == _expected);" in result
+        assert "_mutated" not in result
+
+    def test_mutated_dict_expected_generates_prefix_check(self):
+        result = self._generate(
+            test_expected=[{"returns": 2, "mutated": [1, 2]}])
+        assert "int _mutated[] = {1, 2};" in result
+        assert "_mutated_passed" in result
+        assert "int _passed = (_actual == _expected) && _mutated_passed;" in result
+
+    def test_scalar_add_still_works(self):
+        result = self._generate(
+            candidate_code="int add(int a, int b) { return a + b; }",
+            function_name="add",
+            test_arguments=[[2, 3], [10, -3]],
+            test_expected=[5, 7],
+            function_signature="int add(int a, int b)",
+        )
+        assert "int _actual = add(2, 3);" in result
+        assert "int _actual = add(10, -3);" in result
+        assert "_mutated" not in result
+
+    def test_empty_array_generates_placeholder(self):
+        result = self._generate(test_arguments=[[[]]], test_expected=[0])
+        assert "int _arg0_0[1] = {0};" in result
+        assert "removeDuplicates(_arg0_0, 0)" in result
+
+    def test_single_element_array(self):
+        result = self._generate(test_arguments=[[[1]]], test_expected=[1])
+        assert "int _arg0_0[] = {1};" in result
+        assert "removeDuplicates(_arg0_0, 1)" in result
+
+    def test_mutated_longer_than_input_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="longer than"):
+            self._generate(test_arguments=[[[1]]],
+                           test_expected=[{"returns": 2, "mutated": [1, 2]}])
+
+    def test_mutation_dict_unknown_keys_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="unsupported key"):
+            self._generate(test_expected=[{"returns": 2, "mutated": [1, 2], "x": 1}])
+
+    def test_mutation_dict_missing_returns_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="'returns'"):
+            self._generate(test_expected=[{"mutated": [1, 2]}])
+
+    def test_mutation_dict_prefix_length_mismatch_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="exactly the first k"):
+            self._generate(test_expected=[{"returns": 2, "mutated": [1]}])
+
+    def test_mutation_dict_non_int_returns_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="'returns' must be"):
+            self._generate(test_expected=[{"returns": "two", "mutated": [1, 2]}])
+
+    def test_mutation_dict_non_int_elements_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="JSON number"):
+            self._generate(test_expected=[{"returns": 1, "mutated": ["one"]}])
+
+    def test_mutation_dict_requires_int_return_type(self):
+        import pytest
+        with pytest.raises(ValueError, match="only supported when"):
+            self._generate(
+                candidate_code="bool f(int* a, int n) { return true; }",
+                function_name="f",
+                test_arguments=[[[1]]],
+                test_expected=[{"returns": 1}],
+                function_signature="bool f(int* a, int n)",
+            )
+
+    def test_mutation_dict_requires_exactly_one_array_param(self):
+        import pytest
+        with pytest.raises(ValueError, match="exactly one 'int\*'"):
+            self._generate(
+                candidate_code="int f(int x) { return x; }",
+                function_name="f",
+                test_arguments=[[1]],
+                test_expected=[{"returns": 1}],
+                function_signature="int f(int x)",
+            )
+
+    def test_non_array_json_for_array_param_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="JSON array of integers"):
+            self._generate(test_arguments=[[42]], test_expected=[1])
+
+    def test_array_element_overflow_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="does not fit in a C 'int'"):
+            self._generate(test_arguments=[[[2**31]]], test_expected=[1])
+
+    def test_wrong_json_arg_count_with_trailing_scalar_rejected(self):
+        import pytest
+        with pytest.raises(ValueError, match="consumes 2 JSON argument"):
+            self._generate(
+                candidate_code="int f(int* a, int n, int cap) { return cap; }",
+                function_name="f",
+                test_arguments=[[[1], 5, 9]],
+                test_expected=[5],
+                function_signature="int f(int* a, int n, int cap)",
+            )
+
+
+class TestLanguageAwareSignature:
+    """The shared function_signature field may hold another language's syntax.
+
+    C-style signatures (pointers / C bracket arrays) are invalid for the C++
+    and Java typed paths, so C++/Java must ignore them and fall back to their
+    existing legacy shape-inference behavior instead of mis-parsing them
+    (C++ strips '*' and would pass an int where the candidate expects
+    vector<int>&; Java rejects 'int*' outright).
+    """
+
+    C_SIG = "int removeDuplicates(int* nums, int numsSize)"
+
+    def test_c_signature_works_for_c(self):
+        from services.harness import generate_c_harness
+        result = generate_c_harness(
+            candidate_code="int removeDuplicates(int* nums, int numsSize) { return numsSize; }",
+            function_name="removeDuplicates",
+            class_name="Solution",
+            test_arguments=[[[1, 1, 2]]],
+            test_expected=[2],
+            function_signature=self.C_SIG,
+        )
+        assert "removeDuplicates(_arg0_0, 3)" in result
+        assert "class Solution" not in result and "Solution(" not in result
+
+    def test_cpp_with_c_style_signature_falls_back_to_legacy(self):
+        """C++ must not feed a C signature into its typed parser: the '*'
+        would be stripped and an int passed where the candidate expects
+        vector<int>&. Legacy shape-inferred invocation must be used instead."""
+        from services.harness import generate_cpp_harness
+        result = generate_cpp_harness(
+            candidate_code=(
+                "class Solution {\npublic:\n"
+                "    int removeDuplicates(vector<int>& nums) { return 0; }\n"
+                "};"
+            ),
+            function_name="removeDuplicates",
+            class_name="Solution",
+            test_arguments=[[[1, 1, 2]]],
+            test_expected=[2],
+            function_signature=self.C_SIG,
+        )
+        # Legacy path: native arg materialized from the JSON array shape...
+        assert "std::vector<int> _arg0 = jsonToVectorInt(args.to_array()[0]);" in result
+        # ...invoked on the class instance...
+        assert "Solution _obj;" in result
+        # ...via nativeToJson, exactly as for signature-less problems.
+        assert "json::Value _result = nativeToJson(_obj.removeDuplicates(_arg0));" in result
+        # The C signature must NOT have been taken as a typed contract.
+        assert "int _result_native = " not in result
+
+    def test_java_with_c_style_signature_falls_back_to_legacy(self):
+        """Java must not feed a C signature into its typed parser ('int*' is
+        unsupported Java). Legacy shape-inferred invocation must be used."""
+        from services.harness import generate_java_harness
+        result = generate_java_harness(
+            candidate_code=(
+                "class Solution {\n"
+                "    public int removeDuplicates(int[] nums) { return 0; }\n"
+                "}"
+            ),
+            function_name="removeDuplicates",
+            class_name="Solution",
+            test_arguments=[[[1, 1, 2]]],
+            test_expected=[2],
+            function_signature=self.C_SIG,
+        )
+        assert "int[] _arg0 = jsonToIntArray(tcArgs.get(0));" in result
+        assert "Solution _obj = new Solution();" in result
+        assert "JsonValue _result = nativeToJson(_obj.removeDuplicates(_arg0));" in result
+        assert "int _result_native = " not in result
+
+    def test_cpp_bracket_array_signature_falls_back_to_legacy(self):
+        """'int arr[]' is C syntax, not valid typed C++ here either."""
+        from services.harness import generate_cpp_harness
+        result = generate_cpp_harness(
+            candidate_code="class Solution {\npublic:\n    int sum(vector<int>& nums) { return 0; }\n};",
+            function_name="sum",
+            class_name="Solution",
+            test_arguments=[[[1, 2]]],
+            test_expected=[3],
+            function_signature="int sum(int arr[], int n)",
+        )
+        assert "std::vector<int> _arg0 = jsonToVectorInt(args.to_array()[0]);" in result
+        assert "json::Value _result = nativeToJson(_obj.sum(_arg0));" in result
+        assert "int _result_native = " not in result
+
+    def test_cpp_typed_signature_still_works(self):
+        """Existing valid C++ typed signatures keep using the typed path."""
+        from services.harness import generate_cpp_harness
+        result = generate_cpp_harness(
+            candidate_code="class Solution {\npublic:\n    int add(int a, int b) { return a + b; }\n};",
+            function_name="add",
+            class_name="Solution",
+            test_arguments=[[2, 3]],
+            test_expected=[5],
+            function_signature="int add(int a, int b)",
+        )
+        assert "int _arg0 = jsonToInt(args.to_array()[0]);" in result
+        assert "int _result_native = _obj.add(_arg0, _arg1);" in result
+
+    def test_cpp_vector_ref_typed_signature_still_works(self):
+        """vector<int>& is valid typed C++ and must NOT be treated as C-style."""
+        from services.harness import generate_cpp_harness
+        result = generate_cpp_harness(
+            candidate_code="class Solution {\npublic:\n    int size(vector<int>& nums) { return 0; }\n};",
+            function_name="size",
+            class_name="Solution",
+            test_arguments=[[[1, 2]]],
+            test_expected=[2],
+            function_signature="int size(vector<int>& nums)",
+        )
+        assert "int _result_native = _obj.size(_arg0);" in result
+
+    def test_java_typed_signature_still_works(self):
+        """Existing valid Java typed signatures keep using the typed path."""
+        from services.harness import generate_java_harness
+        result = generate_java_harness(
+            candidate_code="class Solution {\n    public int add(int a, int b) { return a + b; }\n}",
+            function_name="add",
+            class_name="Solution",
+            test_arguments=[[2, 3]],
+            test_expected=[5],
+            function_signature="public int add(int a, int b)",
+        )
+        assert "int _result_native = _obj.add(_arg0, _arg1);" in result
+
+    def test_java_bracket_array_typed_signature_still_works(self):
+        """'int[]' IS valid typed Java and must stay on the typed path."""
+        from services.harness import generate_java_harness
+        result = generate_java_harness(
+            candidate_code="class Solution {\n    public int sum(int[] nums) { return 0; }\n}",
+            function_name="sum",
+            class_name="Solution",
+            test_arguments=[[[1, 2]]],
+            test_expected=[3],
+            function_signature="public int sum(int[] nums)",
+        )
+        assert "int[] _arg0 = jsonToIntArray(tcArgs.get(0));" in result
+        assert "int _result_native = _obj.sum(_arg0);" in result
+
+    def test_python_behavior_unchanged(self):
+        """The Python harness never consumes function_signature."""
+        from services.harness import generate_python_harness
+        without = generate_python_harness(
+            candidate_code="def solve(a):\n    return a",
+            function_name="solve", class_name=None,
+            test_arguments=[[1]], test_expected=[1],
+        )
+        with_c_sig = generate_python_harness(
+            candidate_code="def solve(a):\n    return a",
+            function_name="solve", class_name=None,
+            test_arguments=[[1]], test_expected=[1],
+            function_signature=self.C_SIG,
+        )
+        assert without == with_c_sig
+
+
+class TestCCodeExecutorPath:
+    """C goes through the same run_code_public / evaluate_submission path."""
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_accepts_c(self, mock_exec):
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="c", execution_time_ms=10,
+            tests=[{"passed": True, "actual_output": 5,
+                    "status": "accepted", "execution_time_ms": 10}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.code_executor import run_code_public
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [2, 3],
+            "expected_output": 5,
+            "is_public": True,
+        }]
+        result = run_code_public(
+            "int add(int a, int b) { return a + b; }",
+            "c",
+            test_cases,
+            function_name="add",
+            class_name=None,
+            function_signature="int add(int a, int b)",
+        )
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+        source_sent = mock_exec.call_args[1]["source_code"]
+        assert "int _actual = add(2, 3);" in source_sent
+
+    @patch("services.code_executor.execute_code_sync")
+    def test_run_code_public_accepts_c_in_place_array(self, mock_exec):
+        """The removeDuplicates pattern flows through the server run path with
+        the {'returns': k, 'mutated': [...]} expected_output form."""
+        from services.compiler import CompilerResponse
+        mock_exec.return_value = CompilerResponse(
+            status="accepted", language="c", execution_time_ms=10,
+            tests=[{"passed": True, "actual_output": 2,
+                    "status": "accepted", "execution_time_ms": 10}],
+            total_tests=1, passed_tests=1,
+        )
+        from services.code_executor import run_code_public
+        sol = ("int removeDuplicates(int* nums, int numsSize) {"
+               "    if (numsSize == 0) { return 0; }"
+               "    int j = 0;"
+               "    for (int i = 1; i < numsSize; i++) {"
+               "        if (nums[i] != nums[j]) { j++; nums[j] = nums[i]; }"
+               "    }"
+               "    return j + 1;"
+               "}")
+        test_cases = [{
+            "id": "tc1",
+            "arguments": [[1, 1, 2]],
+            "expected_output": {"returns": 2, "mutated": [1, 2]},
+            "is_public": True,
+        }]
+        result = run_code_public(
+            sol, "c", test_cases,
+            function_name="removeDuplicates",
+            class_name=None,
+            function_signature="int removeDuplicates(int* nums, int numsSize)",
+        )
+        assert result["all_passed"] is True
+        source_sent = mock_exec.call_args[1]["source_code"]
+        assert "int _arg0_0[] = {1, 1, 2};" in source_sent
+        assert "removeDuplicates(_arg0_0, 3)" in source_sent
+        assert "_mutated_passed" in source_sent
+>>>>>>> c28c073 (feat: add C coding language support)

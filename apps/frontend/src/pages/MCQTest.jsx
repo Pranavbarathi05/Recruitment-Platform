@@ -25,6 +25,7 @@ const CODING_LANGUAGES = [
   { value: 'python3', label: 'Python 3' },
   { value: 'cpp', label: 'C++' },
   { value: 'java', label: 'Java' },
+  { value: 'c', label: 'C' },
 ];
 
 const INT32_MIN = -2147483648;
@@ -128,6 +129,17 @@ const getDefaultStarter = (lang, problem) => {
   const functionName = problem?.function_name || 'solve';
   const className = problem?.class_name || null;
   const signature = (problem?.function_signature || '').trim();
+  // Language-aware: the shared function_signature field may hold another
+  // language's syntax (e.g. a C 'int* nums, int numsSize' signature on a
+  // multi-language problem). C++/Java starters must not render it — the
+  // backend harness ignores such signatures for C++/Java and uses legacy
+  // shape inference, so the starter falls back the same way. Java's own
+  // array syntax ('int[]') stays valid; C keeps using its signature verbatim.
+  const signatureIsCStyleForLang =
+    (lang === 'cpp' &&
+      (signature.includes('*') || /[A-Za-z_]\w*\s*\[\s*\]/.test(signature))) ||
+    (lang === 'java' && signature.includes('*'));
+  const starterSignature = signatureIsCStyleForLang ? '' : signature;
 
   // --- Python ---
   if (lang === 'python3') {
@@ -159,8 +171,8 @@ const getDefaultStarter = (lang, problem) => {
   // --- C++ ---
   if (lang === 'cpp') {
     const body = (indent) => `${indent}// Write your solution here`;
-    if (signature) {
-      const head = signature.replace(/;\s*$/, '');
+    if (starterSignature) {
+      const head = starterSignature.replace(/;\s*$/, '');
       if (className) {
         return (
           `class ${className} {\npublic:\n` +
@@ -183,12 +195,36 @@ const getDefaultStarter = (lang, problem) => {
     return `${retType} ${functionName}(${paramsText}) {\n    ${body('')}\n}\n`;
   }
 
+  // --- C (server-side only; requires an explicit C function_signature) ---
+  if (lang === 'c') {
+    const body = (indent) => `${indent}// Write your solution here`;
+    const cSignature = signature.trim();
+    if (cSignature) {
+      // The backend harness builds the invocation from this exact signature;
+      // show it verbatim so the starter always agrees with the harness.
+      const head = cSignature.replace(/;\s*$/, '');
+      const usesBool = /\b(_Bool|bool)\b/.test(head);
+      return (
+        (usesBool ? '#include <stdbool.h>\n\n' : '') +
+        `${head} {\n    ${body('')}\n}\n`
+      );
+    }
+    // No signature configured: parameter types cannot be inferred from JSON
+    // test cases for C, and the backend harness will reject the run with a
+    // clear error until the problem defines a C function_signature.
+    return (
+      `// This problem needs a C function_signature (e.g. int add(int a, int b)).\n` +
+      `int solve(void) {\n` +
+      `    ${body('')}\n}\n`
+    );
+  }
+
   // --- Java (harness always invokes an instance method on class_name or "Solution") ---
   {
     const javaClassName = className || 'Solution';
     let method;
-    if (signature) {
-      method = signature.replace(/;\s*$/, '').trim();
+    if (starterSignature) {
+      method = starterSignature.replace(/;\s*$/, '').trim();
       if (!/^public\b/.test(method)) method = `public ${method}`;
       method = `${method} {\n        // Write your solution here\n    }`;
     } else {
@@ -1173,7 +1209,7 @@ function CodingSection({
         <div className="flex-1 min-h-0 relative">
           <CodeEditor
             key={problem.id}
-            language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : 'java'}
+            language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : language === 'c' ? 'c' : 'java'}
             value={sourceCode} onChange={(val) => setSourceCode(val || '')}
           />
         </div>
