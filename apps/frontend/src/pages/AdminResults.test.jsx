@@ -130,3 +130,100 @@ describe('AdminResults — Descriptive Responses section', () => {
     expect(screen.queryByText(/admin_remark/i)).not.toBeInTheDocument();
   });
 });
+
+describe('AdminResults — Hands-On Challenge Responses section', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function buildHandsOnResults({ handsOn, handsOnScore = 100, handsOnMax = 100 }) {
+    const results = buildResults({});
+    results.hands_on_results = handsOn;
+    results.hands_on_score = handsOnScore;
+    results.hands_on_max_score = handsOnMax;
+    results.total_hands_on_questions = handsOn?.length ?? 0;
+    return results;
+  }
+
+  it('renders a verified hands-on response with evidence, flag and score', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [{
+        question_id: 'h1',
+        title: 'SQL Injection — Employee Portal',
+        challenge_type: 'sql_injection_employee_portal',
+        difficulty: 'medium',
+        points: 100,
+        submitted_input: "' OR 1=1 --",
+        submitted_flag: 'FLAG{sql1}',
+        verified: true,
+        score: 100,
+        started_at: '2026-09-14T10:00:00Z',
+        completed_at: '2026-09-14T10:05:00Z',
+        attempted: true,
+      }],
+    })));
+
+    expect(await screen.findByText('Hands-On Challenge Responses')).toBeInTheDocument();
+    expect(screen.getByText(/SQL Injection — Employee Portal/)).toBeInTheDocument();
+    expect(screen.getByText('✓ Completed')).toBeInTheDocument();
+    expect(screen.getByText("' OR 1=1 --")).toBeInTheDocument();
+    expect(screen.getByText('FLAG{sql1}')).toBeInTheDocument();
+    expect(screen.getByText('Score: 100 / 100')).toBeInTheDocument();
+    expect(screen.getByText(/Verification: ✓ Correct/)).toBeInTheDocument();
+  });
+
+  it('renders an incorrect submission without revealing the expected flag', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [{
+        question_id: 'h1',
+        title: 'SQL Injection — Employee Portal',
+        challenge_type: 'sql_injection_employee_portal',
+        difficulty: 'medium',
+        points: 100,
+        submitted_input: "admin'--",
+        submitted_flag: 'FLAG{nope}',
+        verified: false,
+        score: 0,
+        started_at: '2026-09-14T10:00:00Z',
+        completed_at: null,
+        attempted: true,
+      }],
+      handsOnScore: 0,
+    })));
+
+    expect(await screen.findByText('✗ Not Completed')).toBeInTheDocument();
+    expect(screen.getByText(/Verification: ✗ Incorrect/)).toBeInTheDocument();
+    expect(screen.getByText('Score: 0 / 100')).toBeInTheDocument();
+    expect(screen.queryByText(/expected_flag/i)).not.toBeInTheDocument();
+  });
+
+  it('renders an unattempted challenge as Not attempted', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [{
+        question_id: 'h1',
+        title: 'SQL Injection — Employee Portal',
+        challenge_type: 'sql_injection_employee_portal',
+        difficulty: 'easy',
+        points: 100,
+        submitted_input: null,
+        submitted_flag: null,
+        verified: false,
+        score: null,
+        started_at: null,
+        completed_at: null,
+        attempted: false,
+      }],
+      handsOnScore: 0,
+      handsOnMax: 100,
+    })));
+
+    expect(await screen.findByText('✗ Not Completed')).toBeInTheDocument();
+    expect(screen.getAllByText('Not attempted').length).toBeGreaterThan(0);
+  });
+
+  it('does not render the hands-on section when there are no hands-on results', async () => {
+    renderPage(mockFetch(buildResults({ descriptives: [] })));
+    expect(await screen.findByText('Question Review')).toBeInTheDocument();
+    expect(screen.queryByText('Hands-On Challenge Responses')).not.toBeInTheDocument();
+  });
+});

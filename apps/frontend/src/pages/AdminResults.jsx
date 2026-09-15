@@ -105,9 +105,13 @@ const AdminResults = () => {
     mcq_questions,
     coding_results,
     descriptive_results,
+    hands_on_results,
+    hands_on_score,
+    hands_on_max_score,
   } = results;
   const questions = mcq_questions || [];
   const descriptives = descriptive_results || [];
+  const handsOn = hands_on_results || [];
 
   const formatTime = (iso) => {
     if (!iso) return '—';
@@ -211,6 +215,12 @@ const AdminResults = () => {
               <div className="text-sm text-theme-muted mt-1">Coding Score</div>
             </div>
           </div>
+          {hands_on_max_score > 0 && (
+            <div className="text-center mt-4">
+              <div className="text-2xl font-bold text-rose-400">{hands_on_score} / {hands_on_max_score}</div>
+              <div className="text-sm text-theme-muted mt-1">Hands-On Score</div>
+            </div>
+          )}
         </div>
 
         {/* Coding Submissions */}
@@ -293,6 +303,61 @@ const AdminResults = () => {
                   </div>
                 );
               })}
+            </div>
+          </div>
+        )}
+
+        {/* Hands-On Challenge Responses */}
+        {handsOn.length > 0 && (
+          <div className="bg-theme-secondary rounded-lg p-6 mb-6">
+            <h2 className="text-xl font-bold text-theme-primary mb-6">Hands-On Challenge Responses</h2>
+            <div className="space-y-4">
+              {handsOn.map((hr, idx) => (
+                <div key={hr.question_id || idx} className={`bg-theme-primary rounded-lg p-4 border-l-4 ${hr.verified ? 'border-green-500' : 'border-yellow-500'}`}>
+                  <div className="flex items-start justify-between mb-2">
+                    <h3 className="font-semibold text-theme-primary">
+                      H{idx + 1}. {hr.title}
+                    </h3>
+                    <span className={`text-xs px-2 py-1 rounded ml-2 flex-shrink-0 font-bold ${
+                      hr.verified ? 'bg-green-900/50 text-green-300' : 'bg-yellow-900/50 text-yellow-300'
+                    }`}>
+                      {hr.verified ? '✓ Completed' : '✗ Not Completed'}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap gap-4 text-xs text-theme-muted mb-3">
+                    <span className="capitalize">Difficulty: {hr.difficulty}</span>
+                    <span>Score: {hr.score ?? 0} / {hr.points}</span>
+                    {!hr.attempted && <span className="text-yellow-400">Not attempted</span>}
+                  </div>
+
+                  <p className="text-xs text-theme-muted mb-1">SQL Input Used:</p>
+                  {hr.submitted_input ? (
+                    <pre className="bg-theme-secondary rounded p-3 text-xs text-theme-primary whitespace-pre-wrap font-mono overflow-x-auto max-h-48 overflow-y-auto">{hr.submitted_input}</pre>
+                  ) : (
+                    <p className="text-sm text-theme-muted italic">Not attempted</p>
+                  )}
+
+                  <p className="text-xs text-theme-muted mb-1 mt-3">Flag Submitted:</p>
+                  <pre className="bg-theme-secondary rounded p-3 text-xs text-theme-primary font-mono">{hr.submitted_flag || '—'}</pre>
+
+                  <div className="flex gap-4 mt-2 text-xs text-theme-muted">
+                    <span>
+                      Verification: {hr.verified ? '✓ Correct' : '✗ Incorrect'}
+                    </span>
+                    {hr.started_at && (
+                      <span>Started: {new Date(hr.started_at).toLocaleString('en-US', {
+                        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                      })}</span>
+                    )}
+                    {hr.completed_at && (
+                      <span>Completed: {new Date(hr.completed_at).toLocaleString('en-US', {
+                        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                      })}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}

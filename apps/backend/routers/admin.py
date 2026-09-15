@@ -3,7 +3,8 @@ from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
 from schemas.assessment import (
     DomainCreate, DomainUpdate, MCQCreate, MCQUpdate,
-    AssessmentConfigUpdate, VALID_SEMESTERS, SEMESTER_LABELS, AdminRemarkUpdate,
+    AssessmentConfigUpdate, AssessmentConfigUpdateHandsOn,
+    VALID_SEMESTERS, SEMESTER_LABELS, AdminRemarkUpdate,
 )
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -657,6 +658,48 @@ def get_assessment_results(
                     "answered_at": da.get("answered_at"),
                 })
 
+        # Hands-On challenge results. Every frozen challenge is listed, even
+        # when not attempted (evidence "Not attempted"). expected_flag is
+        # NEVER returned — admins see the candidate's submitted flag and the
+        # backend's verification verdict, not the secret itself.
+        hands_on_results = []
+        hands_ids = attempt.get("selected_hands_on_question_ids") or []
+        if hands_ids:
+            hq_resp = (
+                supabase_client.table("hands_on_questions")
+                .select("id, title, difficulty, points, challenge_type")
+                .in_("id", hands_ids)
+                .execute()
+            )
+            hq_map = {q["id"]: q for q in (hq_resp.data or [])}
+
+            hr_resp = (
+                supabase_client.table("assessment_hands_on_results")
+                .select("question_id, submitted_input, submitted_flag, verified, score, started_at, completed_at")
+                .eq("attempt_id", attempt_id)
+                .execute()
+            )
+            hr_map = {r["question_id"]: r for r in (hr_resp.data or [])}
+
+            for qid in hands_ids:
+                hq = hq_map.get(qid, {})
+                hr = hr_map.get(qid, {})
+                attempted = bool(hr) and (hr.get("submitted_input") or hr.get("submitted_flag"))
+                hands_on_results.append({
+                    "question_id": qid,
+                    "title": hq.get("title", ""),
+                    "challenge_type": hq.get("challenge_type", ""),
+                    "difficulty": hq.get("difficulty", ""),
+                    "points": hq.get("points", 0),
+                    "submitted_input": hr.get("submitted_input") if hr else None,
+                    "submitted_flag": hr.get("submitted_flag") if hr else None,
+                    "verified": bool(hr.get("verified")) if hr else False,
+                    "score": hr.get("score") if hr else None,
+                    "started_at": hr.get("started_at") if hr else None,
+                    "completed_at": hr.get("completed_at") if hr else None,
+                    "attempted": attempted,
+                })
+
         return {
             "attempt_id": attempt_id,
             "status": attempt["status"],
@@ -675,6 +718,10 @@ def get_assessment_results(
             "total_coding_problems": attempt.get("total_coding_problems") or 0,
             "total_descriptive_questions": attempt.get("total_descriptive_questions") or 0,
             "descriptive_results": descriptive_results,
+            "total_hands_on_questions": attempt.get("total_hands_on_questions") or 0,
+            "hands_on_results": hands_on_results,
+            "hands_on_score": attempt.get("hands_on_score") or 0,
+            "hands_on_max_score": attempt.get("hands_on_max_score") or 0,
             "duration_minutes": attempt["duration_minutes"],
             "started_at": attempt["started_at"],
             "submitted_at": attempt.get("submitted_at"),
@@ -720,7 +767,7 @@ def list_config(admin: AuthUser = Depends(require_admin)):
 @router.put("/config/{config_id}")
 def update_config(
     config_id: str,
-    payload: AssessmentConfigUpdate,
+    payload: AssessmentConfigUpdateHandsOn,
     admin: AuthUser = Depends(require_admin),
 ):
     """Update an assessment configuration. Admin only."""
@@ -929,6 +976,14 @@ def reset_assessment(
         supabase_client.table("assessment_attempts").update(
             {"status": "reset"}
         ).eq("id", attempt_id).execute()
+
+        # Hands-On: clear the challenge result on the reset attempt (evidence,
+        # flag, verification, score, timestamps) so a retake starts clean. The
+        # shared challenge server keeps running — nothing container-like to
+        # tear down. Challenge rows and the static expected flag are untouched.
+        supabase_client.table("assessment_hands_on_results").delete().eq(
+            "attempt_id", attempt_id
+        ).execute()
 
         return {
             "status": "reset",

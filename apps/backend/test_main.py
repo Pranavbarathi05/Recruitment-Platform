@@ -25,6 +25,8 @@ from unittest.mock import patch, MagicMock
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from http.server import ThreadingHTTPServer
+import json
 from core.auth import AuthUser
 
 
@@ -130,7 +132,8 @@ def mock_supabase():
          patch("routers.admin.supabase_client", mock_client), \
          patch("routers.assessment.supabase_client", mock_client), \
          patch("routers.coding.supabase_client", mock_client), \
-         patch("routers.coding_admin.supabase_client", mock_client):
+         patch("routers.coding_admin.supabase_client", mock_client), \
+         patch("routers.hands_on_admin.supabase_client", mock_client):
         yield mock_client
 
 
@@ -4442,6 +4445,8 @@ class TestCodingScoringPerProblem:
 
 MOCK_DESC_ID = "dddd1111-1111-1111-1111-111111111111"
 MOCK_DESC_ID_2 = "dddd2222-2222-2222-2222-222222222222"
+MOCK_HANDS_ID = "eeee1111-1111-1111-1111-111111111111"
+MOCK_HANDS_ID_2 = "eeee2222-2222-2222-2222-222222222222"
 
 
 def _make_descriptive(desc_id=MOCK_DESC_ID, domain_ids=None):
@@ -4696,7 +4701,8 @@ def _route_table(mock_sb, table_name):
     return mock_sb
 
 
-def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=None):
+def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=None,
+                           hands_on_count=0, hands_on_available=None):
     """Configure per-table mock chains for POST /assessment/start.
 
     start_assessment queries (in order):
@@ -4716,6 +4722,10 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
             {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
             {"id": MOCK_DESC_ID_2, "domain_ids": [MOCK_DOMAIN_1_ID]},
         ]
+    if hands_on_available is None:
+        hands_on_available = [
+            {"id": MOCK_HANDS_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+        ]
 
     chains = mock_sb._table_chains
 
@@ -4726,7 +4736,11 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
     # total_questions must match the mocked MCQ pool (2) so selection succeeds.
     config_chain = chains.setdefault("assessment_config", MagicMock())
     config_chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
-        _make_mock_response([_make_config(total_questions=2, descriptive_question_count=descriptive_count)])
+        _make_mock_response([_make_config(
+            total_questions=2,
+            descriptive_question_count=descriptive_count,
+            hands_on_question_count=hands_on_count,
+        )])
     )
 
     # profiles — candidate identity check
@@ -4755,6 +4769,8 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
             "total_questions": 2,
             "total_coding_problems": 0,
             "total_descriptive_questions": descriptive_count,
+            "total_hands_on_questions": hands_on_count,
+            "selected_hands_on_question_ids": [MOCK_HANDS_ID] if hands_on_count else [],
             "duration_minutes": 20,
             "expires_at": "2025-01-01T00:20:00Z",
         }])
@@ -4776,6 +4792,12 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
     desc_chain = chains.setdefault("descriptive_questions", MagicMock())
     desc_chain.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
         _make_mock_response(descriptive_available)
+    )
+
+    # hands_on_questions — selection pool (only queried when count > 0)
+    hands_chain = chains.setdefault("hands_on_questions", MagicMock())
+    hands_chain.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+        _make_mock_response(hands_on_available or [])
     )
 
     return mock_sb
@@ -5915,3 +5937,852 @@ class TestAdminResultsDescriptive:
             assert r.status_code == 403
         finally:
             client.app.dependency_overrides.clear()
+
+
+# =====================================================================
+# HANDS-ON CHALLENGE TESTS
+# =====================================================================
+
+
+class TestHandsOnSelection:
+    """_select_hands_on_questions: active + domain-overlap filtering."""
+
+    @patch("routers.assessment.supabase_client")
+    def test_zero_count_selects_nothing_without_query(self, mock_sb):
+        from routers.assessment import _select_hands_on_questions
+        result = _select_hands_on_questions(0, [MOCK_DOMAIN_1_ID])
+        assert result == []
+        mock_sb.table.assert_not_called()
+
+    @patch("routers.assessment.supabase_client")
+    def test_selects_requested_challenge(self, mock_sb):
+        from routers.assessment import _select_hands_on_questions
+        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        result = _select_hands_on_questions(1, [MOCK_DOMAIN_1_ID])
+        assert result == [MOCK_HANDS_ID]
+
+    @patch("routers.assessment.supabase_client")
+    def test_raises_400_when_insufficient(self, mock_sb):
+        """Fewer eligible challenges than requested → loud 400."""
+        from routers.assessment import _select_hands_on_questions
+        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            _select_hands_on_questions(1, [MOCK_DOMAIN_1_ID])
+        assert exc_info.value.status_code == 400
+        assert "hands-on" in exc_info.value.detail.lower()
+
+    @patch("routers.assessment.supabase_client")
+    def test_filters_active_and_domain(self, mock_sb):
+        """Query must filter is_active=True and overlap domain_ids."""
+        from routers.assessment import _select_hands_on_questions
+        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        _select_hands_on_questions(1, [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID])
+        mock_sb.table.return_value.select.return_value.eq.assert_called_with("is_active", True)
+        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.assert_called_with(
+            "domain_ids", [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+        )
+
+
+class TestHandsOnStartFlow:
+    """POST /assessment/start with hands_on_question_count."""
+
+    def _set_auth_override(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        return app
+
+    def test_start_with_count_1_selects_and_persists(self, client, mock_supabase):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, descriptive_count=0, hands_on_count=1)
+        self._set_auth_override()
+        try:
+            response = client.post("/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["total_hands_on_questions"] == 1
+            assert data["selected_hands_on_question_ids"] == [MOCK_HANDS_ID]
+
+            insert_call = mock_supabase._table_chains["assessment_attempts"].insert.call_args
+            payload = insert_call.args[0]
+            assert payload["selected_hands_on_question_ids"] == [MOCK_HANDS_ID]
+            assert payload["total_hands_on_questions"] == 1
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_start_with_count_0_preserves_old_behavior(self, client, mock_supabase):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, descriptive_count=0, hands_on_count=0)
+        self._set_auth_override()
+        try:
+            response = client.post("/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]})
+            assert response.status_code == 200
+            assert response.json()["total_hands_on_questions"] == 0
+            # The hands-on selection query must never run
+            hands_chain = mock_supabase._table_chains["hands_on_questions"]
+            hands_chain.select.return_value.eq.return_value.overlaps.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_start_rejects_when_hands_on_insufficient(self, client, mock_supabase):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase, descriptive_count=0, hands_on_count=1, hands_on_available=[]
+        )
+        self._set_auth_override()
+        try:
+            response = client.post("/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]})
+            assert response.status_code == 400
+            assert "hands-on" in response.json()["detail"].lower()
+            mock_supabase.table.return_value.insert.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestHandsOnQuestionsEndpoint:
+    """GET /assessment/attempt/{id}/questions returns hands-on metadata."""
+
+    def _set_auth_override(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+
+    def _configure_mocks(self, mock_sb, attempt, ho_question=None, ho_results=None):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        # questions endpoint top-up path reads config (any failure → 0)
+        cfg = chains.setdefault("assessment_config", MagicMock())
+        cfg.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response([_make_config(total_questions=2, descriptive_question_count=0)])
+        )
+
+        m = chains.setdefault("mcq_questions", MagicMock())
+        m.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([_make_mcq(MOCK_MCQ_1_ID), _make_mcq(MOCK_MCQ_2_ID)])
+        )
+
+        d = chains.setdefault("domains", MagicMock())
+        d.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev"}])
+        )
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+
+        ho = chains.setdefault("hands_on_questions", MagicMock())
+        ho.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([ho_question] if ho_question else [])
+        )
+
+        hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hr.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(ho_results or [])
+        )
+
+        # descriptive tables may be touched by the top-up path — keep empty
+        dq = chains.setdefault("descriptive_questions", MagicMock())
+        dq.select.return_value.in_.return_value.execute.return_value = _make_mock_response([])
+        da = chains.setdefault("assessment_descriptive_answers", MagicMock())
+        da.select.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        return mock_sb
+
+    def _attempt(self, hands_ids=None):
+        attempt = _make_attempt()
+        attempt["selected_descriptive_question_ids"] = []
+        attempt["total_descriptive_questions"] = 0
+        selected = [MOCK_HANDS_ID] if hands_ids is None else hands_ids
+        attempt["selected_hands_on_question_ids"] = selected
+        attempt["total_hands_on_questions"] = len(selected)
+        return attempt
+
+    def test_returns_hands_on_metadata_without_expected_flag(self, client, mock_supabase):
+        self._set_auth_override()
+        ho_q = {
+            "id": MOCK_HANDS_ID, "title": "SQL Injection — Employee Portal",
+            "description": "desc", "difficulty": "medium", "points": 100,
+            "challenge_type": "sql_injection_employee_portal",
+            "challenge_url": "http://127.0.0.1:8080",
+            # expected_flag present on the row but must NOT leak into response
+        }
+        self._configure_mocks(mock_supabase, self._attempt(), ho_question=ho_q)
+        try:
+            r = client.get(f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions")
+            assert r.status_code == 200
+            data = r.json()
+            assert len(data["hands_on_questions"]) == 1
+            hq = data["hands_on_questions"][0]
+            assert hq["title"] == "SQL Injection — Employee Portal"
+            assert hq["challenge_url"] == "http://127.0.0.1:8080"
+            assert hq["points"] == 100
+            assert "expected_flag" not in hq
+            assert "FLAG" not in json.dumps(data)
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_returns_candidate_own_results(self, client, mock_supabase):
+        self._set_auth_override()
+        ho_result = [{
+            "question_id": MOCK_HANDS_ID, "submitted_input": "' OR 1=1 --",
+            "submitted_flag": "FLAG{x}", "verified": True, "score": 100,
+            "started_at": "2026-09-15T10:00:00Z", "completed_at": "2026-09-15T10:05:00Z",
+        }]
+        self._configure_mocks(
+            mock_supabase, self._attempt(),
+            ho_question={"id": MOCK_HANDS_ID, "title": "t", "description": "d",
+                         "difficulty": "medium", "points": 100,
+                         "challenge_type": "sql_injection_employee_portal",
+                         "challenge_url": "http://x"},
+            ho_results=ho_result,
+        )
+        try:
+            r = client.get(f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions")
+            assert r.status_code == 200
+            results = r.json()["hands_on_results"]
+            assert len(results) == 1
+            assert results[0]["verified"] is True
+            assert results[0]["submitted_input"] == "' OR 1=1 --"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_empty_hands_on_when_none_selected(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(hands_ids=[]))
+        try:
+            r = client.get(f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions")
+            assert r.status_code == 200
+            data = r.json()
+            assert data["hands_on_questions"] == []
+            assert data["total_hands_on_questions"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestHandsOnSubmitVerification:
+    """PUT /assessment/attempt/{id}/hands-on — flag verification (evidence-only SQL input)."""
+
+    EXPECTED_FLAG = "FLAG{sql1_1nj3ct10n_p0rt4l}"
+    WRONG_FLAG = "FLAG{wrong}"
+
+    def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=profile_id, email="candidate@test.com"
+        )
+
+    def _configure_mocks(self, mock_sb, attempt, expected_flag=EXPECTED_FLAG,
+                         points=100, existing_result=None, owner=MOCK_PROFILE_ID):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        hq = chains.setdefault("hands_on_questions", MagicMock())
+        hq.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{
+                "id": MOCK_HANDS_ID, "points": points, "expected_flag": expected_flag,
+            }])
+        )
+
+        hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hr.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([existing_result] if existing_result else [])
+        )
+        hr.update.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        hr.insert.return_value.execute.return_value = _make_mock_response([])
+        return mock_sb
+
+    def _attempt(self):
+        attempt = _make_attempt()
+        attempt["selected_hands_on_question_ids"] = [MOCK_HANDS_ID]
+        attempt["total_hands_on_questions"] = 1
+        return attempt
+
+    def _submit(self, client, flag=EXPECTED_FLAG, sql="' OR 1=1 --"):
+        return client.put(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/hands-on",
+            json={"question_id": MOCK_HANDS_ID, "submitted_input": sql, "submitted_flag": flag},
+        )
+
+    def test_correct_flag_full_score(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client)
+            assert r.status_code == 200
+            data = r.json()
+            assert data["verified"] is True
+            assert data["score"] == 100
+            assert data["points"] == 100
+            # The expected flag must never appear in the response
+            assert self.EXPECTED_FLAG not in json.dumps(r.json())
+            # Row persisted with verified=True and full score
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            insert_payload = hr.insert.call_args.args[0]
+            assert insert_payload["verified"] is True
+            assert insert_payload["score"] == 100
+            assert insert_payload["submitted_input"] == "' OR 1=1 --"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_incorrect_flag_zero_score(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client, flag=self.WRONG_FLAG)
+            assert r.status_code == 200
+            data = r.json()
+            assert data["verified"] is False
+            assert data["score"] == 0
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            insert_payload = hr.insert.call_args.args[0]
+            assert insert_payload["verified"] is False
+            assert insert_payload["score"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_sql_input_stored_verbatim_not_verified(self, client, mock_supabase):
+        """Nonsense SQL input is stored as evidence and never validated."""
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            weird_sql = "this is not even SQL ; DROP TABLE users; --"
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/hands-on",
+                json={"question_id": MOCK_HANDS_ID, "submitted_input": weird_sql,
+                      "submitted_flag": self.EXPECTED_FLAG},
+            )
+            assert r.status_code == 200
+            assert r.json()["verified"] is True  # flag alone decides
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            insert_payload = hr.insert.call_args.args[0]
+            assert insert_payload["submitted_input"] == weird_sql
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_flag_trimmed_before_comparison(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client, flag=f"  {self.EXPECTED_FLAG}  \n")
+            assert r.status_code == 200
+            assert r.json()["verified"] is True
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_case_sensitive_by_default(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client, flag=self.EXPECTED_FLAG.lower())
+            assert r.status_code == 200
+            assert r.json()["verified"] is False
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_whitespace_only_flag_rejected(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client, flag="   ")
+            assert r.status_code == 200
+            assert r.json()["verified"] is False
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_empty_flag_rejected(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client, flag="")
+            assert r.status_code == 200
+            assert r.json()["verified"] is False
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_resubmission_updates_same_row(self, client, mock_supabase):
+        """UNIQUE(attempt_id, question_id): resubmission updates, never duplicates."""
+        self._set_auth_override()
+        self._configure_mocks(
+            mock_supabase, self._attempt(),
+            existing_result={"id": "res-1", "verified": False, "score": 0},
+        )
+        try:
+            r = self._submit(client)
+            assert r.status_code == 200
+            assert r.json()["verified"] is True
+            hr = mock_supabase._table_chains["assessment_hands_on_results"]
+            hr.insert.assert_not_called()
+            hr.update.assert_called_once()
+            update_payload = hr.update.call_args.args[0]
+            assert update_payload["verified"] is True
+            assert update_payload["score"] == 100
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_first_correct_wins_not_downgraded(self, client, mock_supabase):
+        """A verified result is never downgraded by a later wrong submission."""
+        self._set_auth_override()
+        self._configure_mocks(
+            mock_supabase, self._attempt(),
+            existing_result={"id": "res-1", "verified": True, "score": 100},
+        )
+        try:
+            r = self._submit(client, flag=self.WRONG_FLAG, sql="different evidence")
+            assert r.status_code == 200
+            assert r.json()["verified"] is True
+            assert r.json()["score"] == 100
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_unauthorized_attempt_rejected(self, client, mock_supabase):
+        self._set_auth_override(profile_id="99999999-9999-9999-9999-999999999999")
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = self._submit(client)
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_challenge_not_in_attempt_rejected(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/hands-on",
+                json={"question_id": MOCK_HANDS_ID_2, "submitted_input": "x",
+                      "submitted_flag": self.EXPECTED_FLAG},
+            )
+            assert r.status_code == 400
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_unauthenticated_rejected(self, client):
+        r = client.put(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/hands-on",
+            json={"question_id": MOCK_HANDS_ID, "submitted_input": "x",
+                  "submitted_flag": "FLAG{x}"},
+        )
+        assert r.status_code == 401
+
+    def test_expired_attempt_rejected(self, client, mock_supabase):
+        self._set_auth_override()
+        attempt = self._attempt()
+        attempt["expires_at"] = "2020-01-01T00:00:00Z"
+        self._configure_mocks(mock_supabase, attempt)
+        try:
+            r = self._submit(client)
+            assert r.status_code == 400
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestHandsOnScoring:
+    """_score_attempt includes verified hands-on points."""
+
+    @patch("routers.assessment.supabase_client")
+    def test_hands_on_score_included(self, mock_sb):
+        from routers.assessment import _score_attempt
+
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        # MCQ scoring
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": "a1", "question_id": MOCK_MCQ_1_ID, "selected_option": "A"}])
+        )
+        mcq = chains.setdefault("mcq_questions", MagicMock())
+        mcq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_MCQ_1_ID, "correct_option": "A"}])
+        )
+
+        # Coding scoring (no problems selected)
+        att = chains.setdefault("assessment_attempts", MagicMock())
+        att.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"selected_question_ids": [MOCK_MCQ_1_ID],
+                                  "selected_coding_problem_ids": [],
+                                  "selected_hands_on_question_ids": [MOCK_HANDS_ID]}])
+        )
+
+        # Hands-On scoring
+        hq = chains.setdefault("hands_on_questions", MagicMock())
+        hq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID, "points": 100}])
+        )
+        hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hr.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"question_id": MOCK_HANDS_ID, "verified": True, "score": 100}])
+        )
+
+        result = _score_attempt(MOCK_ATTEMPT_ID)
+        assert result["hands_on_score"] == 100
+        assert result["hands_on_max_score"] == 100
+        assert result["score"] == 1 + 0 + 100  # mcq + coding + hands-on
+
+        update_call = att.update.call_args.args[0]
+        assert update_call["hands_on_score"] == 100
+        assert update_call["hands_on_max_score"] == 100
+
+
+class TestHandsOnAdminAPI:
+    """Admin CRUD + View Responses integration for hands-on."""
+
+    def _set_admin_override(self):
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id="admin-user-id", email="admin@test.com"
+        )
+
+    def _configure_admin_mocks(self, mock_sb):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        # Pre-create every table the admin endpoints touch, and make the
+        # domains validation query accept any requested IDs.
+        for name in (
+            "hands_on_questions", "domains", "assessment_attempts",
+            "profiles", "candidates", "assessment_hands_on_results",
+            "assessment_answers", "mcq_questions", "coding_submissions",
+            "descriptive_questions", "assessment_descriptive_answers",
+        ):
+            chains.setdefault(name, MagicMock())
+        chains["domains"].select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID}])
+        )
+        return chains
+
+    def test_admin_create_challenge(self, client, mock_supabase):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        created = {"id": MOCK_HANDS_ID, "title": "SQL Injection — Employee Portal"}
+        chains["hands_on_questions"].insert.return_value.execute.return_value = (
+            _make_mock_response([created])
+        )
+        try:
+            r = client.post("/admin/hands-on-questions", json={
+                "title": "SQL Injection — Employee Portal",
+                "description": "Retrieve the flag.",
+                "domain_ids": [MOCK_DOMAIN_1_ID],
+                "challenge_url": "http://127.0.0.1:8080",
+                "expected_flag": f"  FLAG{{x}}  ",
+                "points": 100,
+            })
+            assert r.status_code == 201
+            assert r.json()["id"] == MOCK_HANDS_ID
+            insert_payload = chains["hands_on_questions"].insert.call_args.args[0]
+            assert insert_payload["expected_flag"] == "FLAG{x}"  # trimmed
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_admin_update_challenge(self, client, mock_supabase):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        chains["hands_on_questions"].select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        chains["hands_on_questions"].update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID, "points": 50}])
+        )
+        try:
+            r = client.put(f"/admin/hands-on-questions/{MOCK_HANDS_ID}", json={"points": 50})
+            assert r.status_code == 200
+            assert r.json()["points"] == 50
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_admin_delete_challenge(self, client, mock_supabase):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        chains["hands_on_questions"].select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        chains["assessment_attempts"].select.return_value.contains.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        chains["hands_on_questions"].delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        try:
+            r = client.delete(f"/admin/hands-on-questions/{MOCK_HANDS_ID}")
+            assert r.status_code == 200
+            assert r.json()["status"] == "deleted"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_admin_delete_blocked_when_referenced(self, client, mock_supabase):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        chains["hands_on_questions"].select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        chains["assessment_attempts"].select.return_value.contains.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_ATTEMPT_ID}])
+        )
+        try:
+            r = client.delete(f"/admin/hands-on-questions/{MOCK_HANDS_ID}")
+            assert r.status_code == 409
+            assert "deactivation" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_admin_api_requires_admin(self, client, mock_supabase):
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: (_ for _ in ()).throw(
+            HTTPException(status_code=403, detail="Admin access required")
+        )
+        try:
+            r = client.get("/admin/hands-on-questions")
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_admin_api_requires_auth(self, client):
+        r = client.get("/admin/hands-on-questions")
+        assert r.status_code == 401
+
+    def _configure_results_mocks(self, mock_sb, attempt, hq_row, hr_rows):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        p = chains.setdefault("profiles", MagicMock())
+        p.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_PROFILE_ID, "full_name": "C", "email": "c@t.com"}])
+        )
+        c = chains.setdefault("candidates", MagicMock())
+        c.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"usn": "USN1", "semester": 5, "branch": "CSE"}])
+        )
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        m = chains.setdefault("mcq_questions", MagicMock())
+        m.select.return_value.in_.return_value.execute.return_value = _make_mock_response([])
+        d = chains.setdefault("domains", MagicMock())
+        d.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev"}])
+        )
+        cs = chains.setdefault("coding_submissions", MagicMock())
+        cs.select.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        hq = chains.setdefault("hands_on_questions", MagicMock())
+        hq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([hq_row] if hq_row else [])
+        )
+        hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hr.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(hr_rows)
+        )
+        return chains
+
+    def test_view_responses_contains_hands_on(self, client, mock_supabase):
+        self._set_admin_override()
+        attempt = _make_attempt(status="scored")
+        attempt["selected_hands_on_question_ids"] = [MOCK_HANDS_ID]
+        attempt["total_hands_on_questions"] = 1
+        attempt["hands_on_score"] = 100
+        attempt["hands_on_max_score"] = 100
+        hq_row = {
+            "id": MOCK_HANDS_ID, "title": "SQL Injection — Employee Portal",
+            "difficulty": "medium", "points": 100,
+            "challenge_type": "sql_injection_employee_portal",
+        }
+        hr_rows = [{
+            "question_id": MOCK_HANDS_ID,
+            "submitted_input": "' OR 1=1 --",
+            "submitted_flag": "FLAG{sql1_1nj3ct10n_p0rt4l}",
+            "verified": True, "score": 100,
+            "started_at": "2026-09-15T10:00:00Z",
+            "completed_at": "2026-09-15T10:05:00Z",
+        }]
+        self._configure_results_mocks(mock_supabase, attempt, hq_row, hr_rows)
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 200
+            data = r.json()
+            assert data["hands_on_score"] == 100
+            assert len(data["hands_on_results"]) == 1
+            ho = data["hands_on_results"][0]
+            assert ho["title"] == "SQL Injection — Employee Portal"
+            assert ho["submitted_input"] == "' OR 1=1 --"
+            assert ho["verified"] is True
+            assert ho["score"] == 100
+            # expected_flag never in the admin response
+            assert "expected_flag" not in json.dumps(data)
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_view_responses_shows_unattempted_challenge(self, client, mock_supabase):
+        self._set_admin_override()
+        attempt = _make_attempt(status="scored")
+        attempt["selected_hands_on_question_ids"] = [MOCK_HANDS_ID]
+        attempt["total_hands_on_questions"] = 1
+        hq_row = {"id": MOCK_HANDS_ID, "title": "T", "difficulty": "easy",
+                  "points": 100, "challenge_type": "sql_injection_employee_portal"}
+        self._configure_results_mocks(mock_supabase, attempt, hq_row, [])
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 200
+            ho = r.json()["hands_on_results"][0]
+            assert ho["attempted"] is False
+            assert ho["submitted_input"] is None
+            assert ho["verified"] is False
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_reset_clears_hands_on_results(self, client, mock_supabase):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        a = chains["assessment_attempts"]
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_ATTEMPT_ID, "profile_id": MOCK_PROFILE_ID, "status": "scored"}])
+        )
+        a.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        a.update.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        hr = chains["assessment_hands_on_results"]
+        hr.delete.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        try:
+            r = client.post(f"/admin/assessments/{MOCK_ATTEMPT_ID}/reset")
+            assert r.status_code == 200
+            hr.delete.assert_called_once()
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestHandsOnChallengeServer:
+    """The standalone SQLi challenge server (stdlib Python, own SQLite)."""
+
+    @pytest.fixture(scope="class")
+    def challenge(self):
+        import importlib.util
+        import tempfile
+
+        spec = importlib.util.spec_from_file_location(
+            "challenge_server",
+            os.path.join(os.path.dirname(__file__), "challenge_server", "challenge_server.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        tmpdir = tempfile.mkdtemp(prefix="sqli_challenge_")
+        db_path = os.path.join(tmpdir, "challenge.db")
+        module.init_db(db_path)
+
+        from threading import Thread
+        server = ThreadingHTTPServer(("127.0.0.1", 0), module.ChallengeHandler)
+        server.daemon_threads = True
+        module.ChallengeHandler.db_path = db_path  # ensure isolation
+        t = Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        yield {"base": f"http://127.0.0.1:{server.server_address[1]}", "module": module, "db": db_path}
+        server.shutdown()
+        server.server_close()
+
+    def _post_login(self, base, username, password):
+        from urllib.request import Request, urlopen
+        from urllib.parse import urlencode
+        data = urlencode({"username": username, "password": password}).encode()
+        req = Request(f"{base}/login", data=data)
+        with urlopen(req) as resp:
+            return resp.read().decode()
+
+    def test_homepage_renders_portal(self, challenge):
+        from urllib.request import urlopen
+        with urlopen(f"{challenge['base']}/") as resp:
+            html = resp.read().decode()
+        assert "Employee Portal" in html
+        assert "username" in html.lower()
+        assert "password" in html.lower()
+
+    def test_valid_login_works(self, challenge):
+        body = self._post_login(challenge["base"], "guest", "guest")
+        assert "LOGIN SUCCESSFUL" in body
+        assert "guest" in body
+
+    def test_invalid_login_fails(self, challenge):
+        body = self._post_login(challenge["base"], "guest", "wrongpass")
+        assert "invalid credentials" in body
+        assert "LOGIN SUCCESSFUL" not in body
+
+    def test_sqli_bypass_reveals_admin(self, challenge):
+        body = self._post_login(challenge["base"], "admin'--", "anything")
+        assert "LOGIN SUCCESSFUL" in body
+        assert "administrator" in body
+
+    def test_sqli_reveals_flag(self, challenge):
+        body = self._post_login(challenge["base"], "' OR 1=1 --", "x")
+        assert "LOGIN SUCCESSFUL" in body
+        assert "administrator" in body
+        assert "Protected Flag:" in body
+        assert "FLAG{" in body
+
+    def test_db_contains_only_synthetic_data(self, challenge):
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(challenge["db"])
+        try:
+            rows = conn.execute("SELECT username, role, flag FROM users").fetchall()
+        finally:
+            conn.close()
+        assert all(row[1] in ("administrator", "employee", "guest") for row in rows)
+        flags = [row[2] for row in rows if row[2]]
+        assert len(flags) == 1  # only the admin row carries the flag

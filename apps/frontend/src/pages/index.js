@@ -11,4 +11,5 @@ export { default as AdminPanel } from './AdminPanel';
 export { default as AdminResults } from './AdminResults';
 export { default as AdminCoding } from './AdminCoding';
 export { default as AdminDescriptive } from './AdminDescriptive';
+export { default as AdminHandsOn } from './AdminHandsOn';
 export { default as Instructions } from './Instructions';

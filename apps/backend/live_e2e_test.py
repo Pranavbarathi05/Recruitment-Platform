@@ -25,6 +25,7 @@ Usage:
 """
 import os
 import sys
+import tempfile
 import json
 import uuid
 import time
@@ -87,6 +88,7 @@ def main():
         "total_questions": cfg["total_questions"],
         "coding_problem_count": cfg.get("coding_problem_count", 0),
         "descriptive_question_count": cfg.get("descriptive_question_count", 0),
+        "hands_on_question_count": cfg.get("hands_on_question_count", 0),
         "duration_minutes": cfg["duration_minutes"],
         "max_domains": cfg.get("max_domains", 1),
     }
@@ -408,7 +410,148 @@ def main():
               str(r.status_code))
 
         # ============================================================
-        # 15. Auth sanity for both sessions
+        # 14b. HANDS-ON: challenge server + submission round-trip
+        # ============================================================
+        import importlib.util
+        cs_spec = importlib.util.spec_from_file_location(
+            "challenge_server",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "challenge_server", "challenge_server.py"))
+        cs_mod = importlib.util.module_from_spec(cs_spec)
+        cs_spec.loader.exec_module(cs_mod)
+
+        cs_db = os.path.join(tempfile.gettempdir(), f"live_e2e_sqli_{stamp}_{rng}.db")
+        cs_mod.init_db(cs_db)
+        cs_proc = subprocess.Popen(
+            [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          ".venv/bin/python"),
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "challenge_server", "challenge_server.py"),
+             "--port", "8093", "--db", cs_db],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            # Wait for the challenge server to come up
+            cs_up = False
+            for _ in range(30):
+                try:
+                    if httpx.get("http://127.0.0.1:8093/health", timeout=2).status_code == 200:
+                        cs_up = True
+                        break
+                except Exception:
+                    time.sleep(0.3)
+            check("challenge server starts + /health ok", cs_up)
+
+            # ACTUAL SQL INJECTION against the challenge website (real HTTP)
+            r = httpx.post("http://127.0.0.1:8093/login",
+                           data={"username": "' OR 1=1 --", "password": "x"},
+                           timeout=10)
+            page = r.text
+            check("SQLi reveals administrator", "administrator" in page)
+            check("SQLi prints login info", "LOGIN SUCCESSFUL" in page and "Username: admin" in page)
+            import re as _re
+            flag_match = _re.search(r"FLAG\{[^}]*\}", page)
+            discovered_flag = flag_match.group(0) if flag_match else ""
+            check("SQLi prints flag", bool(discovered_flag), page[-200:] if not discovered_flag else "")
+
+            # Create an active hands-on challenge for the attempt domains
+            ho_title = f"Live E2E SQLi {stamp}{rng}"
+            r = admin_s.post(f"{BASE}/admin/hands-on-questions", json={
+                "title": ho_title,
+                "description": "Gain access to the administrator account and retrieve the protected flag.",
+                "domain_ids": dq_domains,
+                "challenge_type": "sql_injection_employee_portal",
+                "difficulty": "medium",
+                "points": 100,
+                "challenge_url": "http://127.0.0.1:8093",
+                "expected_flag": discovered_flag,
+                "is_active": True,
+            })
+            check("admin creates hands-on challenge", r.status_code == 201,
+                  r.text[:200] if r.status_code != 201 else "")
+            ho_id = r.json().get("id") if r.status_code == 201 else None
+
+            # Candidate questions endpoint returns hands-on metadata — never the flag
+            r = cand_s.get(f"{BASE}/assessment/attempt/{attempt_id}/questions")
+            qd2 = r.json()
+            ho_meta = qd2.get("hands_on_questions") or []
+            check("candidate sees hands-on challenge metadata", len(ho_meta) == 1,
+                  str(len(ho_meta)))
+            check("candidate response has no expected_flag", "expected_flag" not in json.dumps(qd2))
+            check("candidate questions response has no challenge flag",
+                  discovered_flag not in json.dumps(qd2))
+
+            # Wrong flag → verified=false, score 0
+            r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/hands-on",
+                           json={"question_id": ho_meta[0]["id"],
+                                 "submitted_input": "' OR 1=1 --",
+                                 "submitted_flag": "FLAG{wrong}"})
+            check("wrong flag → verified false / score 0",
+                  r.status_code == 200 and r.json().get("verified") is False
+                  and r.json().get("score") == 0,
+                  r.text[:120] if r.status_code != 200 else "")
+
+            # Correct (discovered) flag → full score
+            r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/hands-on",
+                           json={"question_id": ho_meta[0]["id"],
+                                 "submitted_input": "' OR 1=1 --",
+                                 "submitted_flag": discovered_flag})
+            check("correct flag → verified true / full score",
+                  r.status_code == 200 and r.json().get("verified") is True
+                  and r.json().get("score") == 100,
+                  r.text[:120] if r.status_code != 200 else "")
+            check("verification response never contains the expected flag",
+                  discovered_flag not in json.dumps(r.json()))
+
+            # Result persisted with evidence
+            ho_rows = (sb.table("assessment_hands_on_results")
+                       .select("*").eq("attempt_id", attempt_id).execute().data)
+            check("hands-on result persisted with evidence",
+                  len(ho_rows) == 1 and ho_rows[0]["submitted_input"] == "' OR 1=1 --"
+                  and ho_rows[0]["verified"] is True and ho_rows[0]["score"] == 100,
+                  str(len(ho_rows)))
+
+            # Admin view shows the hands-on response (evidence + verdict, no secret)
+            r = admin_s.get(f"{BASE}/admin/assessments/{attempt_id}/results")
+            ho_results = (r.json().get("hands_on_results") or [])
+            check("admin results include hands-on response", len(ho_results) == 1,
+                  str(len(ho_results)))
+            if ho_results:
+                check("admin sees submitted SQL input",
+                      ho_results[0].get("submitted_input") == "' OR 1=1 --")
+                check("admin sees submitted flag + verification",
+                      ho_results[0].get("submitted_flag") == discovered_flag
+                      and ho_results[0].get("verified") is True)
+                check("admin results carry no expected_flag",
+                      "expected_flag" not in json.dumps(r.json()))
+
+            # Candidate cannot read the challenge table directly (RLS/grants)
+            r = cand_s.get(f"{BASE}/admin/hands-on-questions")
+            check("candidate rejected from admin hands-on API",
+                  r.status_code in (401, 403), str(r.status_code))
+
+            # Admin reset clears the hands-on result
+            r = admin_s.post(f"{BASE}/admin/assessments/{attempt_id}/reset")
+            check("admin reset request ok", r.status_code == 200,
+                  r.text[:120] if r.status_code != 200 else "")
+            ho_rows_after = (sb.table("assessment_hands_on_results")
+                             .select("*").eq("attempt_id", attempt_id).execute().data)
+            check("reset cleared hands-on result", len(ho_rows_after) == 0,
+                  str(len(ho_rows_after)))
+        finally:
+            cs_proc.terminate()
+            try:
+                os.remove(cs_db)
+            except OSError:
+                pass
+            if ho_id:
+                try:
+                    admin_s.delete(f"{BASE}/admin/hands-on-questions/{ho_id}")
+                except Exception:
+                    pass
+
+        # ============================================================
+        # 14c. Auth sanity for both sessions
         # ============================================================
         r = admin_s.get(f"{BASE}/auth/me")
         check("admin /auth/me works", r.status_code == 200)

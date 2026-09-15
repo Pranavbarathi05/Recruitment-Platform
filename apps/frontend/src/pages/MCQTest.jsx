@@ -235,6 +235,11 @@ const AssessmentWorkspace = () => {
   const [descriptiveIndex, setDescriptiveIndex] = useState(0);
   const [hasDescriptive, setHasDescriptive] = useState(false);
 
+  // Hands-On state
+  const [handsOnQuestions, setHandsOnQuestions] = useState([]);
+  const [handsOnResults, setHandsOnResults] = useState({}); // questionId -> result
+  const [hasHandsOn, setHasHandsOn] = useState(false);
+
   const autosaveTimerRef = useRef(null);
   const lastSavedRef = useRef({}); // { [problemId]: lastSavedCode }
 
@@ -258,6 +263,11 @@ const AssessmentWorkspace = () => {
           setDescriptiveQuestions(mcqData.descriptive_questions || []);
           setDescriptiveAnswers(mcqData.descriptive_answers || {});
           setHasDescriptive((mcqData.descriptive_questions || []).length > 0);
+          setHandsOnQuestions(mcqData.hands_on_questions || []);
+          setHandsOnResults(
+            Object.fromEntries((mcqData.hands_on_results || []).map((r) => [r.question_id, r]))
+          );
+          setHasHandsOn((mcqData.hands_on_questions || []).length > 0);
           setAttemptData(mcqData);
           setHasMcq((mcqData.questions || []).length > 0);
 
@@ -300,6 +310,8 @@ const AssessmentWorkspace = () => {
           setActiveTab('mcq');
         } else if ((mcqData?.descriptive_questions || []).length > 0) {
           setActiveTab('descriptive');
+        } else if ((mcqData?.hands_on_questions || []).length > 0) {
+          setActiveTab('handson');
         } else {
           setActiveTab('coding');
         }
@@ -389,6 +401,31 @@ const AssessmentWorkspace = () => {
     if (!problem) return null;
     return { problem, state: codingStates[problem.id] || { code: '', language: 'python3' } };
   }, [codingProblems, codingIndex, codingStates]);
+
+  // ========== HANDS-ON: SUBMIT (evidence + flag) ==========
+  const submitHandsOn = useCallback(async (questionId, submittedInput, submittedFlag) => {
+    const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/hands-on`, {
+      method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
+      body: JSON.stringify({ question_id: questionId, submitted_input: submittedInput, submitted_flag: submittedFlag }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || 'Failed to submit challenge');
+    }
+    setHandsOnResults((prev) => ({
+      ...prev,
+      [questionId]: {
+        ...(prev[questionId] || {}),
+        question_id: questionId,
+        submitted_input: submittedInput,
+        submitted_flag: (submittedFlag || '').trim(),
+        verified: data.verified,
+        score: data.score,
+        completed_at: data.verified ? new Date().toISOString() : null,
+      },
+    }));
+    return data;
+  }, [attemptId, apiUrl, getAuthHeaders]);
 
   // ========== CODING: RUN CODE ==========
   //
@@ -533,6 +570,16 @@ const AssessmentWorkspace = () => {
                 Descriptive ({descriptiveQuestions.length})
               </button>
             )}
+            {hasHandsOn && (
+              <button
+                onClick={() => setActiveTab('handson')}
+                className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  activeTab === 'handson' ? 'bg-blue-600 text-white' : 'text-theme-muted hover:text-theme-primary'
+                }`}
+              >
+                Hands-On ({handsOnQuestions.length})
+              </button>
+            )}
             {hasCoding && (
               <button
                 onClick={() => setActiveTab('coding')}
@@ -580,6 +627,15 @@ const AssessmentWorkspace = () => {
             currentIndex={descriptiveIndex}
             setCurrentIndex={setDescriptiveIndex}
             saveAnswer={saveDescriptiveAnswer}
+          />
+        )}
+
+        {/* Hands-On Section */}
+        {activeTab === 'handson' && (
+          <HandsOnSection
+            questions={handsOnQuestions}
+            results={handsOnResults}
+            onSubmit={submitHandsOn}
           />
         )}
 
@@ -790,6 +846,145 @@ function DescriptiveSection({ questions, answers, currentIndex, setCurrentIndex,
               className="px-6 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold">Next</button>
           ) : null}
         </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// HANDS-ON SUB-COMPONENT
+// Shared challenge website + two-field submission (evidence + flag).
+// ============================================================
+
+function HandsOnSection({ questions, results, onSubmit }) {
+  // Hooks must run unconditionally — the empty-state return comes after them.
+  const q = questions[0];
+  const result = q ? results[q.id] : undefined;
+
+  const [sqlInput, setSqlInput] = useState(result?.submitted_input || '');
+  const [flagInput, setFlagInput] = useState(result?.submitted_flag || '');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [savedResult, setSavedResult] = useState(result || null);
+
+  if (questions.length === 0 || !q) {
+    return (
+      <div className="h-full flex items-center justify-center text-theme-muted">
+        <p>No hands-on challenges in this assessment.</p>
+      </div>
+    );
+  }
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setError('');
+    try {
+      const data = await onSubmit(q.id, sqlInput, flagInput);
+      setSavedResult((prev) => ({
+        ...(prev || {}),
+        submitted_input: sqlInput,
+        submitted_flag: (flagInput || '').trim(),
+        verified: data.verified,
+        score: data.score,
+      }));
+    } catch (err) {
+      setError(err.message || 'Failed to submit');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="h-full overflow-y-auto p-4 md:p-8">
+      <div className="max-w-4xl mx-auto">
+        {/* Challenge header */}
+        <div className="bg-theme-secondary rounded-lg p-6 mb-6">
+          <div className="flex items-start justify-between mb-3">
+            <h2 className="text-xl font-bold text-theme-primary">{q.title}</h2>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
+              <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
+              {savedResult && (
+                <span className={`text-xs px-2 py-0.5 rounded font-semibold ${savedResult.verified ? 'bg-green-900/50 text-green-300' : 'bg-yellow-900/50 text-yellow-300'}`}>
+                  {savedResult.verified ? '✓ Completed' : 'Attempted'}
+                </span>
+              )}
+            </div>
+          </div>
+          <p className="text-theme-secondary whitespace-pre-wrap text-sm">{q.description}</p>
+        </div>
+
+        {/* Challenge website — embedded when possible, open-in-new-tab otherwise */}
+        <div className="bg-theme-secondary rounded-lg overflow-hidden mb-6">
+          <div className="px-4 py-2 border-b border-theme-border flex items-center justify-between">
+            <span className="text-sm font-medium text-theme-primary">Challenge Website</span>
+            <a
+              href={q.challenge_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-blue-400 hover:text-blue-300"
+            >
+              Open in new tab ↗
+            </a>
+          </div>
+          <iframe
+            src={q.challenge_url}
+            title="Hands-on challenge"
+            className="w-full h-[480px] border-0 bg-white"
+            sandbox="allow-scripts allow-same-origin allow-forms"
+          />
+        </div>
+
+        {/* Submission form — exactly two fields */}
+        <form onSubmit={handleSubmit} className="bg-theme-secondary rounded-lg p-6">
+          <h3 className="text-lg font-bold text-theme-primary mb-4">Submit Your Solution</h3>
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-theme-primary mb-1">SQL Input Used</label>
+            <textarea
+              value={sqlInput}
+              onChange={(e) => setSqlInput(e.target.value)}
+              rows={5}
+              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono resize-y"
+              placeholder="Paste the SQL input/payload you used..."
+            />
+            <p className="text-xs text-theme-muted mt-1">
+              Stored as evidence of your approach. Not automatically verified.
+            </p>
+          </div>
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-theme-primary mb-1">Flag</label>
+            <input
+              value={flagInput}
+              onChange={(e) => setFlagInput(e.target.value)}
+              className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono"
+              placeholder="FLAG{...}"
+            />
+          </div>
+
+          {error && (
+            <p className="text-sm text-red-300 bg-red-900/30 border border-red-500 rounded px-3 py-2 mb-3">{error}</p>
+          )}
+          {savedResult && !error && (
+            <p className={`text-sm rounded px-3 py-2 mb-3 border ${savedResult.verified ? 'text-green-300 bg-green-900/30 border-green-500' : 'text-yellow-300 bg-yellow-900/30 border-yellow-500'}`}>
+              {savedResult.verified
+                ? `✓ Correct — score ${savedResult.score} / ${q.points}`
+                : '✗ Incorrect flag — score 0. You can try again.'}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={submitting}
+            className="w-full px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50"
+          >
+            {submitting ? 'Submitting...' : 'Submit Challenge'}
+          </button>
+        </form>
       </div>
     </div>
   );

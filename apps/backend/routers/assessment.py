@@ -14,7 +14,10 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
 from core.supabase import supabase_client
-from schemas.assessment import AssessmentStartRequest, AnswerSaveRequest, DescriptiveAnswerSaveRequest
+from schemas.assessment import (
+    AssessmentStartRequest, AnswerSaveRequest, DescriptiveAnswerSaveRequest,
+    HandsOnSubmitRequest,
+)
 
 router = APIRouter(prefix="/assessment", tags=["Assessment"])
 
@@ -41,6 +44,7 @@ def _get_active_config() -> dict:
         )
     config = dict(result.data[0])
     config.setdefault("descriptive_question_count", 0)
+    config.setdefault("hands_on_question_count", 0)
     return config
 
 
@@ -208,16 +212,62 @@ def _score_attempt(attempt_id: str) -> dict:
     mcq = _score_mcq(attempt_id)
     coding = _score_coding(attempt_id)
 
-    # Combined score: simple sum (MCQ + Coding)
-    # Both use raw points, no weighting — straightforward total
-    overall_score = mcq["score"] + coding["score"]
-    overall_max = mcq["max_score"] + coding["max_score"]
+    # Hands-On score: full points for every frozen challenge the candidate
+    # verified (flag correct). Unverified or unsubmitted challenges earn 0.
+    attempt_resp = (
+        supabase_client.table("assessment_attempts")
+        .select("selected_hands_on_question_ids")
+        .eq("id", attempt_id)
+        .execute()
+    )
+    hands_ids = (attempt_resp.data or [{}])[0].get("selected_hands_on_question_ids") or []
+    hands_points = {}
+    if hands_ids:
+        hq_resp = (
+            supabase_client.table("hands_on_questions")
+            .select("id, points")
+            .in_("id", hands_ids)
+            .execute()
+        )
+        hands_points = {h["id"]: int(h.get("points", 0) or 0) for h in (hq_resp.data or [])}
+
+    hands_score = 0
+    hands_max = 0
+    if hands_ids:
+        results_resp = (
+            supabase_client.table("assessment_hands_on_results")
+            .select("question_id, verified, score")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        )
+        r_map = {
+            r["question_id"]: r
+            for r in (results_resp.data or [])
+            if r.get("verified")
+        }
+        for hid in hands_ids:
+            points = hands_points.get(hid, 0)
+            hands_max += points
+            r = r_map.get(hid)
+            if r:
+                # Backend-verified score wins; fall back to stored score
+                # (they are identical — score is only ever written by this
+                # module) capped at the challenge's points.
+                stored = int(r.get("score") or 0)
+                hands_score += min(stored, points) if stored > 0 else points
+
+    # Combined score: simple sum (MCQ + Coding + Hands-On)
+    # All use raw points, no weighting — straightforward total
+    overall_score = mcq["score"] + coding["score"] + hands_score
+    overall_max = mcq["max_score"] + coding["max_score"] + hands_max
 
     supabase_client.table("assessment_attempts").update({
         "status": "scored",
         "submitted_at": _utcnow().isoformat(),
         "score": overall_score,
         "max_score": overall_max if overall_max > 0 else 1,
+        "hands_on_score": hands_score,
+        "hands_on_max_score": hands_max,
     }).eq("id", attempt_id).execute()
 
     return {
@@ -227,6 +277,8 @@ def _score_attempt(attempt_id: str) -> dict:
         "mcq_max_score": mcq["max_score"],
         "coding_score": coding["score"],
         "coding_max_score": coding["max_score"],
+        "hands_on_score": hands_score,
+        "hands_on_max_score": hands_max,
     }
 
 
@@ -265,6 +317,40 @@ def _select_descriptive_questions(
         )
     sampled = random.sample(available, descriptive_question_count)
     return [d["id"] for d in sampled]
+
+
+def _select_hands_on_questions(
+    hands_on_question_count: int,
+    domain_ids: list,
+) -> list[str]:
+    """Select Hands-On challenges for the attempt.
+
+    Only ACTIVE challenges overlapping the candidate's chosen domains are
+    eligible (same conceptual domain filtering as descriptive selection).
+    Raises 400 if fewer eligible challenges exist than requested — loud
+    failure instead of a silently invalid attempt (mirrors MCQ/descriptive).
+    """
+    if hands_on_question_count <= 0:
+        return []
+
+    resp = (
+        supabase_client.table("hands_on_questions")
+        .select("id")
+        .eq("is_active", True)
+        .overlaps("domain_ids", domain_ids)
+        .execute()
+    )
+    available = resp.data or []
+    if len(available) < hands_on_question_count:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Only {len(available)} active hands-on challenges "
+                f"available for selected domains, need {hands_on_question_count}"
+            ),
+        )
+    sampled = random.sample(available, hands_on_question_count)
+    return [h["id"] for h in sampled]
 
 
 def _select_coding_problems(
@@ -315,6 +401,7 @@ def start_assessment(
     total_mcq = config["total_questions"]
     coding_problem_count = config.get("coding_problem_count", 0)
     descriptive_question_count = config.get("descriptive_question_count", 0)
+    hands_on_question_count = config.get("hands_on_question_count", 0)
     duration_minutes = config["duration_minutes"]
     max_domains = config["max_domains"]
 
@@ -379,6 +466,20 @@ def start_assessment(
                 except HTTPException:
                     pass  # Not enough eligible questions — resume unchanged
 
+            # Hands-On resume top-up — mirrors the descriptive gap fix above.
+            # Best-effort: selection failures never block the MCQ/coding resume.
+            selected_hands = attempt.get("selected_hands_on_question_ids") or []
+            want_hands = int(config.get("hands_on_question_count", 0) or 0)
+            if want_hands > 0 and len(selected_hands) < want_hands:
+                try:
+                    top_up = _select_hands_on_questions(want_hands, domain_ids=payload.domain_ids)
+                    supabase_client.table("assessment_attempts").update({
+                        "selected_hands_on_question_ids": top_up,
+                        "total_hands_on_questions": len(top_up),
+                    }).eq("id", attempt["id"]).execute()
+                except HTTPException:
+                    pass  # Not enough eligible challenges — resume unchanged
+
             return {
                 "attempt_id": attempt["id"],
                 "total_mcq_questions": attempt["total_questions"],
@@ -386,6 +487,9 @@ def start_assessment(
                 "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
                 "selected_descriptive_question_ids": attempt.get(
                     "selected_descriptive_question_ids") or [],
+                "total_hands_on_questions": attempt.get("total_hands_on_questions", 0),
+                "selected_hands_on_question_ids": attempt.get(
+                    "selected_hands_on_question_ids") or [],
                 "duration_minutes": attempt["duration_minutes"],
                 "domain_ids": attempt.get("domain_ids", []),
                 "expires_at": attempt["expires_at"],
@@ -473,6 +577,11 @@ def start_assessment(
         descriptive_question_count, domain_ids
     )
 
+    # 7b. Select hands-on challenges (active, overlapping chosen domains)
+    selected_hands_on_ids = _select_hands_on_questions(
+        hands_on_question_count, domain_ids
+    )
+
     # 8. Create ONE combined attempt
     now = _utcnow()
     expires_at = now + timedelta(minutes=duration_minutes)
@@ -487,6 +596,8 @@ def start_assessment(
         "total_coding_problems": len(selected_coding_ids),
         "selected_descriptive_question_ids": selected_descriptive_ids,
         "total_descriptive_questions": len(selected_descriptive_ids),
+        "selected_hands_on_question_ids": selected_hands_on_ids,
+        "total_hands_on_questions": len(selected_hands_on_ids),
         "duration_minutes": duration_minutes,
         "started_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
@@ -503,6 +614,9 @@ def start_assessment(
         "total_descriptive_questions": attempt["total_descriptive_questions"],
         "selected_descriptive_question_ids": attempt.get(
             "selected_descriptive_question_ids", []),
+        "total_hands_on_questions": attempt["total_hands_on_questions"],
+        "selected_hands_on_question_ids": attempt.get(
+            "selected_hands_on_question_ids", []),
         "duration_minutes": attempt["duration_minutes"],
         "domain_ids": domain_ids,
         "expires_at": attempt["expires_at"],
@@ -590,6 +704,7 @@ def get_attempt_questions(
 
     question_ids = attempt["selected_question_ids"]
     desc_ids = attempt.get("selected_descriptive_question_ids") or []
+    hands_ids = attempt.get("selected_hands_on_question_ids") or []
 
     # Defensive: if the config asks for descriptive questions but the frozen
     # selection is empty (attempt predates the feature or a previous selection
@@ -610,6 +725,24 @@ def get_attempt_questions(
             attempt["total_descriptive_questions"] = len(top_up)
         except HTTPException:
             pass  # Not enough eligible questions — return whatever exists
+
+    # Hands-On defensive top-up — mirrors the descriptive gap fix above.
+    try:
+        config = _get_active_config()
+        want_hands = int(config.get("hands_on_question_count", 0) or 0)
+    except HTTPException:
+        want_hands = 0
+    if want_hands > 0 and len(hands_ids) < want_hands:
+        try:
+            top_up = _select_hands_on_questions(want_hands, domain_ids=attempt.get("domain_ids") or [])
+            supabase_client.table("assessment_attempts").update({
+                "selected_hands_on_question_ids": top_up,
+                "total_hands_on_questions": len(top_up),
+            }).eq("id", attempt_id).execute()
+            hands_ids = top_up
+            attempt["total_hands_on_questions"] = len(top_up)
+        except HTTPException:
+            pass  # Not enough eligible challenges — return whatever exists
 
     # Fetch MCQ questions (empty list if none selected)
     questions = []
@@ -666,17 +799,42 @@ def get_attempt_questions(
             a["question_id"]: a["answer_text"] for a in (desc_answers_resp.data or [])
         }
 
+    # Fetch hands-on challenges (metadata only — NEVER the expected flag)
+    hands_on_questions = []
+    hands_on_results = []
+    if hands_ids:
+        ho_resp = (
+            supabase_client.table("hands_on_questions")
+            .select("id, title, description, difficulty, points, challenge_type, challenge_url")
+            .in_("id", hands_ids)
+            .execute()
+        )
+        ho_map = {q["id"]: q for q in (ho_resp.data or [])}
+        hands_on_questions = [ho_map[qid] for qid in hands_ids if qid in ho_map]
+
+        # Candidate's own submissions (verified/score only — never secrets)
+        ho_results_resp = (
+            supabase_client.table("assessment_hands_on_results")
+            .select("question_id, submitted_input, submitted_flag, verified, score, started_at, completed_at")
+            .eq("attempt_id", attempt_id)
+            .execute()
+        )
+        hands_on_results = ho_results_resp.data or []
+
     # admin_remark is admin-only. Never include it in candidate responses.
     return {
         "attempt_id": attempt_id,
         "total_questions": attempt["total_questions"],
         "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
+        "total_hands_on_questions": attempt.get("total_hands_on_questions", 0),
         "duration_minutes": attempt["duration_minutes"],
         "expires_at": attempt.get("expires_at"),
         "questions": questions,
         "answers": answers_map,
         "descriptive_questions": descriptive_questions,
         "descriptive_answers": descriptive_answers_map,
+        "hands_on_questions": hands_on_questions,
+        "hands_on_results": hands_on_results,
     }
 
 
@@ -834,4 +992,112 @@ def submit_attempt(
         "total_mcq_questions": attempt["total_questions"],
         "total_coding_problems": attempt["total_coding_problems"],
         "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
+        "total_hands_on_questions": attempt.get("total_hands_on_questions", 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+
+@router.put("/attempt/{attempt_id}/hands-on")
+def submit_hands_on(
+    attempt_id: str,
+    payload: HandsOnSubmitRequest,
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Submit a Hands-On challenge result (SQL evidence + flag).
+
+    Only the flag is verified. The SQL input is stored verbatim as evidence
+    and is never parsed, executed or validated.
+
+    Verification is backend-authoritative:
+      - the challenge must belong to this attempt (frozen selection),
+      - the expected flag never leaves the backend and is compared exactly
+        after trimming surrounding whitespace,
+      - score is full question points when correct, 0 otherwise — a
+        candidate-provided score is never trusted (the schema has no such
+        field in the request at all).
+
+    Returns only {verified, score, points} — never the expected flag.
+    """
+    attempt_resp = (
+        supabase_client.table("assessment_attempts")
+        .select("*")
+        .eq("id", attempt_id)
+        .execute()
+    )
+    if not attempt_resp.data:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    attempt = attempt_resp.data[0]
+    if attempt["profile_id"] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if attempt["status"] != "in_progress":
+        raise HTTPException(status_code=400, detail="Attempt is not in progress")
+    if _is_expired(attempt):
+        _score_attempt(attempt_id)
+        raise HTTPException(status_code=400, detail="Assessment time has expired")
+
+    hands_ids = attempt.get("selected_hands_on_question_ids") or []
+    if payload.question_id not in hands_ids:
+        raise HTTPException(status_code=400, detail="Challenge not part of this attempt")
+
+    # Load the challenge server-side. expected_flag is only ever read here.
+    question_resp = (
+        supabase_client.table("hands_on_questions")
+        .select("id, points, expected_flag")
+        .eq("id", payload.question_id)
+        .execute()
+    )
+    if not question_resp.data:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    question = question_resp.data[0]
+
+    submitted_flag = (payload.submitted_flag or "").strip()
+    expected_flag = (question.get("expected_flag") or "").strip()
+    verified = bool(expected_flag) and submitted_flag == expected_flag
+    points = int(question.get("points", 0) or 0)
+    score = points if verified else 0
+
+    now = _utcnow().isoformat()
+    existing = (
+        supabase_client.table("assessment_hands_on_results")
+        .select("id, verified, score")
+        .eq("attempt_id", attempt_id)
+        .eq("question_id", payload.question_id)
+        .execute()
+    )
+
+    if existing.data:
+        prev = existing.data[0]
+        # First-correct-wins: a previously verified result is never downgraded
+        # by a later (possibly wrong) resubmission.
+        verified = verified or bool(prev.get("verified"))
+        if verified and not prev.get("verified"):
+            score = points
+        elif verified:
+            score = max(int(prev.get("score") or 0), score)
+        supabase_client.table("assessment_hands_on_results").update({
+            "submitted_input": payload.submitted_input or "",
+            "submitted_flag": submitted_flag,
+            "verified": verified,
+            "score": score,
+            "completed_at": now if verified else None,
+        }).eq("id", prev["id"]).execute()
+    else:
+        supabase_client.table("assessment_hands_on_results").insert({
+            "attempt_id": attempt_id,
+            "question_id": payload.question_id,
+            "submitted_input": payload.submitted_input or "",
+            "submitted_flag": submitted_flag,
+            "verified": verified,
+            "score": score,
+            "started_at": now,
+            "completed_at": now if verified else None,
+        }).execute()
+
+    return {
+        "status": "saved",
+        "verified": verified,
+        "score": score,
+        "points": points,
     }

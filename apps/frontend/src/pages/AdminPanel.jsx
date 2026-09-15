@@ -180,6 +180,11 @@ const AdminPanel = () => {
       setConfigError('Descriptive questions cannot be negative.');
       return;
     }
+    const hc = configForm.hands_on_question_count;
+    if (hc !== undefined && hc !== null && hc < 0) {
+      setConfigError('Hands-On questions cannot be negative.');
+      return;
+    }
 
     try {
       // Filter out undefined values so we only send changed fields
@@ -567,6 +572,12 @@ const AdminPanel = () => {
               📝 Descriptive
             </button>
             <button
+              onClick={() => navigate('/admin/hands-on')}
+              className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-semibold transition-colors"
+            >
+              🎯 Hands-On
+            </button>
+            <button
               onClick={() => navigate('/admin/coding')}
               className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-semibold transition-colors"
             >
@@ -717,6 +728,20 @@ const AdminPanel = () => {
                           />
                         </div>
                         <div>
+                          <label className="text-xs text-theme-muted mb-1 block">Hands-On Questions</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={configForm.hands_on_question_count ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
+                              setConfigForm({ ...configForm, hands_on_question_count: val });
+                            }}
+                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                            required
+                          />
+                        </div>
+                        <div>
                           <label className="text-xs text-theme-muted mb-1 block">Max Domains (1 or 2)</label>
                           <input
                             type="number"
@@ -752,7 +777,7 @@ const AdminPanel = () => {
                           </span>
                         </div>
                         <button
-                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, coding_problem_count: cfg.coding_problem_count ?? 0, descriptive_question_count: cfg.descriptive_question_count ?? 0, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
+                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, coding_problem_count: cfg.coding_problem_count ?? 0, descriptive_question_count: cfg.descriptive_question_count ?? 0, hands_on_question_count: cfg.hands_on_question_count ?? 0, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
                           className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
                         >
                           Edit
@@ -762,6 +787,7 @@ const AdminPanel = () => {
                         <span>MCQ Questions: {cfg.total_questions}</span>
                         <span>Coding Problems: {cfg.coding_problem_count ?? 0}</span>
                         <span>Descriptive: {cfg.descriptive_question_count ?? 0}</span>
+                        <span>Hands-On: {cfg.hands_on_question_count ?? 0}</span>
                         <span>Duration: {cfg.duration_minutes}m</span>
                         <span>Max Domains: {cfg.max_domains}</span>
                       </div>

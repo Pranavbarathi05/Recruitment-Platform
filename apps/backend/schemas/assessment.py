@@ -112,6 +112,69 @@ class DescriptiveAnswerSaveRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Hands-On challenges (SQL injection micro-CTF)
+# ---------------------------------------------------------------------------
+
+# Fixed challenge-type registry — mirrors the DB CHECK constraint in
+# migration 012. There is deliberately no arbitrary-execution type.
+HANDS_ON_CHALLENGE_TYPES = ["sql_injection_employee_portal"]
+HANDS_ON_DIFFICULTIES = ["easy", "medium", "hard"]
+
+
+class HandsOnCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(..., min_length=1)
+    domain_ids: list[str] = Field(default_factory=list)
+    challenge_type: str = Field(default="sql_injection_employee_portal")
+    difficulty: str = Field(default="medium")
+    points: int = Field(default=100, ge=0, le=1000)
+    challenge_url: str = Field(..., min_length=1)
+    expected_flag: str = Field(..., min_length=1, max_length=500)
+    is_active: bool = True
+
+    def model_post_init(self, __context):
+        if self.challenge_type not in HANDS_ON_CHALLENGE_TYPES:
+            raise ValueError(f"challenge_type must be one of {HANDS_ON_CHALLENGE_TYPES}")
+        if self.difficulty not in HANDS_ON_DIFFICULTIES:
+            raise ValueError(f"difficulty must be one of {HANDS_ON_DIFFICULTIES}")
+
+
+class HandsOnUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, min_length=1)
+    domain_ids: Optional[list[str]] = None
+    challenge_type: Optional[str] = None
+    difficulty: Optional[str] = None
+    points: Optional[int] = Field(None, ge=0, le=1000)
+    challenge_url: Optional[str] = Field(None, min_length=1)
+    expected_flag: Optional[str] = Field(None, min_length=1, max_length=500)
+    is_active: Optional[bool] = None
+
+    def model_post_init(self, __context):
+        if self.challenge_type is not None and self.challenge_type not in HANDS_ON_CHALLENGE_TYPES:
+            raise ValueError(f"challenge_type must be one of {HANDS_ON_CHALLENGE_TYPES}")
+        if self.difficulty is not None and self.difficulty not in HANDS_ON_DIFFICULTIES:
+            raise ValueError(f"difficulty must be one of {HANDS_ON_DIFFICULTIES}")
+
+
+class HandsOnSubmitRequest(BaseModel):
+    """Candidate submission for a Hands-On challenge.
+
+    submitted_input (the SQL payload) is stored verbatim as evidence and is
+    never parsed, executed or verified. submitted_flag is the only field
+    checked server-side.
+    """
+    question_id: str
+    submitted_input: str = Field(default="", max_length=20_000)
+    submitted_flag: str = Field(default="", max_length=500)
+
+
+class HandsOnConfigCountUpdate(BaseModel):
+    """Assessment configuration hands-on count (ge=0 — 0 preserves old behavior)."""
+    hands_on_question_count: int = Field(..., ge=0)
+
+
+# ---------------------------------------------------------------------------
 # Admin remark (private note on an assessment submission)
 # ---------------------------------------------------------------------------
 
@@ -122,3 +185,12 @@ class AdminRemarkUpdate(BaseModel):
     remark can be cleared through the same PUT endpoint.
     """
     admin_remark: Optional[str] = Field(None, max_length=10_000)
+
+
+class AssessmentConfigUpdateHandsOn(AssessmentConfigUpdate):
+    """Config update schema extended with the Hands-On count.
+
+    Subclassed (rather than editing the base) so the existing config update
+    endpoint keeps its exact behavior while gaining the new optional field.
+    """
+    hands_on_question_count: Optional[int] = Field(None, ge=0)
