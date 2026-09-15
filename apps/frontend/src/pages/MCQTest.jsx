@@ -210,6 +210,7 @@ const AssessmentWorkspace = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState(null);
   const [timeRemaining, setTimeRemaining] = useState(0);
   const [attemptData, setAttemptData] = useState(null);
 
@@ -496,16 +497,26 @@ const AssessmentWorkspace = () => {
   const handleSubmitAll = async () => {
     if (submitting) return;
     setSubmitting(true);
+    setSubmitError(null);
     try {
       const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/submit`, {
         method: 'POST', headers: getAuthHeaders(), credentials: 'include',
       });
+      // 409 = the attempt was already finalized server-side (e.g. submit ran
+      // twice, or the timer auto-submit raced a manual submit) — that is a
+      // success from the candidate's point of view.
       if (!resp.ok && resp.status !== 409) {
-        const err = await resp.json();
-        throw new Error(err.detail || 'Failed to submit');
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || `Submission failed (${resp.status})`);
       }
-    } catch { /* navigate regardless */ }
-    navigate(`/assessment/${attemptId}/submitted`);
+      navigate(`/assessment/${attemptId}/submitted`);
+    } catch (err) {
+      // NEVER navigate to the confirmation screen on a failed submit — the
+      // attempt is NOT finalized and must stay resumable. Surface the error
+      // and let the candidate retry; their answers are all still saved.
+      setSubmitError(err.message || 'Submission failed. Please try again.');
+      setSubmitting(false);
+    }
   };
 
   // ========== HELPERS ==========
@@ -605,6 +616,23 @@ const AssessmentWorkspace = () => {
           </button>
         </div>
       </div>
+
+      {/* ===== SUBMIT ERROR BANNER — attempt NOT finalized, candidate can retry ===== */}
+      {submitError && (
+        <div role="alert" className="shrink-0 bg-red-900/40 border-b border-red-500 px-6 py-2.5 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-red-200 text-sm">
+            <span className="font-bold">Submission failed:</span> {submitError}
+            {' '}— your attempt has NOT been finalized; all saved answers are kept. Please retry.
+          </p>
+          <button
+            onClick={handleSubmitAll}
+            disabled={submitting}
+            className="shrink-0 bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-semibold disabled:opacity-50"
+          >
+            {submitting ? 'Submitting…' : 'Retry submission'}
+          </button>
+        </div>
+      )}
 
       {/* ===== WORKSPACE CONTENT — fills remaining height, no overflow ===== */}
       <div className="flex-1 min-h-0 overflow-hidden">

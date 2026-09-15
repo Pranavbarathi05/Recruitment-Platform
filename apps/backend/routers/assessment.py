@@ -261,14 +261,21 @@ def _score_attempt(attempt_id: str) -> dict:
     overall_score = mcq["score"] + coding["score"] + hands_score
     overall_max = mcq["max_score"] + coding["max_score"] + hands_max
 
-    supabase_client.table("assessment_attempts").update({
+    final_update = {
         "status": "scored",
         "submitted_at": _utcnow().isoformat(),
         "score": overall_score,
         "max_score": overall_max if overall_max > 0 else 1,
-        "hands_on_score": hands_score,
-        "hands_on_max_score": hands_max,
-    }).eq("id", attempt_id).execute()
+    }
+    # Only touch the hands-on score columns when this attempt actually has
+    # hands-on challenges. Otherwise the DB defaults (0) already reflect the
+    # correct score, and databases predating migration 013 (which adds these
+    # columns) stay submittable for every non-hands-on attempt.
+    if hands_ids:
+        final_update["hands_on_score"] = hands_score
+        final_update["hands_on_max_score"] = hands_max
+
+    supabase_client.table("assessment_attempts").update(final_update).eq("id", attempt_id).execute()
 
     return {
         "score": overall_score,
@@ -982,7 +989,9 @@ def submit_attempt(
     if attempt["profile_id"] != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
     if attempt["status"] != "in_progress":
-        raise HTTPException(status_code=400, detail="Attempt already submitted")
+        # 409 Conflict, matching /assessment/start's already-completed convention:
+        # the attempt IS finalized, so this is an idempotent no-op, not a client error.
+        raise HTTPException(status_code=409, detail="Attempt already submitted")
 
     _score_attempt(attempt_id)
 

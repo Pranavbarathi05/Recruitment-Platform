@@ -67,8 +67,6 @@ PAGE_STYLE = """
       button { margin-top: 1.2rem; width: 100%; padding: .6rem; border: 0; border-radius: 5px;
                background: #2f6fdb; color: white; font-weight: bold; cursor: pointer; }
       button:hover { background: #255cb8; }
-      .banner { background: #16202e; border: 1px dashed #3c5a78; border-radius: 6px;
-                padding: .6rem .8rem; font-size: .75rem; color: #9fb6cc; margin-bottom: 1rem; }
       .success { background: #142c1b; border: 2px solid #2f9e4f; border-radius: 8px;
                  padding: 1rem 1.4rem; margin-top: 1rem; font-family: monospace; white-space: pre-wrap; }
       .error { background: #331414; border: 1px solid #a33; border-radius: 6px;
@@ -161,11 +159,6 @@ def render_login_page(message: str = "", success: dict = None, error: str = "") 
 <body>
   <div class="portal">
     <h1>Employee Portal</h1>
-    <div class="banner">
-      Objective: gain access to the administrator account and retrieve the
-      protected flag. Valid employee credentials exist, but the administrator's
-      password is not among them.
-    </div>
     <form method="POST" action="/login">
       <label for="username">Username</label>
       <input id="username" name="username" autocomplete="off" required>
@@ -189,10 +182,14 @@ class ChallengeHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
-        # The challenge is same-origin only; it needs no integration with the
-        # platform. A restrictive frame policy still lets the assessment UI
-        # embed it in an <iframe> while blocking other origins.
-        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        # NOTE: deliberately NO X-Frame-Options / CSP frame-ancestors header.
+        # The assessment UI embeds this page in an <iframe> from a different
+        # origin (the platform and the challenge always differ in port at
+        # minimum), so X-Frame-Options: SAMEORIGIN makes the browser refuse to
+        # render the frame entirely. Same-origin framing restrictions only
+        # matter when the page must not be framed elsewhere; this challenge is
+        # DESIGNED to be framed by the platform. No CORS headers are needed —
+        # CORS governs script reads across origins, not iframe rendering.
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
@@ -262,7 +259,10 @@ class ChallengeHandler(BaseHTTPRequestHandler):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Employee Portal SQLi challenge server")
     parser.add_argument("--port", type=int, default=int(os.environ.get("CHALLENGE_PORT", "8080")))
-    parser.add_argument("--host", default=os.environ.get("CHALLENGE_HOST", "127.0.0.1"))
+    # Default bind 0.0.0.0: candidate browsers reach the challenge over the
+    # LAN, so loopback-only listening breaks every machine but the server's
+    # own. Override with --host 127.0.0.1 or CHALLENGE_HOST for local testing.
+    parser.add_argument("--host", default=os.environ.get("CHALLENGE_HOST", "0.0.0.0"))
     parser.add_argument("--db", default=os.environ.get("CHALLENGE_DB", DB_PATH_DEFAULT))
     args = parser.parse_args()
 

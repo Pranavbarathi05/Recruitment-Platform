@@ -6754,6 +6754,20 @@ class TestHandsOnChallengeServer:
         assert "username" in html.lower()
         assert "password" in html.lower()
 
+    def test_homepage_send_no_frame_blocking_headers(self, challenge):
+        """The assessment UI embeds the challenge in an <iframe> from a
+        different origin (ports always differ), so X-Frame-Options or CSP
+        frame-ancestors would make the browser refuse to render the frame
+        (blank Challenge Website area). Regression guard: these headers must
+        never be sent. CORS headers are likewise unnecessary for framing.
+        """
+        from urllib.request import urlopen
+        with urlopen(f"{challenge['base']}/") as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+        assert "x-frame-options" not in headers
+        assert "content-security-policy" not in headers
+        assert "access-control-allow-origin" not in headers
+
     def test_valid_login_works(self, challenge):
         body = self._post_login(challenge["base"], "guest", "guest")
         assert "LOGIN SUCCESSFUL" in body
@@ -6786,3 +6800,153 @@ class TestHandsOnChallengeServer:
         assert all(row[1] in ("administrator", "employee", "guest") for row in rows)
         flags = [row[2] for row in rows if row[2]]
         assert len(flags) == 1  # only the admin row carries the flag
+
+
+# ============================================================
+# SUBMISSION LIFECYCLE — submit must finalize the attempt
+# ============================================================
+# Regression tests for the bug where POST .../submit 500ed against the real
+# Supabase (missing hands_on_score/hands_on_max_score columns, migration 013)
+# and the frontend masked the failure — leaving attempts in_progress and
+# resumable with a running timer even though the UI showed success.
+
+
+class TestSubmissionLifecycle:
+    """Submit finalizes the attempt server-side; completed attempts cannot resume."""
+
+    def _set_auth_override(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+
+    def _score_attempt_chains(self, mock_sb, hands_on=True):
+        """Per-table chains on the fixture mock for the submit → _score_attempt
+        query sequence (same routing style as _configure_start_mocks)."""
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        # Attempt row must satisfy BOTH the submit endpoint's full-row fetch
+        # (profile_id, status) and the inner scoring lookups (selected_* ids).
+        attempt_row = _make_attempt(status="in_progress")
+        attempt_row.update({
+            "selected_coding_problem_ids": [],
+            "total_coding_problems": 0,
+            "selected_hands_on_question_ids": [MOCK_HANDS_ID] if hands_on else [],
+        })
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": "a1", "question_id": MOCK_MCQ_1_ID, "selected_option": "A"}])
+        )
+        mcq = chains.setdefault("mcq_questions", MagicMock())
+        mcq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_MCQ_1_ID, "correct_option": "A"}])
+        )
+        att = chains.setdefault("assessment_attempts", MagicMock())
+        att.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt_row])
+        )
+
+        if hands_on:
+            hq = chains.setdefault("hands_on_questions", MagicMock())
+            hq.select.return_value.in_.return_value.execute.return_value = (
+                _make_mock_response([{"id": MOCK_HANDS_ID, "points": 100}])
+            )
+            hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+            hr.select.return_value.eq.return_value.execute.return_value = (
+                _make_mock_response([{"question_id": MOCK_HANDS_ID, "verified": True, "score": 100}])
+            )
+        return chains
+
+    def test_submit_finalizes_attempt_with_scored_status(self, client, mock_supabase):
+        """Successful submit writes status='scored' + submitted_at (server-side finalization)."""
+        self._set_auth_override()
+        chains = self._score_attempt_chains(mock_supabase)
+
+        response = client.post(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/submit",
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "submitted"
+
+        att = chains["assessment_attempts"]
+        # Final update call must flip the authoritative status to 'scored'
+        update_call = att.update.call_args.args[0]
+        assert update_call["status"] == "scored"
+        assert update_call["submitted_at"] is not None
+        assert update_call["hands_on_score"] == 100
+        assert update_call["hands_on_max_score"] == 100
+
+    def test_score_attempt_without_hands_on_omits_hands_columns(self, client, mock_supabase):
+        """Attempts with no hands-on selection never touch hands_on_* columns
+        (pre-hands-on rows and migrated-but-empty DBs stay compatible)."""
+        self._set_auth_override()
+        chains = self._score_attempt_chains(mock_supabase, hands_on=False)
+
+        response = client.post(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/submit",
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200, response.text
+
+        update_call = chains["assessment_attempts"].update.call_args.args[0]
+        assert update_call["status"] == "scored"
+        assert "hands_on_score" not in update_call
+        assert "hands_on_max_score" not in update_call
+
+    def test_resubmit_of_finalized_attempt_conflicts(self, client, mock_supabase):
+        """Double submit returns 409 (idempotent conflict), never resurrects the attempt."""
+        self._set_auth_override()
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([_make_attempt(status="scored")])
+        )
+
+        response = client.post(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/submit",
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 409
+        assert "already submitted" in response.json()["detail"]
+
+    def test_started_after_submission_is_blocked(self, client, mock_supabase):
+        """POST /assessment/start after a scored attempt → 409 (no silent resume)."""
+        self._set_auth_override()
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, descriptive_count=0, hands_on_count=0)
+        # A scored attempt already exists for this candidate
+        mock_supabase._table_chains["assessment_attempts"] \
+            .select.return_value.eq.return_value.in_.return_value.execute.return_value = (
+                _make_mock_response([{"id": MOCK_ATTEMPT_ID, "status": "scored"}]))
+
+        response = client.post(
+            "/assessment/start",
+            json={"domain_ids": [MOCK_DOMAIN_1_ID]},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 409
+        assert "already completed" in response.json()["detail"]
+
+    def test_answer_save_rejected_after_finalization(self, client, mock_supabase):
+        """Candidate cannot keep answering a scored attempt (PUT answers → 400)."""
+        self._set_auth_override()
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([_make_attempt(status="scored")])
+        )
+
+        response = client.put(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/answers",
+            json={"question_id": MOCK_MCQ_1_ID, "selected_option": "A"},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 400
+        assert "not in progress" in response.json()["detail"]

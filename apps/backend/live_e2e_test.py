@@ -188,6 +188,7 @@ def main():
         sys.exit(1)
     print("Synthetic users created (profile+candidate via trigger).")
 
+    ho_id = None
     try:
         # ============================================================
         # 3. Login through the REAL HTTP API
@@ -207,7 +208,8 @@ def main():
         # 4. Config round-trip
         # ============================================================
         r = admin_s.put(f"{BASE}/admin/config/{cfg_id}",
-                        json={"descriptive_question_count": 1})
+                        json={"descriptive_question_count": 1,
+                              "hands_on_question_count": 1})
         check("PUT config descriptive_question_count=1", r.status_code == 200,
               r.text[:150] if r.status_code != 200 else "")
         r = admin_s.get(f"{BASE}/admin/config")
@@ -231,6 +233,9 @@ def main():
               str(start.get("total_descriptive_questions")))
         check("start has selected_descriptive_question_ids",
               bool(start.get("selected_descriptive_question_ids")))
+        check("start total_hands_on_questions == 0 (no challenge exists yet)",
+              start.get("total_hands_on_questions") == 0,
+              str(start.get("total_hands_on_questions")))
 
         db_attempt = (sb.table("assessment_attempts").select("*")
                       .eq("id", attempt_id).execute().data[0])
@@ -308,109 +313,12 @@ def main():
               r.text[:150] if r.status_code != 200 else "")
         check("resume keeps total_descriptive_questions == 1",
               r.json().get("total_descriptive_questions") == 1)
+        check("resume keeps total_hands_on_questions == 1",
+              r.json().get("total_hands_on_questions") == 1,
+              str(r.json().get("total_hands_on_questions")))
 
         # ============================================================
-        # 10. Submit
-        # ============================================================
-        r = cand_s.post(f"{BASE}/assessment/attempt/{attempt_id}/submit")
-        check("submit", r.status_code == 200,
-              r.text[:150] if r.status_code != 200 else "")
-        check("submit reports total_descriptive_questions == 1",
-              r.json().get("total_descriptive_questions") == 1,
-              str(r.json().get("total_descriptive_questions")))
-
-        # ============================================================
-        # 11. Candidate must NOT read/write remark (security)
-        # ============================================================
-        base = f"{BASE}/admin/assessments/{attempt_id}/remark"
-        r = cand_s.get(base)
-        check("candidate GET remark rejected", r.status_code in (401, 403),
-              str(r.status_code))
-        r = cand_s.put(base, json={"admin_remark": "hax"})
-        check("candidate PUT remark rejected", r.status_code in (401, 403),
-              str(r.status_code))
-        r = cand_s.delete(base)
-        check("candidate DELETE remark rejected", r.status_code in (401, 403),
-              str(r.status_code))
-
-        # ============================================================
-        # 12. Admin remark CRUD over real HTTP
-        # ============================================================
-        r = admin_s.get(base)
-        check("admin GET remark (empty)",
-              r.status_code == 200 and r.json().get("admin_remark") is None,
-              r.text[:100] if r.status_code != 200 else "")
-        r = admin_s.put(base, json={"admin_remark": "Strong candidate — live E2E"})
-        check("admin PUT remark", r.status_code == 200,
-              r.text[:150] if r.status_code != 200 else "")
-        r = admin_s.get(base)
-        check("admin GET remark returns saved text",
-              r.json().get("admin_remark") == "Strong candidate — live E2E")
-        r = admin_s.put(base, json={"admin_remark": "Edited — live E2E"})
-        check("admin PUT remark (edit)", r.status_code == 200)
-        r = admin_s.get(base)
-        check("edit persisted",
-              r.json().get("admin_remark") == "Edited — live E2E")
-        r = admin_s.delete(base)
-        check("admin DELETE remark", r.status_code == 200)
-        r = admin_s.delete(base)
-        check("DELETE is idempotent", r.status_code == 200)
-        r = admin_s.get(base)
-        check("remark cleared", r.json().get("admin_remark") is None)
-
-        # ============================================================
-        # 13. Submissions list has_admin_remark flag
-        # ============================================================
-        admin_s.put(base, json={"admin_remark": "Flag for review"})
-        r = admin_s.get(f"{BASE}/admin/assessments/submissions")
-        rows = r.json()
-        mine = [x for x in rows if x.get("attempt_id") == attempt_id]
-        check("submissions list includes attempt", len(mine) == 1,
-              f"rows={len(rows)}")
-        if mine:
-            check("has_admin_remark true when remark set",
-                  bool(mine[0].get("admin_remark")),
-                  repr(mine[0].get("admin_remark"))[:60])
-            check("submissions list leaks no remark to unauthenticated",
-                  True)  # trivially true — list itself is admin-gated
-        else:
-            check("has_admin_remark true when remark set", False,
-                  "attempt missing from list")
-        admin_s.delete(base)
-        r = admin_s.get(f"{BASE}/admin/assessments/submissions")
-        rows = r.json()
-        mine = [x for x in rows if x.get("attempt_id") == attempt_id]
-        check("admin_remark null after clear",
-              bool(mine) and mine[0].get("admin_remark") is None)
-
-        # ============================================================
-        # 14. Admin responses include descriptive results
-        # ============================================================
-        r = admin_s.get(f"{BASE}/admin/assessments/{attempt_id}/results")
-        check("admin GET results", r.status_code == 200,
-              r.text[:150] if r.status_code != 200 else "")
-        results = r.json()
-        dres = results.get("descriptive_results") or []
-        check("admin results include descriptive_results",
-              len(dres) == 1 and dres[0]["question_id"] == dq0["id"],
-              str(len(dres)))
-        check("admin results carry answer_text",
-              dres and dres[0]["answer_text"] == within,
-              repr(dres[0].get("answer_text"))[:60] if dres else "missing")
-        check("admin results carry answered_at",
-              bool(dres and dres[0].get("answered_at")))
-        check("admin results carry word_limit metadata",
-              dres and dres[0].get("word_limit") == dq0.get("word_limit"))
-        check("admin results carry image_url metadata",
-              dres and dres[0].get("image_url") == dq0.get("image_url"))
-        check("admin results response has no admin_remark",
-              "admin_remark" not in json.dumps(results))
-        r = cand_s.get(f"{BASE}/admin/assessments/{attempt_id}/results")
-        check("candidate rejected from admin results", r.status_code in (401, 403),
-              str(r.status_code))
-
-        # ============================================================
-        # 14b. HANDS-ON: challenge server + submission round-trip
+        # 9.5. HANDS-ON (pre-submit): challenge server + SQLi + flag round-trip
         # ============================================================
         import importlib.util
         cs_spec = importlib.util.spec_from_file_location(
@@ -511,44 +419,158 @@ def main():
                   and ho_rows[0]["verified"] is True and ho_rows[0]["score"] == 100,
                   str(len(ho_rows)))
 
-            # Admin view shows the hands-on response (evidence + verdict, no secret)
-            r = admin_s.get(f"{BASE}/admin/assessments/{attempt_id}/results")
-            ho_results = (r.json().get("hands_on_results") or [])
-            check("admin results include hands-on response", len(ho_results) == 1,
-                  str(len(ho_results)))
-            if ho_results:
-                check("admin sees submitted SQL input",
-                      ho_results[0].get("submitted_input") == "' OR 1=1 --")
-                check("admin sees submitted flag + verification",
-                      ho_results[0].get("submitted_flag") == discovered_flag
-                      and ho_results[0].get("verified") is True)
-                check("admin results carry no expected_flag",
-                      "expected_flag" not in json.dumps(r.json()))
-
-            # Candidate cannot read the challenge table directly (RLS/grants)
-            r = cand_s.get(f"{BASE}/admin/hands-on-questions")
-            check("candidate rejected from admin hands-on API",
-                  r.status_code in (401, 403), str(r.status_code))
-
-            # Admin reset clears the hands-on result
-            r = admin_s.post(f"{BASE}/admin/assessments/{attempt_id}/reset")
-            check("admin reset request ok", r.status_code == 200,
-                  r.text[:120] if r.status_code != 200 else "")
-            ho_rows_after = (sb.table("assessment_hands_on_results")
-                             .select("*").eq("attempt_id", attempt_id).execute().data)
-            check("reset cleared hands-on result", len(ho_rows_after) == 0,
-                  str(len(ho_rows_after)))
         finally:
             cs_proc.terminate()
             try:
                 os.remove(cs_db)
             except OSError:
                 pass
-            if ho_id:
-                try:
-                    admin_s.delete(f"{BASE}/admin/hands-on-questions/{ho_id}")
-                except Exception:
-                    pass
+
+
+        # ============================================================
+        # 10. Submit
+        # ============================================================
+        r = cand_s.post(f"{BASE}/assessment/attempt/{attempt_id}/submit")
+        check("submit", r.status_code == 200,
+              r.text[:150] if r.status_code != 200 else "")
+        check("submit reports total_descriptive_questions == 1",
+              r.json().get("total_descriptive_questions") == 1,
+              str(r.json().get("total_descriptive_questions")))
+        check("submit reports total_hands_on_questions == 1",
+              r.json().get("total_hands_on_questions") == 1,
+              str(r.json().get("total_hands_on_questions")))
+
+        # ============================================================
+        # 10b. Submitted attempt is FINALIZED: no resume, no re-answer
+        # ============================================================
+        r = cand_s.post(f"{BASE}/assessment/start",
+                        json={"domain_ids": dq_domains})
+        check("start after submit blocked (409)", r.status_code == 409,
+              f"{r.status_code} {r.text[:120]}")
+        r = cand_s.put(f"{BASE}/assessment/attempt/{attempt_id}/answers",
+                       json={"question_id": (qs.get("questions") or [{}])[0].get("id"),
+                             "selected_option": "B"})
+        check("answer save after submit rejected (400)", r.status_code == 400,
+              str(r.status_code))
+
+        # ============================================================
+        # 11. Candidate must NOT read/write remark (security)
+        # ============================================================
+        base = f"{BASE}/admin/assessments/{attempt_id}/remark"
+        r = cand_s.get(base)
+        check("candidate GET remark rejected", r.status_code in (401, 403),
+              str(r.status_code))
+        r = cand_s.put(base, json={"admin_remark": "hax"})
+        check("candidate PUT remark rejected", r.status_code in (401, 403),
+              str(r.status_code))
+        r = cand_s.delete(base)
+        check("candidate DELETE remark rejected", r.status_code in (401, 403),
+              str(r.status_code))
+
+        # ============================================================
+        # 12. Admin remark CRUD over real HTTP
+        # ============================================================
+        r = admin_s.get(base)
+        check("admin GET remark (empty)",
+              r.status_code == 200 and r.json().get("admin_remark") is None,
+              r.text[:100] if r.status_code != 200 else "")
+        r = admin_s.put(base, json={"admin_remark": "Strong candidate — live E2E"})
+        check("admin PUT remark", r.status_code == 200,
+              r.text[:150] if r.status_code != 200 else "")
+        r = admin_s.get(base)
+        check("admin GET remark returns saved text",
+              r.json().get("admin_remark") == "Strong candidate — live E2E")
+        r = admin_s.put(base, json={"admin_remark": "Edited — live E2E"})
+        check("admin PUT remark (edit)", r.status_code == 200)
+        r = admin_s.get(base)
+        check("edit persisted",
+              r.json().get("admin_remark") == "Edited — live E2E")
+        r = admin_s.delete(base)
+        check("admin DELETE remark", r.status_code == 200)
+        r = admin_s.delete(base)
+        check("DELETE is idempotent", r.status_code == 200)
+        r = admin_s.get(base)
+        check("remark cleared", r.json().get("admin_remark") is None)
+
+        # ============================================================
+        # 13. Submissions list has_admin_remark flag
+        # ============================================================
+        admin_s.put(base, json={"admin_remark": "Flag for review"})
+        r = admin_s.get(f"{BASE}/admin/assessments/submissions")
+        rows = r.json()
+        mine = [x for x in rows if x.get("attempt_id") == attempt_id]
+        check("submissions list includes attempt", len(mine) == 1,
+              f"rows={len(rows)}")
+        if mine:
+            check("has_admin_remark true when remark set",
+                  bool(mine[0].get("admin_remark")),
+                  repr(mine[0].get("admin_remark"))[:60])
+            check("submissions list leaks no remark to unauthenticated",
+                  True)  # trivially true — list itself is admin-gated
+        else:
+            check("has_admin_remark true when remark set", False,
+                  "attempt missing from list")
+        admin_s.delete(base)
+        r = admin_s.get(f"{BASE}/admin/assessments/submissions")
+        rows = r.json()
+        mine = [x for x in rows if x.get("attempt_id") == attempt_id]
+        check("admin_remark null after clear",
+              bool(mine) and mine[0].get("admin_remark") is None)
+
+        # ============================================================
+        # 14. Admin responses include descriptive results
+        # ============================================================
+        r = admin_s.get(f"{BASE}/admin/assessments/{attempt_id}/results")
+        check("admin GET results", r.status_code == 200,
+              r.text[:150] if r.status_code != 200 else "")
+        results = r.json()
+        dres = results.get("descriptive_results") or []
+        check("admin results include descriptive_results",
+              len(dres) == 1 and dres[0]["question_id"] == dq0["id"],
+              str(len(dres)))
+        check("admin results carry answer_text",
+              dres and dres[0]["answer_text"] == within,
+              repr(dres[0].get("answer_text"))[:60] if dres else "missing")
+        check("admin results carry answered_at",
+              bool(dres and dres[0].get("answered_at")))
+        check("admin results carry word_limit metadata",
+              dres and dres[0].get("word_limit") == dq0.get("word_limit"))
+        check("admin results carry image_url metadata",
+              dres and dres[0].get("image_url") == dq0.get("image_url"))
+        check("admin results response has no admin_remark",
+              "admin_remark" not in json.dumps(results))
+        r = cand_s.get(f"{BASE}/admin/assessments/{attempt_id}/results")
+        check("candidate rejected from admin results", r.status_code in (401, 403),
+              str(r.status_code))
+
+        # Hands-On response visible to admin (evidence + verdict, no secret)
+        ho_results = (results.get("hands_on_results") or [])
+        check("admin results include hands-on response", len(ho_results) == 1,
+              str(len(ho_results)))
+        if ho_results:
+            check("admin sees submitted SQL input",
+                  ho_results[0].get("submitted_input") == "' OR 1=1 --")
+            check("admin sees submitted flag + verification",
+                  ho_results[0].get("submitted_flag") == discovered_flag
+                  and ho_results[0].get("verified") is True)
+            check("admin results carry no expected_flag",
+                  "expected_flag" not in json.dumps(results))
+
+        # ============================================================
+        # 14b. HANDS-ON: post-submit security + reset semantics
+        # ============================================================
+        r = cand_s.get(f"{BASE}/admin/hands-on-questions")
+        check("candidate rejected from admin hands-on API",
+              r.status_code in (401, 403), str(r.status_code))
+
+        # Admin reset clears the hands-on result
+        r = admin_s.post(f"{BASE}/admin/assessments/{attempt_id}/reset")
+        check("admin reset request ok", r.status_code == 200,
+              r.text[:120] if r.status_code != 200 else "")
+        ho_rows_after = (sb.table("assessment_hands_on_results")
+                         .select("*").eq("attempt_id", attempt_id).execute().data)
+        check("reset cleared hands-on result", len(ho_rows_after) == 0,
+              str(len(ho_rows_after)))
 
         # ============================================================
         # 14c. Auth sanity for both sessions
@@ -579,7 +601,9 @@ def main():
                 sb.table("assessment_attempts").delete().eq("profile_id", pid).execute()
             sb.auth.admin.delete_user(cand_uid)
             sb.auth.admin.delete_user(admin_uid)
-            print("Synthetic users + attempts deleted.")
+            if ho_id:
+                sb.table("hands_on_questions").delete().eq("id", ho_id).execute()
+            print("Synthetic users + attempts + challenge deleted.")
         except Exception as e:
             print(f"CLEANUP WARNING: {e}")
         if backend_proc is not None:
