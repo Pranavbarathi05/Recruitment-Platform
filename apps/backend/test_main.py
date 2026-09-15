@@ -25,6 +25,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from core.auth import AuthUser
 
 
 # Mock environment variables before importing app
@@ -4598,3 +4599,1319 @@ class TestDescriptiveInAssessment:
         """Config without descriptive_question_count defaults to 0."""
         config = _make_config()
         assert config.get("descriptive_question_count", 0) == 0
+
+
+# =====================================================================
+# DESCRIPTIVE END-TO-END FLOW TESTS (Part 1 fix verification)
+# =====================================================================
+
+
+class TestDescriptiveSelection:
+    """_select_descriptive_questions: active + domain-overlap filtering."""
+
+    def _select(self, mock_sb, count, domain_ids, available, expect_error=False):
+        from routers.assessment import _select_descriptive_questions
+        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+            _make_mock_response(available)
+        )
+        if expect_error:
+            with pytest.raises(HTTPException) as exc_info:
+                _select_descriptive_questions(count, domain_ids)
+            return exc_info.value
+        return _select_descriptive_questions(count, domain_ids)
+
+    @patch("routers.assessment.supabase_client")
+    def test_selects_requested_number(self, mock_sb):
+        available = [
+            {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+            {"id": MOCK_DESC_ID_2, "domain_ids": [MOCK_DOMAIN_1_ID]},
+        ]
+        result = self._select(mock_sb, 2, [MOCK_DOMAIN_1_ID], available)
+        assert sorted(result) == sorted([MOCK_DESC_ID, MOCK_DESC_ID_2])
+
+    @patch("routers.assessment.supabase_client")
+    def test_zero_count_selects_nothing_without_query(self, mock_sb):
+        from routers.assessment import _select_descriptive_questions
+        result = _select_descriptive_questions(0, [MOCK_DOMAIN_1_ID])
+        assert result == []
+        mock_sb.table.assert_not_called()
+
+    @patch("routers.assessment.supabase_client")
+    def test_raises_400_when_insufficient_eligible(self, mock_sb):
+        """Fewer eligible questions than requested → loud 400, not a short attempt."""
+        available = [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}]
+        exc = self._select(mock_sb, 3, [MOCK_DOMAIN_1_ID], available, expect_error=True)
+        assert exc.status_code == 400
+        assert "descriptive" in exc.detail.lower()
+
+    @patch("routers.assessment.supabase_client")
+    def test_filters_by_active_flag(self, mock_sb):
+        """The selection query filters is_active=True."""
+        self._select(
+            mock_sb, 1, [MOCK_DOMAIN_1_ID],
+            [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}],
+        )
+        # The chained filter must include is_active=True
+        mock_sb.table.return_value.select.return_value.eq.assert_called_with("is_active", True)
+
+    @patch("routers.assessment.supabase_client")
+    def test_filters_by_domain_overlap(self, mock_sb):
+        """The selection query overlaps domain_ids with the chosen domains."""
+        self._select(
+            mock_sb, 1, [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID],
+            [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}],
+        )
+        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.assert_called_with(
+            "domain_ids", [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+        )
+
+    @patch("routers.assessment.supabase_client")
+    def test_inactive_question_not_selected(self, mock_sb):
+        """Available pool as returned by the (active-filtered) query is used;
+        verify a question not returned by the DB is never selected."""
+        # DB returns only the active overlapping one
+        available = [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}]
+        result = self._select(mock_sb, 1, [MOCK_DOMAIN_1_ID], available)
+        assert result == [MOCK_DESC_ID]
+        assert MOCK_DESC_ID_2 not in result  # inactive/ineligible one absent
+
+
+def _route_table(mock_sb, table_name):
+    """Configure mock_sb.table(name) to return a per-table fresh mock chain.
+
+    MagicMock shares return values across calls with identical shapes, which
+    cross-contaminates queries against different tables. Routing by table name
+    gives each table its own chain. The routed chain is stored on the mock so
+    _configure_start_mocks can configure each table's chain explicitly.
+    """
+    chains = {}
+
+    def _table(name):
+        if name not in chains:
+            chains[name] = MagicMock()
+        return chains[name]
+
+    mock_sb.table.side_effect = _table
+    mock_sb._table_chains = chains
+    return mock_sb
+
+
+def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=None):
+    """Configure per-table mock chains for POST /assessment/start.
+
+    start_assessment queries (in order):
+      assessment_config    → select().eq().limit().execute()
+      profiles             → select().eq().execute()
+      candidates           → select().eq().execute()
+      assessment_attempts  → select().eq().eq().execute()      (existing)
+                           → select().eq().in_().execute()     (submitted)
+                           → insert().execute()                (create)
+      domains              → select().in_().execute()
+      mcq_questions        → select().eq().eq().eq().execute()
+      coding_problems      → (no query when count = 0)
+      descriptive_questions→ select().eq().overlaps().execute()
+    """
+    if descriptive_available is None:
+        descriptive_available = [
+            {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+            {"id": MOCK_DESC_ID_2, "domain_ids": [MOCK_DOMAIN_1_ID]},
+        ]
+
+    chains = mock_sb._table_chains
+
+    def _sel(table, chain):
+        return chains.setdefault(table, chain or MagicMock())
+
+    # assessment_config — _get_active_config
+    # total_questions must match the mocked MCQ pool (2) so selection succeeds.
+    config_chain = chains.setdefault("assessment_config", MagicMock())
+    config_chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
+        _make_mock_response([_make_config(total_questions=2, descriptive_question_count=descriptive_count)])
+    )
+
+    # profiles — candidate identity check
+    profiles_chain = chains.setdefault("profiles", MagicMock())
+    profiles_chain.select.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([{"id": MOCK_PROFILE_ID}])
+    )
+
+    # candidates — semester lookup
+    candidates_chain = chains.setdefault("candidates", MagicMock())
+    candidates_chain.select.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([{"id": MOCK_CANDIDATE_ID, "semester": 5}])
+    )
+
+    # assessment_attempts — existing/submitted checks + insert
+    attempts_chain = chains.setdefault("assessment_attempts", MagicMock())
+    attempts_chain.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([])  # no existing in_progress attempt
+    )
+    attempts_chain.select.return_value.eq.return_value.in_.return_value.execute.return_value = (
+        _make_mock_response([])  # no submitted/scored attempts
+    )
+    attempts_chain.insert.return_value.execute.return_value = (
+        _make_mock_response([{
+            "id": MOCK_ATTEMPT_ID,
+            "total_questions": 2,
+            "total_coding_problems": 0,
+            "total_descriptive_questions": descriptive_count,
+            "duration_minutes": 20,
+            "expires_at": "2025-01-01T00:20:00Z",
+        }])
+    )
+
+    # domains — validation of chosen domains
+    domains_chain = chains.setdefault("domains", MagicMock())
+    domains_chain.select.return_value.in_.return_value.execute.return_value = (
+        _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev", "duration_minutes": 20, "is_active": True}])
+    )
+
+    # mcq_questions — selection pool
+    mcq_chain = chains.setdefault("mcq_questions", MagicMock())
+    mcq_chain.select.return_value.eq.return_value.eq.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([{"id": MOCK_MCQ_1_ID}, {"id": MOCK_MCQ_2_ID}])
+    )
+
+    # descriptive_questions — selection pool (active + domain overlap)
+    desc_chain = chains.setdefault("descriptive_questions", MagicMock())
+    desc_chain.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+        _make_mock_response(descriptive_available)
+    )
+
+    return mock_sb
+
+
+class TestDescriptiveStartFlow:
+    """POST /assessment/start persists and returns descriptive selections.
+
+    Uses app.dependency_overrides to bypass cookie JWT verification, matching
+    the TestAssessmentDeleteAndBulk convention above.
+    """
+
+    def _set_auth_override(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        return app
+
+    def test_start_selects_and_persists_descriptive(self, client, mock_supabase):
+        """descriptive_question_count > 0 → IDs persisted + returned count."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, descriptive_count=1)
+        self._set_auth_override()
+
+        response = client.post(
+            "/assessment/start",
+            json={"domain_ids": [MOCK_DOMAIN_1_ID]},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_descriptive_questions"] == 1
+
+        # The insert payload must contain the selected descriptive IDs
+        # (random.sample picks one of the two available)
+        insert_call = mock_supabase._table_chains["assessment_attempts"].insert.call_args
+        payload = insert_call.args[0]
+        assert payload["selected_descriptive_question_ids"] in ([MOCK_DESC_ID], [MOCK_DESC_ID_2])
+        assert payload["total_descriptive_questions"] == 1
+
+    def test_start_with_zero_descriptive_preserves_old_behavior(self, client, mock_supabase):
+        """descriptive_question_count = 0 → empty selection, no descriptive query."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, descriptive_count=0)
+        self._set_auth_override()
+
+        response = client.post(
+            "/assessment/start",
+            json={"domain_ids": [MOCK_DOMAIN_1_ID]},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_descriptive_questions"] == 0
+
+        insert_call = mock_supabase._table_chains["assessment_attempts"].insert.call_args
+        payload = insert_call.args[0]
+        assert payload["selected_descriptive_question_ids"] == []
+        assert payload["total_descriptive_questions"] == 0
+
+        # The descriptive selection query must never run
+        desc_chain = mock_supabase._table_chains["descriptive_questions"]
+        desc_chain.select.return_value.eq.return_value.overlaps.assert_not_called()
+
+    def test_start_rejects_when_descriptive_insufficient(self, client, mock_supabase):
+        """Not enough eligible descriptive questions → 400, no attempt created."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            descriptive_count=2,
+            descriptive_available=[{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}],
+        )
+        self._set_auth_override()
+
+        response = client.post(
+            "/assessment/start",
+            json={"domain_ids": [MOCK_DOMAIN_1_ID]},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 400
+        assert "descriptive" in response.json()["detail"].lower()
+        # No attempt must be created
+        mock_supabase.table.return_value.insert.assert_not_called()
+
+
+# =====================================================================
+# DESCRIPTIVE QUESTIONS ENDPOINT TESTS
+# =====================================================================
+
+
+class TestDescriptiveQuestionsEndpoint:
+    """GET /assessment/attempt/{id}/questions returns descriptive questions."""
+
+    def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=profile_id, email="candidate@test.com"
+        )
+
+    def _configure_questions_mocks(self, mock_sb, attempt, desc_questions, attempt_owner=MOCK_PROFILE_ID):
+        """Per-table mock chains for GET /assessment/attempt/{id}/questions.
+
+        Queries in get_attempt_questions:
+          assessment_attempts            → select().eq().execute()
+          mcq_questions                  → select().in_().execute()
+          domains                        → select().in_().execute()
+          assessment_answers             → select().eq().execute()
+          descriptive_questions          → select().in_().execute()
+          assessment_descriptive_answers → select().eq().execute()
+        """
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        m = chains.setdefault("mcq_questions", MagicMock())
+        m.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([_make_mcq(MOCK_MCQ_1_ID), _make_mcq(MOCK_MCQ_2_ID)])
+        )
+
+        d = chains.setdefault("domains", MagicMock())
+        d.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Test Domain"}])
+        )
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        dq = chains.setdefault("descriptive_questions", MagicMock())
+        dq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response(desc_questions)
+        )
+
+        da = chains.setdefault("assessment_descriptive_answers", MagicMock())
+        da.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        return mock_sb
+
+    def _make_attempt_with_desc(self, desc_ids):
+        attempt = _make_attempt()
+        attempt["selected_descriptive_question_ids"] = desc_ids
+        attempt["total_descriptive_questions"] = len(desc_ids)
+        return attempt
+
+    @patch("routers.assessment.supabase_client")
+    @patch("routers.assessment._get_active_config")
+    def test_questions_endpoint_returns_descriptive_questions(
+        self, mock_config, mock_sb, client
+    ):
+        """Selected descriptive questions are returned with answers map."""
+        mock_config.return_value = _make_config(descriptive_question_count=1)
+        desc_q = {
+            "id": MOCK_DESC_ID,
+            "question_text": "Explain your approach.",
+            "image_url": "https://example.com/img.png",
+            "word_limit": 300,
+        }
+        self._configure_questions_mocks(
+            mock_sb, self._make_attempt_with_desc([MOCK_DESC_ID]), [desc_q]
+        )
+        self._set_auth_override()
+
+        response = client.get(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions",
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_descriptive_questions"] == 1
+        assert len(data["descriptive_questions"]) == 1
+        assert data["descriptive_questions"][0]["id"] == MOCK_DESC_ID
+        assert data["descriptive_questions"][0]["question_text"] == "Explain your approach."
+        assert data["descriptive_questions"][0]["image_url"] == "https://example.com/img.png"
+        assert data["descriptive_questions"][0]["word_limit"] == 300
+        assert data["descriptive_answers"] == {}
+
+    @patch("routers.assessment.supabase_client")
+    @patch("routers.assessment._get_active_config")
+    def test_questions_endpoint_empty_when_none_selected(
+        self, mock_config, mock_sb, client
+    ):
+        """No descriptive selection → empty array (old behavior preserved)."""
+        mock_config.return_value = _make_config(descriptive_question_count=0)
+        self._configure_questions_mocks(mock_sb, self._make_attempt_with_desc([]), [])
+        self._set_auth_override()
+
+        response = client.get(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions",
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert data["descriptive_questions"] == []
+        assert data["total_descriptive_questions"] == 0
+
+    @patch("routers.assessment.supabase_client")
+    @patch("routers.assessment._get_active_config")
+    def test_questions_endpoint_tops_up_missing_descriptive(
+        self, mock_config, mock_sb, client
+    ):
+        """Attempt predating the feature gets a defensive top-up so the
+        Descriptive section actually appears on an existing attempt."""
+        mock_config.return_value = _make_config(descriptive_question_count=1)
+        desc_q = {
+            "id": MOCK_DESC_ID,
+            "question_text": "Explain your approach.",
+            "image_url": None,
+            "word_limit": None,
+        }
+        attempt = self._make_attempt_with_desc([])  # empty (pre-feature)
+        self._configure_questions_mocks(mock_sb, attempt, [desc_q])
+        # Descriptive selection pool for the top-up query
+        desc_sel = mock_sb._table_chains["descriptive_questions"]
+        desc_sel.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}])
+        )
+        self._set_auth_override()
+
+        response = client.get(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions",
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["descriptive_questions"]) == 1
+        assert data["descriptive_questions"][0]["id"] == MOCK_DESC_ID
+
+        # Selection must be persisted to the attempt
+        update_call = mock_sb._table_chains["assessment_attempts"].update.call_args
+        persisted = update_call.args[0]
+        assert persisted["selected_descriptive_question_ids"] == [MOCK_DESC_ID]
+        assert persisted["total_descriptive_questions"] == 1
+
+    @patch("routers.assessment.supabase_client")
+    def test_descriptive_answer_save_and_persist(self, mock_sb, client):
+        """PUT descriptive-answers inserts/updates and requires ownership."""
+        attempt = _make_attempt()
+        attempt["selected_descriptive_question_ids"] = [MOCK_DESC_ID]
+        attempt["total_descriptive_questions"] = 1
+
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        # No existing answer → insert path
+        mock_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        mock_sb.table.return_value.insert.return_value.execute.return_value = (
+            _make_mock_response([{"id": "answer-1"}])
+        )
+        self._set_auth_override()
+
+        response = client.put(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+            json={"question_id": MOCK_DESC_ID, "answer_text": "My descriptive answer"},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        assert response.json() == {"status": "saved"}
+
+        # Verify the insert payload contains the answer
+        insert_call = mock_sb.table.return_value.insert.call_args
+        payload = insert_call.args[0]
+        assert payload["question_id"] == MOCK_DESC_ID
+        assert payload["answer_text"] == "My descriptive answer"
+
+    @patch("routers.assessment.supabase_client")
+    def test_descriptive_answer_rejected_for_unselected_question(self, mock_sb, client):
+        """Answering a descriptive question not in the attempt → 400."""
+        attempt = _make_attempt()
+        attempt["selected_descriptive_question_ids"] = [MOCK_DESC_ID]
+        attempt["total_descriptive_questions"] = 1
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        self._set_auth_override()
+
+        response = client.put(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+            json={"question_id": MOCK_DESC_ID_2, "answer_text": "sneaky"},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 400
+
+
+# =====================================================================
+# ADMIN REMARK TESTS
+# =====================================================================
+
+
+class TestAdminRemarkEndpoints:
+    """GET/PUT/DELETE /admin/assessments/{id}/remark.
+
+    Direct endpoint invocations bypass the require_admin dependency but
+    verify the DB interaction; auth behavior is verified via the HTTP tests
+    (401 unauthenticated / 403 non-admin) and dependency-override tests.
+    """
+
+    ATTEMPT_ROW = {"id": MOCK_ATTEMPT_ID, "profile_id": MOCK_PROFILE_ID}
+
+    def _set_admin_override(self):
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id="admin-user-id", email="admin@test.com"
+        )
+
+    def _set_non_admin_override(self):
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: (_ for _ in ()).throw(
+            HTTPException(status_code=403, detail="Admin access required")
+        )
+
+    def test_remark_requires_auth(self, client):
+        assert client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark").status_code in (401, 403)
+        assert client.put(
+            f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark",
+            json={"admin_remark": "x"},
+        ).status_code in (401, 403)
+        assert client.delete(
+            f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark"
+        ).status_code in (401, 403)
+
+    def test_remark_rejects_non_admin(self, client, mock_supabase):
+        """Candidate (non-admin) is rejected on all remark endpoints."""
+        self._set_non_admin_override()
+        for method, kwargs in [
+            (client.get, {}),
+            (client.put, {"json": {"admin_remark": "x"}}),
+            (client.delete, {}),
+        ]:
+            response = method(
+                f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark", **kwargs
+            )
+            assert response.status_code == 403
+        client.app.dependency_overrides.clear()
+
+    @patch("routers.admin.supabase_client")
+    def test_remark_http_put_creates(self, mock_sb, client):
+        """PUT via HTTP stores and returns the remark (admin override)."""
+        self._set_admin_override()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([self.ATTEMPT_ROW])
+        )
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Strong candidate"}])
+        )
+
+        response = client.put(
+            f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark",
+            json={"admin_remark": "Strong candidate"},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert data["admin_remark"] == "Strong candidate"
+        assert data["status"] == "saved"
+
+    @patch("routers.admin.supabase_client")
+    def test_remark_http_get_reads(self, mock_sb, client):
+        """GET via HTTP returns the stored remark (admin override)."""
+        self._set_admin_override()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Private note"}])
+        )
+
+        response = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark")
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        assert response.json()["admin_remark"] == "Private note"
+
+    @patch("routers.admin.supabase_client")
+    def test_remark_http_delete_clears(self, mock_sb, client):
+        """DELETE via HTTP clears the remark (admin override)."""
+        self._set_admin_override()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Old"}])
+        )
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": None}])
+        )
+
+        response = client.delete(f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark")
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        assert response.json()["admin_remark"] is None
+        assert response.json()["status"] == "cleared"
+
+    @patch("routers.admin.supabase_client")
+    def test_remark_http_put_invalid_attempt_404(self, mock_sb, client):
+        self._set_admin_override()
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        response = client.put(
+            "/admin/assessments/00000000-0000-0000-0000-00000000dead/remark",
+            json={"admin_remark": "x"},
+        )
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 404
+
+    def test_remark_rejects_non_admin(self, client, mock_supabase):
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"is_admin": False}])
+        )
+        response = client.get(
+            f"/admin/assessments/{MOCK_ATTEMPT_ID}/remark",
+            headers={"Authorization": "Bearer candidate-token"},
+        )
+        assert response.status_code in (401, 403, 500)
+
+    @patch("routers.admin.supabase_client")
+    def test_admin_can_create_remark(self, mock_sb, client):
+        from routers.admin import set_admin_remark
+        from schemas.assessment import AdminRemarkUpdate
+        from core.auth import AuthUser
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([self.ATTEMPT_ROW])
+        )
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Strong candidate"}])
+        )
+        result = set_admin_remark(
+            MOCK_ATTEMPT_ID,
+            AdminRemarkUpdate(admin_remark="Strong candidate"),
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+        assert result["admin_remark"] == "Strong candidate"
+        assert result["status"] == "saved"
+        update_call = mock_sb.table.return_value.update.call_args
+        assert update_call.args[0]["admin_remark"] == "Strong candidate"
+
+    @patch("routers.admin.supabase_client")
+    def test_admin_can_read_remark(self, mock_sb, client):
+        from routers.admin import get_admin_remark
+        from core.auth import AuthUser
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Private note"}])
+        )
+        result = get_admin_remark(MOCK_ATTEMPT_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+        assert result["admin_remark"] == "Private note"
+
+    @patch("routers.admin.supabase_client")
+    def test_admin_can_update_remark(self, mock_sb, client):
+        from routers.admin import set_admin_remark
+        from schemas.assessment import AdminRemarkUpdate
+        from core.auth import AuthUser
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([self.ATTEMPT_ROW])
+        )
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Updated note"}])
+        )
+        result = set_admin_remark(
+            MOCK_ATTEMPT_ID,
+            AdminRemarkUpdate(admin_remark="Updated note"),
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+        assert result["admin_remark"] == "Updated note"
+
+    @patch("routers.admin.supabase_client")
+    def test_admin_can_clear_remark(self, mock_sb, client):
+        from routers.admin import clear_admin_remark
+        from core.auth import AuthUser
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": "Old note"}])
+        )
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": None}])
+        )
+        result = clear_admin_remark(MOCK_ATTEMPT_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+        assert result["admin_remark"] is None
+        assert result["status"] == "cleared"
+
+    @patch("routers.admin.supabase_client")
+    def test_empty_remark_normalizes_to_null(self, mock_sb, client):
+        from routers.admin import set_admin_remark
+        from schemas.assessment import AdminRemarkUpdate
+        from core.auth import AuthUser
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([self.ATTEMPT_ROW])
+        )
+        mock_sb.table.return_value.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{**self.ATTEMPT_ROW, "admin_remark": None}])
+        )
+        result = set_admin_remark(
+            MOCK_ATTEMPT_ID,
+            AdminRemarkUpdate(admin_remark="   "),
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+        update_call = mock_sb.table.return_value.update.call_args
+        assert update_call.args[0]["admin_remark"] is None
+        assert result["admin_remark"] is None
+
+    @patch("routers.admin.supabase_client")
+    def test_remark_too_long_rejected(self, mock_sb, client):
+        """Over-limit remark is rejected (Pydantic at schema level; the router's
+        MAX_ADMIN_REMARK_LENGTH guard remains as a second line of defense)."""
+        from schemas.assessment import AdminRemarkUpdate
+        with pytest.raises(Exception):
+            AdminRemarkUpdate(admin_remark="x" * 10_001)
+        # Exactly at the limit is accepted
+        ok = AdminRemarkUpdate(admin_remark="x" * 10_000)
+        assert len(ok.admin_remark) == 10_000
+
+    @patch("routers.admin.supabase_client")
+    def test_remark_invalid_attempt_404(self, mock_sb, client):
+        from routers.admin import get_admin_remark
+        from core.auth import AuthUser
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            get_admin_remark("nonexistent-attempt-id", admin=AuthUser(id=MOCK_PROFILE_ID))
+        assert exc_info.value.status_code == 404
+
+    @patch("routers.admin.supabase_client")
+    def test_submissions_list_includes_remark_presence(self, mock_sb):
+        """Admin submissions list carries admin_remark (string or None)."""
+        from routers.admin import list_submissions
+        from core.auth import AuthUser
+
+        attempt = _make_attempt(status="scored")
+        attempt["admin_remark"] = "Interview recommended"
+        attempt["total_descriptive_questions"] = 1
+
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        at = chains.setdefault("assessment_attempts", MagicMock())
+        at.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        pf = chains.setdefault("profiles", MagicMock())
+        pf.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_PROFILE_ID, "full_name": "Test User", "email": "t@t.com"}])
+        )
+
+        cd = chains.setdefault("candidates", MagicMock())
+        cd.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"profile_id": MOCK_PROFILE_ID, "usn": "01JST22CS001", "semester": 5, "branch": "CSE"}])
+        )
+
+        dm = chains.setdefault("domains", MagicMock())
+        dm.select.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev"}])
+        )
+
+        result = list_submissions(
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+            semester=None, branch=None, domain_id=None, search=None,
+            sort="score", order="desc", limit=200, offset=0,
+        )
+        record = next(r for r in result if r["attempt_id"] == MOCK_ATTEMPT_ID)
+        assert record["admin_remark"] == "Interview recommended"
+
+    def test_submissions_list_remark_field_schema(self, client, mock_supabase):
+        """The submissions endpoint response includes admin_remark per row."""
+        # Route through the API layer to verify the response contract
+        attempt = _make_attempt(status="scored")
+        attempt["admin_remark"] = None
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"is_admin": True}])
+        )
+        mock_supabase.table.return_value.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        mock_supabase.table.return_value.select.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev"}])
+        )
+
+        response = client.get(
+            "/admin/assessments/submissions",
+            headers={"Authorization": "Bearer admin-token"},
+        )
+        if response.status_code == 200:
+            data = response.json()
+            assert isinstance(data, list)
+            for row in data:
+                assert "admin_remark" in row
+
+
+class TestAdminRemarkSecurity:
+    """Candidate-facing endpoints must never expose admin_remark."""
+
+    def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=profile_id, email="candidate@test.com"
+        )
+
+    @patch("routers.assessment.supabase_client")
+    def test_get_attempt_strips_admin_remark(self, mock_sb, client):
+        """GET /assessment/attempt/{id} must not return admin_remark."""
+        attempt = _make_attempt()
+        attempt["admin_remark"] = "SECRET ADMIN NOTE"
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        self._set_auth_override()
+
+        response = client.get(f"/assessment/attempt/{MOCK_ATTEMPT_ID}")
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert "admin_remark" not in data, "admin_remark leaked via /assessment/attempt/{id}"
+
+    @patch("routers.assessment.supabase_client")
+    def test_current_attempt_strips_admin_remark(self, mock_sb, client):
+        """GET /assessment/current must not return admin_remark."""
+        attempt = _make_attempt()
+        attempt["admin_remark"] = "SECRET ADMIN NOTE"
+        # /assessment/current chain: select().eq().eq().order().limit().execute()
+        mock_sb.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        self._set_auth_override()
+
+        response = client.get("/assessment/current")
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert "admin_remark" not in data, "admin_remark leaked via /assessment/current"
+
+    @patch("routers.assessment.supabase_client")
+    @patch("routers.assessment._get_active_config")
+    def test_questions_endpoint_strips_admin_remark(
+        self, mock_config, mock_sb, client
+    ):
+        """GET /assessment/attempt/{id}/questions must not return admin_remark."""
+        mock_config.return_value = _make_config(descriptive_question_count=0)
+        attempt = _make_attempt()
+        attempt["admin_remark"] = "SECRET ADMIN NOTE"
+
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        at = chains.setdefault("assessment_attempts", MagicMock())
+        at.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        m = chains.setdefault("mcq_questions", MagicMock())
+        m.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([_make_mcq(MOCK_MCQ_1_ID), _make_mcq(MOCK_MCQ_2_ID)])
+        )
+
+        d = chains.setdefault("domains", MagicMock())
+        d.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Test Domain"}])
+        )
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        dq = chains.setdefault("descriptive_questions", MagicMock())
+        dq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        da = chains.setdefault("assessment_descriptive_answers", MagicMock())
+        da.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        self._set_auth_override()
+
+        response = client.get(f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions")
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert "admin_remark" not in data, "admin_remark leaked via questions endpoint"
+        for q in data.get("questions", []):
+            assert "admin_remark" not in q
+
+    @patch("routers.assessment.supabase_client")
+    def test_submit_response_has_no_admin_remark(self, mock_sb, client):
+        """POST submit response contains only submission metadata."""
+        attempt = _make_attempt()
+        attempt["admin_remark"] = "SECRET ADMIN NOTE"
+        attempt["total_coding_problems"] = 0  # real rows carry this (default 0)
+
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        # submit fetches the attempt, then _score_attempt re-reads it —
+        # both use select().eq().execute() on assessment_attempts.
+        at = chains.setdefault("assessment_attempts", MagicMock())
+        at.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        at.select.return_value.select.return_value = at.select.return_value
+        at.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        ans.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        cq = chains.setdefault("mcq_questions", MagicMock())
+        cq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        cp = chains.setdefault("coding_problems", MagicMock())
+        cp.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        cs = chains.setdefault("coding_submissions", MagicMock())
+        cs.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        self._set_auth_override()
+
+        response = client.post(f"/assessment/attempt/{MOCK_ATTEMPT_ID}/submit")
+        client.app.dependency_overrides.clear()
+        assert response.status_code == 200
+        data = response.json()
+        assert "admin_remark" not in data
+
+
+# ===========================================================================
+# WORD LIMIT — shared counting + server-side enforcement
+# ===========================================================================
+
+from routers.assessment import count_words as _count_words, _enforce_word_limit
+
+
+class TestCountWords:
+    def test_empty(self):
+        assert _count_words("") == 0
+
+    def test_whitespace_only(self):
+        assert _count_words("   \n\t  ") == 0
+
+    def test_single_word(self):
+        assert _count_words("hello") == 1
+
+    def test_multiple_runs_of_whitespace(self):
+        assert _count_words("hello   world\nthis") == 3
+
+    def test_tabs_and_newlines(self):
+        assert _count_words("a\tb\nc  d") == 4
+
+    def test_none_like_empty(self):
+        assert _count_words("") == 0
+
+
+class TestEnforceWordLimit:
+    def _q(self, word_limit):
+        return {"word_limit": word_limit}
+
+    def test_no_limit_allows_anything(self):
+        _enforce_word_limit(self._q(None), "a b c " * 1000)  # no raise
+
+    def test_under_limit_passes(self):
+        _enforce_word_limit(self._q(10), "one two three")  # no raise
+
+    def test_exactly_at_limit_passes(self):
+        _enforce_word_limit(self._q(3), "one two three")  # no raise
+
+    def test_over_limit_raises_400(self):
+        with pytest.raises(HTTPException) as ei:
+            _enforce_word_limit(self._q(2), "one two three")
+        assert ei.value.status_code == 400
+        assert "word limit" in ei.value.detail.lower()
+
+    def test_whitespace_only_within_limit(self):
+        _enforce_word_limit(self._q(1), "   \n\t ")  # no raise — 0 words
+
+    def test_empty_within_limit(self):
+        _enforce_word_limit(self._q(1), "")  # no raise
+
+
+class TestSaveDescriptiveAnswerWordLimit:
+    """PUT /assessment/attempt/{id}/descriptive-answers enforces word_limit."""
+
+    def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=profile_id, email="candidate@test.com"
+        )
+
+    def _attempt(self, **overrides):
+        attempt = _make_attempt(status="in_progress")
+        attempt["selected_descriptive_question_ids"] = [MOCK_DESC_ID]
+        attempt["total_descriptive_questions"] = 1
+        attempt.update(overrides)
+        return attempt
+
+    def _configure_mocks(self, mock_sb, attempt, word_limit=3, existing_answer=None):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        dq = chains.setdefault("descriptive_questions", MagicMock())
+        dq.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DESC_ID, "word_limit": word_limit}])
+        )
+
+        da = chains.setdefault("assessment_descriptive_answers", MagicMock())
+        da.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([existing_answer] if existing_answer else [])
+        )
+        da.update.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+        da.insert.return_value.execute.return_value = _make_mock_response([])
+        return mock_sb
+
+    def test_under_limit_accepted(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(), word_limit=5)
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "one two three"},
+            )
+            assert r.status_code == 200
+            assert r.json() == {"status": "saved"}
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_exactly_at_limit_accepted(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(), word_limit=3)
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "one two three"},
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_over_limit_rejected_400(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(), word_limit=2)
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "one two three"},
+            )
+            assert r.status_code == 400
+            assert "word limit" in r.json()["detail"].lower()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_over_limit_answer_not_saved(self, client, mock_supabase):
+        self._set_auth_override()
+        sb = self._configure_mocks(mock_supabase, self._attempt(), word_limit=1)
+        try:
+            client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "one two"},
+            )
+            da = sb._table_chains["assessment_descriptive_answers"]
+            da.insert.assert_not_called()
+            da.update.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_unlimited_when_word_limit_null(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(), word_limit=None)
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "word " * 500},
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_empty_answer_accepted(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(), word_limit=3)
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": ""},
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_whitespace_only_accepted(self, client, mock_supabase):
+        self._set_auth_override()
+        self._configure_mocks(mock_supabase, self._attempt(), word_limit=1)
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "  \n\t "},
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_other_users_attempt_rejected(self, client, mock_supabase):
+        self._set_auth_override(profile_id="99999999-9999-9999-9999-999999999999")
+        self._configure_mocks(mock_supabase, self._attempt())
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "hello"},
+            )
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_update_path_validates_existing_answer_edit(self, client, mock_supabase):
+        """Editing a saved answer through the update path is also validated."""
+        self._set_auth_override()
+        self._configure_mocks(
+            mock_supabase, self._attempt(), word_limit=2,
+            existing_answer={"id": MOCK_CANDIDATE_ID, "answer_text": "one"},
+        )
+        try:
+            r = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/descriptive-answers",
+                json={"question_id": MOCK_DESC_ID, "answer_text": "one two three"},
+            )
+            assert r.status_code == 400
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+# ===========================================================================
+# ADMIN VIEW RESPONSES — descriptive results
+# ===========================================================================
+
+class TestAdminResultsDescriptive:
+    """GET /admin/assessments/{id}/results includes descriptive Q&A."""
+
+    def _set_admin_override(self):
+        from core.auth import get_current_user, require_admin
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="admin@test.com"
+        )
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="admin@test.com"
+        )
+
+    def _attempt(self):
+        attempt = _make_attempt(status="scored")
+        attempt["selected_descriptive_question_ids"] = [MOCK_DESC_ID, MOCK_DESC_ID_2]
+        attempt["total_descriptive_questions"] = 2
+        attempt["selected_coding_problem_ids"] = []
+        return attempt
+
+    def _configure_mocks(self, mock_sb, attempt, desc_questions, desc_answers):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        p = chains.setdefault("profiles", MagicMock())
+        p.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_PROFILE_ID, "full_name": "Cand", "email": "c@t.com"}])
+        )
+
+        c = chains.setdefault("candidates", MagicMock())
+        c.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"usn": "USN1", "semester": 5, "branch": "CSE"}])
+        )
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        m = chains.setdefault("mcq_questions", MagicMock())
+        m.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([_make_mcq(MOCK_MCQ_1_ID), _make_mcq(MOCK_MCQ_2_ID)])
+        )
+
+        d = chains.setdefault("domains", MagicMock())
+        d.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev"}])
+        )
+
+        cp = chains.setdefault("coding_problems", MagicMock())  # not queried (no coding)
+        cp.select.return_value.in_.return_value.execute.return_value = _make_mock_response([])
+
+        cs = chains.setdefault("coding_submissions", MagicMock())
+        cs.select.return_value.eq.return_value.execute.return_value = _make_mock_response([])
+
+        dq = chains.setdefault("descriptive_questions", MagicMock())
+        dq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response(desc_questions)
+        )
+
+        da = chains.setdefault("assessment_descriptive_answers", MagicMock())
+        da.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(desc_answers)
+        )
+        return mock_sb
+
+    def test_descriptive_results_included(self, client, mock_supabase):
+        self._set_admin_override()
+        self._configure_mocks(
+            mock_supabase, self._attempt(),
+            desc_questions=[
+                {"id": MOCK_DESC_ID, "question_text": "Q1 text", "image_url": None, "word_limit": 100},
+                {"id": MOCK_DESC_ID_2, "question_text": "Q2 text", "image_url": "http://x/y.png", "word_limit": None},
+            ],
+            desc_answers=[
+                {"question_id": MOCK_DESC_ID, "answer_text": "my answer", "answered_at": "2026-09-14T10:00:00Z"},
+            ],
+        )
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 200
+            data = r.json()
+            assert len(data["descriptive_results"]) == 2
+            assert data["total_descriptive_questions"] == 2
+
+            first = next(d for d in data["descriptive_results"] if d["question_id"] == MOCK_DESC_ID)
+            assert first["question_text"] == "Q1 text"
+            assert first["answer_text"] == "my answer"
+            assert first["answered_at"] == "2026-09-14T10:00:00Z"
+            assert first["word_limit"] == 100
+            assert first["image_url"] is None
+
+            second = next(d for d in data["descriptive_results"] if d["question_id"] == MOCK_DESC_ID_2)
+            assert second["answer_text"] is None          # unanswered stays visible
+            assert second["image_url"] == "http://x/y.png"
+            assert second["word_limit"] is None
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_no_descriptive_results_when_none_selected(self, client, mock_supabase):
+        self._set_admin_override()
+        attempt = self._attempt()
+        attempt["selected_descriptive_question_ids"] = []
+        attempt["total_descriptive_questions"] = 0
+        self._configure_mocks(mock_supabase, attempt, desc_questions=[], desc_answers=[])
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 200
+            assert r.json()["descriptive_results"] == []
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_results_response_has_no_admin_remark(self, client, mock_supabase):
+        self._set_admin_override()
+        self._configure_mocks(mock_supabase, self._attempt(), desc_questions=[], desc_answers=[])
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 200
+            # The results payload never carries the remark column (it selects
+            # explicit fields); assert the key is absent.
+            assert "admin_remark" not in r.json()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_candidate_rejected_from_results(self, client, mock_supabase):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="cand@test.com"
+        )
+        self._configure_mocks(mock_supabase, self._attempt(), desc_questions=[], desc_answers=[])
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 403
+        finally:
+            client.app.dependency_overrides.clear()

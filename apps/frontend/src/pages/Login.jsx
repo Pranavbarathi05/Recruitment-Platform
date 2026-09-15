@@ -35,7 +35,7 @@ const Login = () => {
   // Redirect if already authenticated
   useEffect(() => {
     if (isAuthenticated) {
-      navigate('/domains');
+      navigate('/instructions');
     }
   }, [isAuthenticated, navigate]);
 
@@ -51,7 +51,7 @@ const Login = () => {
     setIsSubmitting(true);
     try {
       await signIn({ email, password });
-      navigate('/domains');
+      navigate('/instructions');
     } catch (err) {
       const message = err.message || 'Login failed';
       if (message.includes('Invalid login credentials')) {

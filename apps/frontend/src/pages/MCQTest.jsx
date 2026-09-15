@@ -5,6 +5,7 @@ import CodeEditor from '../components/CodeEditor';
 import TestResultsPanel from '../components/TestResultsPanel';
 import { runCodeLocally, isClientRunnable } from '../execution/runner';
 import { generatePythonStarterCode } from '../utils/codingStarterCode';
+import { countWords, limitToWords } from '../utils/wordLimit';
 
 /**
  * Combined Assessment Workspace
@@ -713,8 +714,12 @@ function DescriptiveSection({ questions, answers, currentIndex, setCurrentIndex,
 
   const q = questions[currentIndex];
   const answeredCount = Object.keys(answers).length;
-  const currentText = answers[q.id] || '';
-  const wordCount = currentText.trim() ? currentText.trim().split(/\s+/).length : 0;
+  // Hard input constraint: every change (typed, pasted, or editing a saved
+  // answer) is constrained to the configured word limit before it is stored.
+  // word_limit is NULL/undefined = unlimited (schema allows NULL or > 0).
+  const wordLimit = q.word_limit || null;
+  const currentText = limitToWords(answers[q.id] || '', wordLimit);
+  const wordCount = countWords(currentText);
 
   return (
     <div className="h-full flex flex-col">
@@ -748,16 +753,18 @@ function DescriptiveSection({ questions, answers, currentIndex, setCurrentIndex,
             <label className="block text-sm font-medium text-theme-primary mb-2">Your Answer</label>
             <textarea
               value={currentText}
-              onChange={(e) => saveAnswer(q.id, e.target.value)}
+              onChange={(e) => saveAnswer(q.id, limitToWords(e.target.value, wordLimit))}
               rows={10}
               className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm resize-y min-h-[200px]"
               placeholder="Type your answer here..."
             />
             <div className="flex justify-between mt-2 text-sm text-theme-muted">
-              <span>{wordCount} words</span>
-              {q.word_limit && (
-                <span className={wordCount > q.word_limit ? 'text-red-400' : ''}>
-                  Word limit: {q.word_limit}
+              <span>
+                Word count: {wordCount}{wordLimit ? ` / ${wordLimit}` : ''}
+              </span>
+              {wordLimit && (
+                <span className="text-theme-muted">
+                  Word limit: {wordLimit}
                 </span>
               )}
             </div>

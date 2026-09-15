@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { countWords } from '../utils/wordLimit';
 
 /**
  * Admin Results Page
@@ -103,8 +104,10 @@ const AdminResults = () => {
     unanswered_count,
     mcq_questions,
     coding_results,
+    descriptive_results,
   } = results;
   const questions = mcq_questions || [];
+  const descriptives = descriptive_results || [];
 
   const formatTime = (iso) => {
     if (!iso) return '—';
@@ -237,6 +240,59 @@ const AdminResults = () => {
                   </details>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Descriptive Responses */}
+        {descriptives.length > 0 && (
+          <div className="bg-theme-secondary rounded-lg p-6 mb-6">
+            <h2 className="text-xl font-bold text-theme-primary mb-6">Descriptive Responses</h2>
+            <div className="space-y-4">
+              {descriptives.map((dr, idx) => {
+                const answerText = dr.answer_text || '';
+                const answered = Boolean(answerText);
+                const wordCount = countWords(answerText);
+                return (
+                  <div key={dr.question_id || idx} className={`bg-theme-primary rounded-lg p-4 border-l-4 ${answered ? 'border-blue-500' : 'border-yellow-500'}`}>
+                    <div className="flex items-start justify-between mb-2">
+                      <h3 className="font-semibold text-theme-primary">
+                        D{idx + 1}. {dr.question_text}
+                      </h3>
+                      <span className={`text-xs px-2 py-1 rounded ml-2 flex-shrink-0 ${
+                        answered ? 'bg-blue-900/50 text-blue-300' : 'bg-yellow-900/50 text-yellow-300'
+                      }`}>
+                        {answered ? 'Answered' : 'Not answered'}
+                      </span>
+                    </div>
+
+                    {dr.image_url && (
+                      <img
+                        src={dr.image_url}
+                        alt="Question image"
+                        className="max-h-80 rounded-lg border border-theme-secondary mb-3"
+                      />
+                    )}
+
+                    <p className="text-xs text-theme-muted mb-1">Candidate Answer:</p>
+                    {answered ? (
+                      <pre className="bg-theme-secondary rounded p-3 text-sm text-theme-primary whitespace-pre-wrap font-sans">{answerText}</pre>
+                    ) : (
+                      <p className="text-sm text-theme-muted italic">Not answered</p>
+                    )}
+
+                    <div className="flex gap-4 mt-2 text-xs text-theme-muted">
+                      <span>Word count: {wordCount}{dr.word_limit ? ` / ${dr.word_limit}` : ''}</span>
+                      {dr.word_limit && <span>Word limit: {dr.word_limit}</span>}
+                      {dr.answered_at && (
+                        <span>Answered: {new Date(dr.answered_at).toLocaleString('en-US', {
+                          month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+                        })}</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

@@ -11,6 +11,10 @@
 --   7. updated_at trigger on descriptive_questions
 --
 -- SAFE: Additive only. Does not drop tables or delete data.
+-- RERUN-SAFE: All CREATE statements are idempotent.
+--   NOTE: PostgreSQL has no "CREATE POLICY IF NOT EXISTS", so policy
+--   creation is wrapped in DO $$ ... $$ blocks (same convention the
+--   rest of this project uses for conditional statements).
 -- ============================================================
 
 -- ============================================================
@@ -101,10 +105,21 @@ INSERT INTO storage.buckets (id, name, public)
 VALUES ('question-images', 'question-images', true)
 ON CONFLICT (id) DO NOTHING;
 
--- Public read policy: anyone can view question images
-CREATE POLICY IF NOT EXISTS "question_images_public_read"
-    ON storage.objects FOR SELECT
-    USING (bucket_id = 'question-images');
+-- Public read policy: anyone can view question images.
+-- Idempotent: PostgreSQL has no CREATE POLICY IF NOT EXISTS.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'storage'
+          AND tablename  = 'objects'
+          AND policyname = 'question_images_public_read'
+    ) THEN
+        CREATE POLICY "question_images_public_read"
+            ON storage.objects FOR SELECT
+            USING (bucket_id = 'question-images');
+    END IF;
+END $$;
 
 
 -- ============================================================
@@ -121,14 +136,24 @@ ALTER TABLE public.assessment_descriptive_answers ENABLE ROW LEVEL SECURITY;
 -- assessment_descriptive_answers: candidates SELECT own answers.
 -- All writes go through FastAPI using service_role.
 
-CREATE POLICY IF EXISTS "Users can view own descriptive answers"
-    ON public.assessment_descriptive_answers FOR SELECT
-    USING (
-        attempt_id IN (
-            SELECT id FROM public.assessment_attempts
-            WHERE profile_id = auth.uid()
-        )
-    );
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename  = 'assessment_descriptive_answers'
+          AND policyname = 'Users can view own descriptive answers'
+    ) THEN
+        CREATE POLICY "Users can view own descriptive answers"
+            ON public.assessment_descriptive_answers FOR SELECT
+            USING (
+                attempt_id IN (
+                    SELECT id FROM public.assessment_attempts
+                    WHERE profile_id = auth.uid()
+                )
+            );
+    END IF;
+END $$;
 
 
 -- ============================================================

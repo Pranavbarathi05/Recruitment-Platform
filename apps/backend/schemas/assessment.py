@@ -109,3 +109,16 @@ class DescriptiveUpdate(BaseModel):
 class DescriptiveAnswerSaveRequest(BaseModel):
     question_id: str
     answer_text: str = Field(default="")
+
+
+# ---------------------------------------------------------------------------
+# Admin remark (private note on an assessment submission)
+# ---------------------------------------------------------------------------
+
+class AdminRemarkUpdate(BaseModel):
+    """Private admin remark on an assessment attempt.
+
+    Nullable — an empty string is normalized to None by the router so the
+    remark can be cleared through the same PUT endpoint.
+    """
+    admin_remark: Optional[str] = Field(None, max_length=10_000)

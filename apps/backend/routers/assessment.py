@@ -9,6 +9,7 @@ ONE timer (expires_at), ONE final submission, ONE combined score.
 """
 
 import random
+import re
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
@@ -21,7 +22,11 @@ router = APIRouter(prefix="/assessment", tags=["Assessment"])
 # ---------------------------------------------------------------------------
 
 def _get_active_config() -> dict:
-    """Read the active assessment configuration."""
+    """Read the active assessment configuration.
+
+    Returns a plain dict with a defensive default for
+    descriptive_question_count so callers can rely on the key existing.
+    """
     result = (
         supabase_client.table("assessment_config")
         .select("*")
@@ -34,7 +39,9 @@ def _get_active_config() -> dict:
             status_code=500,
             detail="No active assessment configuration found. Contact an admin.",
         )
-    return result.data[0]
+    config = dict(result.data[0])
+    config.setdefault("descriptive_question_count", 0)
+    return config
 
 
 def _utcnow() -> datetime:
@@ -48,6 +55,39 @@ def _is_expired(attempt: dict) -> bool:
     if isinstance(expires_at, str):
         expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     return _utcnow() > expires_at
+
+
+def count_words(text: str) -> int:
+    """Count words on a whitespace-run split, ignoring empty tokens.
+
+    Shared canonical rule for display, input enforcement and server-side
+    validation: trim, split on runs of whitespace (spaces/newlines/tabs),
+    drop empty tokens. E.g. "hello   world\\nthis" -> 3.
+    """
+    if not text:
+        return 0
+    return len([w for w in re.split(r"\s+", text.strip()) if w])
+
+
+def _enforce_word_limit(question: dict, answer_text: str) -> None:
+    """Reject answers exceeding the question's configured word_limit.
+
+    Schema convention (migration 010): word_limit is NULL (unlimited) or a
+    positive integer — 0 is not representable, so there is no zero-limit
+    convention to preserve. Raises 400 when the limit is exceeded so the
+    invalid answer is never saved.
+    """
+    word_limit = question.get("word_limit")
+    if not word_limit or word_limit <= 0:
+        return
+    if count_words(answer_text) > word_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Answer exceeds the word limit ({count_words(answer_text)} "
+                f"words > {word_limit} allowed)"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +232,41 @@ def _score_attempt(attempt_id: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
+def _select_descriptive_questions(
+    descriptive_question_count: int,
+    domain_ids: list,
+) -> list[str]:
+    """Select descriptive questions for the attempt.
+
+    Only ACTIVE questions overlapping the candidate's chosen domains are
+    eligible (same conceptual domain filtering as MCQ selection — MCQs by
+    domain_id, descriptive by domain_ids overlap). Raises 400 if fewer
+    eligible questions exist than requested, mirroring the MCQ/coding
+    behavior of failing loudly rather than creating invalid attempts.
+    """
+    if descriptive_question_count <= 0:
+        return []
+
+    desc_resp = (
+        supabase_client.table("descriptive_questions")
+        .select("id")
+        .eq("is_active", True)
+        .overlaps("domain_ids", domain_ids)
+        .execute()
+    )
+    available = desc_resp.data or []
+    if len(available) < descriptive_question_count:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Only {len(available)} active descriptive questions "
+                f"available for selected domains, need {descriptive_question_count}"
+            ),
+        )
+    sampled = random.sample(available, descriptive_question_count)
+    return [d["id"] for d in sampled]
+
+
 def _select_coding_problems(
     coding_problem_count: int,
 ) -> list[str]:
@@ -286,10 +361,31 @@ def start_assessment(
         else:
             # Active attempt exists and is not expired — resume it
             attempt = attempt_resp.data[0]
+
+            # Resume gap fix: attempts created before the descriptive feature
+            # (or before descriptive questions were authored) have an empty
+            # selection. If the config now asks for descriptive questions, top
+            # up the attempt so the candidate actually receives the section.
+            # Best-effort: selection failures never block the MCQ/coding resume.
+            selected_desc = attempt.get("selected_descriptive_question_ids") or []
+            want_desc = int(config.get("descriptive_question_count", 0) or 0)
+            if want_desc > 0 and len(selected_desc) < want_desc:
+                try:
+                    top_up = _select_descriptive_questions(want_desc, domain_ids=payload.domain_ids)
+                    supabase_client.table("assessment_attempts").update({
+                        "selected_descriptive_question_ids": top_up,
+                        "total_descriptive_questions": len(top_up),
+                    }).eq("id", attempt["id"]).execute()
+                except HTTPException:
+                    pass  # Not enough eligible questions — resume unchanged
+
             return {
                 "attempt_id": attempt["id"],
                 "total_mcq_questions": attempt["total_questions"],
                 "total_coding_problems": attempt.get("total_coding_problems", 0),
+                "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
+                "selected_descriptive_question_ids": attempt.get(
+                    "selected_descriptive_question_ids") or [],
                 "duration_minutes": attempt["duration_minutes"],
                 "domain_ids": attempt.get("domain_ids", []),
                 "expires_at": attempt["expires_at"],
@@ -373,26 +469,9 @@ def start_assessment(
     )
 
     # 7. Select descriptive questions (active, overlapping chosen domains)
-    selected_descriptive_ids = []
-    if descriptive_question_count > 0:
-        desc_resp = (
-            supabase_client.table("descriptive_questions")
-            .select("id")
-            .eq("is_active", True)
-            .overlaps("domain_ids", domain_ids)
-            .execute()
-        )
-        available_desc = desc_resp.data or []
-        if len(available_desc) < descriptive_question_count:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Only {len(available_desc)} active descriptive questions "
-                    f"available for selected domains, need {descriptive_question_count}"
-                ),
-            )
-        sampled_desc = random.sample(available_desc, descriptive_question_count)
-        selected_descriptive_ids = [d["id"] for d in sampled_desc]
+    selected_descriptive_ids = _select_descriptive_questions(
+        descriptive_question_count, domain_ids
+    )
 
     # 8. Create ONE combined attempt
     now = _utcnow()
@@ -422,6 +501,8 @@ def start_assessment(
         "total_mcq_questions": attempt["total_questions"],
         "total_coding_problems": attempt["total_coding_problems"],
         "total_descriptive_questions": attempt["total_descriptive_questions"],
+        "selected_descriptive_question_ids": attempt.get(
+            "selected_descriptive_question_ids", []),
         "duration_minutes": attempt["duration_minutes"],
         "domain_ids": domain_ids,
         "expires_at": attempt["expires_at"],
@@ -451,6 +532,8 @@ def get_current_attempt(current_user: AuthUser = Depends(get_current_user)):
         _score_attempt(attempt["id"])
         attempt["status"] = "scored"
 
+    # admin_remark is admin-only — never returned through candidate endpoints.
+    attempt.pop("admin_remark", None)
     return attempt
 
 
@@ -474,6 +557,8 @@ def get_attempt(attempt_id: str, current_user: AuthUser = Depends(get_current_us
         _score_attempt(attempt_id)
         attempt["status"] = "scored"
 
+    # admin_remark is admin-only — never returned through candidate endpoints.
+    attempt.pop("admin_remark", None)
     return attempt
 
 
@@ -505,6 +590,26 @@ def get_attempt_questions(
 
     question_ids = attempt["selected_question_ids"]
     desc_ids = attempt.get("selected_descriptive_question_ids") or []
+
+    # Defensive: if the config asks for descriptive questions but the frozen
+    # selection is empty (attempt predates the feature or a previous selection
+    # failure), top up now instead of silently omitting the section.
+    try:
+        config = _get_active_config()
+        want_desc = int(config.get("descriptive_question_count", 0) or 0)
+    except HTTPException:
+        want_desc = 0
+    if want_desc > 0 and len(desc_ids) < want_desc:
+        try:
+            top_up = _select_descriptive_questions(want_desc, domain_ids=attempt.get("domain_ids") or [])
+            supabase_client.table("assessment_attempts").update({
+                "selected_descriptive_question_ids": top_up,
+                "total_descriptive_questions": len(top_up),
+            }).eq("id", attempt_id).execute()
+            desc_ids = top_up
+            attempt["total_descriptive_questions"] = len(top_up)
+        except HTTPException:
+            pass  # Not enough eligible questions — return whatever exists
 
     # Fetch MCQ questions (empty list if none selected)
     questions = []
@@ -561,6 +666,7 @@ def get_attempt_questions(
             a["question_id"]: a["answer_text"] for a in (desc_answers_resp.data or [])
         }
 
+    # admin_remark is admin-only. Never include it in candidate responses.
     return {
         "attempt_id": attempt_id,
         "total_questions": attempt["total_questions"],
@@ -659,6 +765,16 @@ def save_descriptive_answer(
     if payload.question_id not in desc_ids:
         raise HTTPException(status_code=400, detail="Question not part of this attempt")
 
+    # Server-side word limit enforcement (do not trust the frontend).
+    question_resp = (
+        supabase_client.table("descriptive_questions")
+        .select("word_limit")
+        .eq("id", payload.question_id)
+        .execute()
+    )
+    question = question_resp.data[0] if question_resp.data else {}
+    _enforce_word_limit(question, payload.answer_text)
+
     existing = (
         supabase_client.table("assessment_descriptive_answers")
         .select("id")
@@ -717,4 +833,5 @@ def submit_attempt(
         "attempt_id": attempt_id,
         "total_mcq_questions": attempt["total_questions"],
         "total_coding_problems": attempt["total_coding_problems"],
+        "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
     }

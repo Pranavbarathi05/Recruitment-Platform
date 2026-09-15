@@ -64,6 +64,12 @@ const AdminPanel = () => {
   const [resetCandidate, setResetCandidate] = useState(null);
   const [resetLoading, setResetLoading] = useState(false);
 
+  // Admin remark state (one per attempt, chat button in submissions table)
+  const [remarkTarget, setRemarkTarget] = useState(null); // submission row
+  const [remarkText, setRemarkText] = useState('');
+  const [remarkError, setRemarkError] = useState('');
+  const [remarkSaving, setRemarkSaving] = useState(false);
+
   // Delete confirmation state
   const [deleteCandidate, setDeleteCandidate] = useState(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -394,6 +400,69 @@ const AdminPanel = () => {
       setResetCandidate(null);
     } finally {
       setResetLoading(false);
+    }
+  };
+
+  // Open the remark modal for a submission
+  const openRemarkModal = (sub) => {
+    setRemarkTarget(sub);
+    setRemarkText(sub.admin_remark || '');
+    setRemarkError('');
+  };
+
+  const closeRemarkModal = () => {
+    setRemarkTarget(null);
+    setRemarkText('');
+    setRemarkError('');
+  };
+
+  // Save (or clear via empty payload) the remark, then refresh button state
+  const handleSaveRemark = async () => {
+    if (!remarkTarget || remarkSaving) return;
+    setRemarkSaving(true);
+    setRemarkError('');
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessments/${remarkTarget.attempt_id}/remark`, {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        credentials: 'include',
+        body: JSON.stringify({ admin_remark: remarkText }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || 'Failed to save remark');
+      setRemarkTarget(null);
+      setRemarkText('');
+      setMessage('Remark saved.');
+      fetchSubmissions(); // refresh admin_remark / button state
+    } catch (err) {
+      // Keep remarkText so the admin does not lose their edit
+      setRemarkError(err.message);
+    } finally {
+      setRemarkSaving(false);
+    }
+  };
+
+  // Clear (delete) the remark for the open modal
+  const handleClearRemark = async () => {
+    if (!remarkTarget || remarkSaving) return;
+    setRemarkSaving(true);
+    setRemarkError('');
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessments/${remarkTarget.attempt_id}/remark`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+        credentials: 'include',
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || 'Failed to clear remark');
+      setRemarkTarget(null);
+      setRemarkText('');
+      setMessage('Remark cleared.');
+      fetchSubmissions();
+    } catch (err) {
+      setRemarkError(err.message);
+    } finally {
+      setRemarkSaving(false);
     }
   };
 
@@ -1051,6 +1120,35 @@ const AdminPanel = () => {
                             >
                               View Responses
                             </button>
+                            {/* Chat-shaped remark button — faded when no remark exists */}
+                            <button
+                              onClick={() => openRemarkModal(sub)}
+                              title={sub.admin_remark ? 'View / edit remark' : 'Add remark'}
+                              aria-label={
+                                sub.admin_remark
+                                  ? `Edit remark for ${sub.candidate_name}`
+                                  : `Add remark for ${sub.candidate_name}`
+                              }
+                              className={`p-1.5 rounded ${
+                                sub.admin_remark
+                                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                                  : 'bg-gray-600/40 text-gray-400 cursor-pointer opacity-60 hover:opacity-100'
+                              }`}
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 24 24"
+                                fill="currentColor"
+                                className="w-4 h-4"
+                                aria-hidden="true"
+                              >
+                                <path
+                                  fillRule="evenodd"
+                                  d="M4.848 2.771A49.144 49.144 0 0 1 12 2.25c2.43 0 4.817.178 7.152.52 1.978.292 3.348 2.024 3.348 3.97v6.02c0 1.946-1.37 3.678-3.348 3.97-.759.1-1.507.18-2.274.226v1.535a2.25 2.25 0 0 1-3.527 1.855l-2.77-1.932a48.09 48.09 0 0 1-3.62-2.745c-.6-.503-.938-1.243-.938-2.015V6.74c0-1.946 1.37-3.678 3.348-3.97Z"
+                                  clipRule="evenodd"
+                                />
+                              </svg>
+                            </button>
                             {(sub.status === 'scored' || sub.status === 'submitted') && (
                               <>
                                 <button
@@ -1113,6 +1211,56 @@ const AdminPanel = () => {
               >
                 Cancel
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Remark Modal — admin-only private note on a submission */}
+      {remarkTarget && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-theme-secondary rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
+            <h3 className="text-xl font-bold text-theme-primary mb-1">Assessment Remark</h3>
+            <p className="text-theme-muted text-sm mb-4">
+              Private note for <span className="font-semibold text-theme-primary">{remarkTarget.candidate_name}</span> — visible to admins only.
+            </p>
+            <textarea
+              value={remarkText}
+              onChange={(e) => setRemarkText(e.target.value)}
+              rows={5}
+              maxLength={10000}
+              placeholder="Write a remark about this submission..."
+              className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm resize-y"
+            />
+            {remarkError && (
+              <p className="text-xs text-red-400 bg-red-900/20 border border-red-500/50 rounded px-3 py-2 mt-2">
+                {remarkError}
+              </p>
+            )}
+            <div className="flex justify-between gap-3 mt-4">
+              <button
+                onClick={handleClearRemark}
+                disabled={remarkSaving || !(remarkTarget.admin_remark || remarkText)}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold disabled:opacity-40"
+              >
+                Clear
+              </button>
+              <div className="flex gap-3">
+                <button
+                  onClick={closeRemarkModal}
+                  disabled={remarkSaving}
+                  className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSaveRemark}
+                  disabled={remarkSaving}
+                  className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-semibold disabled:opacity-50"
+                >
+                  {remarkSaving ? 'Saving...' : 'Save'}
+                </button>
+              </div>
             </div>
           </div>
         </div>

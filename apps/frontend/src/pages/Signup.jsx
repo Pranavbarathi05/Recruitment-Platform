@@ -40,7 +40,7 @@ const Signup = () => {
   // Redirect if already authenticated
   useEffect(() => {
     if (isAuthenticated) {
-      navigate('/domains');
+      navigate('/instructions');
     }
   }, [isAuthenticated, navigate]);
 
@@ -67,7 +67,7 @@ const Signup = () => {
       if (result.needsConfirmation) {
         setConfirmationPending(true);
       } else {
-        navigate('/domains');
+        navigate('/instructions');
       }
     } catch (err) {
       const message = err.message || 'Signup failed';

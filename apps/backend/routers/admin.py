@@ -3,10 +3,12 @@ from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
 from schemas.assessment import (
     DomainCreate, DomainUpdate, MCQCreate, MCQUpdate,
-    AssessmentConfigUpdate, VALID_SEMESTERS, SEMESTER_LABELS,
+    AssessmentConfigUpdate, VALID_SEMESTERS, SEMESTER_LABELS, AdminRemarkUpdate,
 )
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
+MAX_ADMIN_REMARK_LENGTH = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +351,11 @@ def list_submissions(
     try:
         import logging
         logger = logging.getLogger(__name__)
-        # 1. Fetch submitted/scored attempts
+        # 1. Fetch submitted/scored attempts (admin_remark is admin-only and
+        # only ever leaves the database through admin endpoints)
         attempts_resp = (
             supabase_client.table("assessment_attempts")
-            .select("id, profile_id, domain_ids, total_questions, score, max_score, mcq_score, mcq_max_score, coding_score, coding_max_score, total_coding_problems, started_at, submitted_at, status")
+            .select("id, profile_id, domain_ids, total_questions, score, max_score, mcq_score, mcq_max_score, coding_score, coding_max_score, total_coding_problems, total_descriptive_questions, started_at, submitted_at, status, admin_remark")
             .in_("status", ["submitted", "scored", "reset"])
             .execute()
         )
@@ -423,6 +426,8 @@ def list_submissions(
                 "coding_max_score": coding_max,
                 "total_mcq_questions": attempt["total_questions"],
                 "total_coding_problems": attempt.get("total_coding_problems") or 0,
+                "total_descriptive_questions": attempt.get("total_descriptive_questions") or 0,
+                "admin_remark": attempt.get("admin_remark"),
                 "status": attempt.get("status"),
                 "started_at": attempt.get("started_at"),
                 "submitted_at": attempt.get("submitted_at"),
@@ -617,6 +622,41 @@ def get_assessment_results(
                     "execution_time_ms": sub.get("execution_time_ms"),
                 })
 
+        # Descriptive questions + candidate answers. Questions are listed even
+        # when unanswered (answer maps default to None) — admins must see what
+        # was NOT answered too. answer_text/answered_at/image/word_limit mirror
+        # the candidate payload conventions (snake_case).
+        descriptive_results = []
+        desc_ids = attempt.get("selected_descriptive_question_ids") or []
+        if desc_ids:
+            dq_resp = (
+                supabase_client.table("descriptive_questions")
+                .select("id, question_text, image_url, word_limit")
+                .in_("id", desc_ids)
+                .execute()
+            )
+            dq_map = {q["id"]: q for q in (dq_resp.data or [])}
+
+            da_resp = (
+                supabase_client.table("assessment_descriptive_answers")
+                .select("question_id, answer_text, answered_at")
+                .eq("attempt_id", attempt_id)
+                .execute()
+            )
+            da_map = {a["question_id"]: a for a in (da_resp.data or [])}
+
+            for qid in desc_ids:
+                dq = dq_map.get(qid, {})
+                da = da_map.get(qid, {})
+                descriptive_results.append({
+                    "question_id": qid,
+                    "question_text": dq.get("question_text", ""),
+                    "image_url": dq.get("image_url"),
+                    "word_limit": dq.get("word_limit"),
+                    "answer_text": da.get("answer_text"),
+                    "answered_at": da.get("answered_at"),
+                })
+
         return {
             "attempt_id": attempt_id,
             "status": attempt["status"],
@@ -633,6 +673,8 @@ def get_assessment_results(
             "domain_names": [domain_map.get(did, "") for did in attempt["domain_ids"]],
             "total_mcq_questions": attempt["total_questions"],
             "total_coding_problems": attempt.get("total_coding_problems") or 0,
+            "total_descriptive_questions": attempt.get("total_descriptive_questions") or 0,
+            "descriptive_results": descriptive_results,
             "duration_minutes": attempt["duration_minutes"],
             "started_at": attempt["started_at"],
             "submitted_at": attempt.get("submitted_at"),
@@ -932,6 +974,130 @@ def delete_assessment(
             "status": "deleted",
             "attempt_id": attempt_id,
             "message": "Assessment attempt and all associated data have been deleted.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment submission remark (admin only)
+# ---------------------------------------------------------------------------
+# One private administrative note per attempt, stored directly on the
+# canonical submission record (assessment_attempts.admin_remark).
+#
+# Security model:
+#   - require_admin dependency enforces profiles.is_admin on every call.
+#   - These endpoints live under the /admin prefix — candidate routers never
+#     select admin_remark, so the value can only leave the database here.
+#   - Writes go through FastAPI using service_role (bypasses RLS), matching
+#     the existing pattern; RLS adds defense-in-depth (see migration 011).
+
+
+def _verify_attempt_exists(attempt_id: str) -> dict:
+    """Fetch an attempt or raise 404. Shared by the remark endpoints."""
+    attempt_resp = (
+        supabase_client.table("assessment_attempts")
+        .select("id, profile_id")
+        .eq("id", attempt_id)
+        .execute()
+    )
+    if not attempt_resp.data:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+    return attempt_resp.data[0]
+
+
+@router.get("/assessments/{attempt_id}/remark")
+def get_admin_remark(
+    attempt_id: str,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Get the private admin remark for an assessment submission. Admin only."""
+    try:
+        _verify_attempt_exists(attempt_id)
+
+        resp = (
+            supabase_client.table("assessment_attempts")
+            .select("id, admin_remark")
+            .eq("id", attempt_id)
+            .execute()
+        )
+        return {
+            "attempt_id": attempt_id,
+            "admin_remark": resp.data[0].get("admin_remark") if resp.data else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/assessments/{attempt_id}/remark")
+def set_admin_remark(
+    attempt_id: str,
+    payload: AdminRemarkUpdate,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Create or update the private admin remark for a submission. Admin only.
+
+    Empty/whitespace-only remark is stored as NULL (cleared).
+    """
+    try:
+        _verify_attempt_exists(attempt_id)
+
+        remark = payload.admin_remark.strip() if payload.admin_remark else None
+        if remark == "":
+            remark = None  # whitespace-only → cleared
+
+        if remark is not None and len(remark) > MAX_ADMIN_REMARK_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Remark too long (max {MAX_ADMIN_REMARK_LENGTH} characters)",
+            )
+
+        result = (
+            supabase_client.table("assessment_attempts")
+            .update({"admin_remark": remark})
+            .eq("id", attempt_id)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        return {
+            "attempt_id": attempt_id,
+            "admin_remark": result.data[0].get("admin_remark"),
+            "status": "saved",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/assessments/{attempt_id}/remark")
+def clear_admin_remark(
+    attempt_id: str,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Clear (delete) the private admin remark for a submission. Admin only."""
+    try:
+        _verify_attempt_exists(attempt_id)
+
+        result = (
+            supabase_client.table("assessment_attempts")
+            .update({"admin_remark": None})
+            .eq("id", attempt_id)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        return {
+            "attempt_id": attempt_id,
+            "admin_remark": None,
+            "status": "cleared",
         }
     except HTTPException:
         raise
