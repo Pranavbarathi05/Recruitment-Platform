@@ -133,6 +133,7 @@ def mock_supabase():
          patch("routers.assessment.supabase_client", mock_client), \
          patch("routers.coding.supabase_client", mock_client), \
          patch("routers.coding_admin.supabase_client", mock_client), \
+         patch("services.assessment_planning.supabase_client", mock_client), \
          patch("routers.hands_on_admin.supabase_client", mock_client):
         yield mock_client
 
@@ -4701,8 +4702,39 @@ def _route_table(mock_sb, table_name):
     return mock_sb
 
 
+def _make_program(semester=5, scope="technical", tier="senior",
+                  max_domains=2, coding_enabled=True):
+    """A mock assessment_program row (mirrors the seeded DEV rows)."""
+    return {
+        "semester": semester,
+        "scope": scope,
+        "tier": tier,
+        "max_domains": max_domains,
+        "coding_enabled": coding_enabled,
+    }
+
+
+def _make_module_config(*, domain_id, applies_to="senior", mcq_count=0,
+                        descriptive_count=0, hands_on_enabled=False,
+                        hands_on_count=0, hands_on_additional_minutes=0):
+    """A mock assessment_module_config row."""
+    return {
+        "domain_id": domain_id,
+        "applies_to": applies_to,
+        "mcq_count": mcq_count,
+        "descriptive_count": descriptive_count,
+        "hands_on_enabled": hands_on_enabled,
+        "hands_on_count": hands_on_count,
+        "hands_on_additional_minutes": hands_on_additional_minutes,
+    }
+
+
 def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=None,
-                           hands_on_count=0, hands_on_available=None):
+                           hands_on_count=0, hands_on_available=None,
+                           semester=5, program=None, module_configs=None,
+                           domains=None, coding_available=None,
+                           coding_problem_count=0, duration_minutes=20,
+                           mcq_available=None):
     """Configure per-table mock chains for POST /assessment/start.
 
     start_assessment queries (in order):
@@ -4712,11 +4744,32 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
       assessment_attempts  → select().eq().eq().execute()      (existing)
                            → select().eq().in_().execute()     (submitted)
                            → insert().execute()                (create)
+      assessment_program   → select().eq().eq().execute()      (Phase 4)
+      assessment_module_config → select().in_().eq().execute()  (Phase 4)
       domains              → select().in_().execute()
-      mcq_questions        → select().eq().eq().eq().execute()
-      coding_problems      → (no query when count = 0)
+      mcq_questions        → select().eq().eq().in_().execute()
+      coding_problems      → select().eq().execute()   (only when count > 0)
       descriptive_questions→ select().eq().overlaps().execute()
+      hands_on_questions   → select().eq().overlaps().execute()
+
+    ``program=None`` defaults to the seeded SENIOR technical programme and
+    ``module_configs=None`` to NO configuration rows, so by default these mocks
+    exercise the technical LEGACY FALLBACK path driven by assessment_config.
     """
+    if program is None:
+        program = _make_program(semester=semester)
+    if module_configs is None:
+        module_configs = []
+    if domains is None:
+        domains = [
+            {
+                "id": MOCK_DOMAIN_1_ID,
+                "name": "Web Dev",
+                "slug": "web-development",
+                "assessment_scope": "technical",
+                "is_active": True,
+            }
+        ]
     if descriptive_available is None:
         descriptive_available = [
             {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
@@ -4729,9 +4782,6 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
 
     chains = mock_sb._table_chains
 
-    def _sel(table, chain):
-        return chains.setdefault(table, chain or MagicMock())
-
     # assessment_config — _get_active_config
     # total_questions must match the mocked MCQ pool (2) so selection succeeds.
     config_chain = chains.setdefault("assessment_config", MagicMock())
@@ -4740,6 +4790,8 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
             total_questions=2,
             descriptive_question_count=descriptive_count,
             hands_on_question_count=hands_on_count,
+            coding_problem_count=coding_problem_count,
+            duration_minutes=duration_minutes,
         )])
     )
 
@@ -4749,10 +4801,10 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
         _make_mock_response([{"id": MOCK_PROFILE_ID}])
     )
 
-    # candidates — semester lookup
+    # candidates — semester lookup (follows the mocked programme's semester)
     candidates_chain = chains.setdefault("candidates", MagicMock())
     candidates_chain.select.return_value.eq.return_value.execute.return_value = (
-        _make_mock_response([{"id": MOCK_CANDIDATE_ID, "semester": 5}])
+        _make_mock_response([{"id": MOCK_CANDIDATE_ID, "semester": semester}])
     )
 
     # assessment_attempts — existing/submitted checks + insert
@@ -4776,16 +4828,42 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
         }])
     )
 
+    # assessment_program — semester -> scope/tier/max_domains policy
+    program_chain = chains.setdefault("assessment_program", MagicMock())
+    program_chain.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([program])
+    )
+
+    # assessment_module_config — per-domain counts for this tier.
+    # Empty means "not authored yet" → the planner uses the explicit technical
+    # legacy fallback built from assessment_config.
+    module_chain = chains.setdefault("assessment_module_config", MagicMock())
+    module_chain.select.return_value.in_.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response(module_configs)
+    )
+
     # domains — validation of chosen domains
     domains_chain = chains.setdefault("domains", MagicMock())
     domains_chain.select.return_value.in_.return_value.execute.return_value = (
-        _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Web Dev", "duration_minutes": 20, "is_active": True}])
+        _make_mock_response(domains)
     )
 
-    # mcq_questions — selection pool
+    # coding_problems — global pool (only queried when the coding count > 0)
+    coding_chain = chains.setdefault("coding_problems", MagicMock())
+    coding_chain.select.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response(coding_available or [])
+    )
+
+    # mcq_questions — candidate-eligible pool (semester + active + domains).
+    # Rows carry domain_id so a multi-domain pool is expressed realistically.
+    if mcq_available is None:
+        mcq_available = [
+            {"id": MOCK_MCQ_1_ID, "domain_id": MOCK_DOMAIN_1_ID},
+            {"id": MOCK_MCQ_2_ID, "domain_id": MOCK_DOMAIN_1_ID},
+        ]
     mcq_chain = chains.setdefault("mcq_questions", MagicMock())
-    mcq_chain.select.return_value.eq.return_value.eq.return_value.eq.return_value.execute.return_value = (
-        _make_mock_response([{"id": MOCK_MCQ_1_ID}, {"id": MOCK_MCQ_2_ID}])
+    mcq_chain.select.return_value.eq.return_value.eq.return_value.in_.return_value.execute.return_value = (
+        _make_mock_response(mcq_available)
     )
 
     # descriptive_questions — selection pool (active + domain overlap)
@@ -5012,21 +5090,21 @@ class TestDescriptiveQuestionsEndpoint:
 
     @patch("routers.assessment.supabase_client")
     @patch("routers.assessment._get_active_config")
-    def test_questions_endpoint_tops_up_missing_descriptive(
+    def test_questions_endpoint_does_not_top_up_missing_descriptive(
         self, mock_config, mock_sb, client
     ):
-        """Attempt predating the feature gets a defensive top-up so the
-        Descriptive section actually appears on an existing attempt."""
+        """FROZEN: an empty descriptive selection stays empty even when the live
+        assessment_config asks for descriptive questions.
+
+        Replaces the previous top-up expectation. The attempt was already
+        created without a descriptive selection, so the frozen selection wins:
+        the endpoint must not re-select, must not write to the attempt, and
+        must not even read the assessment configuration.
+        """
         mock_config.return_value = _make_config(descriptive_question_count=1)
-        desc_q = {
-            "id": MOCK_DESC_ID,
-            "question_text": "Explain your approach.",
-            "image_url": None,
-            "word_limit": None,
-        }
-        attempt = self._make_attempt_with_desc([])  # empty (pre-feature)
-        self._configure_questions_mocks(mock_sb, attempt, [desc_q])
-        # Descriptive selection pool for the top-up query
+        attempt = self._make_attempt_with_desc([])  # frozen empty selection
+        self._configure_questions_mocks(mock_sb, attempt, [])
+        # A populated eligible pool exists — the point is that it is NOT used.
         desc_sel = mock_sb._table_chains["descriptive_questions"]
         desc_sel.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
             _make_mock_response([{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}])
@@ -5039,14 +5117,15 @@ class TestDescriptiveQuestionsEndpoint:
         client.app.dependency_overrides.clear()
         assert response.status_code == 200
         data = response.json()
-        assert len(data["descriptive_questions"]) == 1
-        assert data["descriptive_questions"][0]["id"] == MOCK_DESC_ID
+        assert data["descriptive_questions"] == []
+        assert data["total_descriptive_questions"] == 0
 
-        # Selection must be persisted to the attempt
-        update_call = mock_sb._table_chains["assessment_attempts"].update.call_args
-        persisted = update_call.args[0]
-        assert persisted["selected_descriptive_question_ids"] == [MOCK_DESC_ID]
-        assert persisted["total_descriptive_questions"] == 1
+        # No re-selection, no persistence, and no config read at all.
+        mock_config.assert_not_called()
+        attempts_chain = mock_sb._table_chains["assessment_attempts"]
+        attempts_chain.update.assert_not_called()
+        attempts_chain.insert.assert_not_called()
+        desc_sel.select.return_value.eq.return_value.overlaps.assert_not_called()
 
     @patch("routers.assessment.supabase_client")
     def test_descriptive_answer_save_and_persist(self, mock_sb, client):
@@ -5939,7 +6018,6 @@ class TestAdminResultsDescriptive:
             client.app.dependency_overrides.clear()
 
 
-<<<<<<< HEAD
 # =====================================================================
 # HANDS-ON CHALLENGE TESTS
 # =====================================================================
@@ -7004,7 +7082,8 @@ class TestSubmissionLifecycle:
         )
         assert response.status_code == 400
         assert "not in progress" in response.json()["detail"]
-=======
+
+
 # ===========================================================================
 # C Language Support (minimal additive feature)
 # ===========================================================================
@@ -7779,4 +7858,426 @@ class TestCCodeExecutorPath:
         assert "int _arg0_0[] = {1, 1, 2};" in source_sent
         assert "removeDuplicates(_arg0_0, 3)" in source_sent
         assert "_mutated_passed" in source_sent
->>>>>>> c28c073 (feat: add C coding language support)
+
+
+# =====================================================================
+# PHASE 1 — ATTEMPT FREEZING
+# =====================================================================
+#
+# Regression guard for the defect where a live assessment_config change could
+# re-select ("top up") the Descriptive and Hands-on sections of an attempt that
+# was already in progress — mutating its frozen selections, counts, totals,
+# duration and expiry.
+#
+# Contract now enforced: once an attempt exists, its domain_ids, every
+# selected_*_ids array, every total_* count, duration_minutes and expires_at are
+# immutable. Both the resume path (POST /assessment/start) and the read path
+# (GET /assessment/attempt/{id}/questions) read the frozen row and never write
+# it, so a later admin configuration change has zero effect on an active
+# attempt.
+#
+# See TestSharedExpiryHelper for the single shared expiry implementation that
+# replaced the two identical private copies in routers/assessment.py and
+# routers/coding.py.
+
+FROZEN_DESC_IDS = [MOCK_DESC_ID]
+FROZEN_HANDS_IDS = [MOCK_HANDS_ID]
+
+# Response keys that must be identical across repeated resumes.
+_FROZEN_RESUME_KEYS = (
+    "attempt_id", "domain_ids", "total_mcq_questions", "total_coding_problems",
+    "total_descriptive_questions", "selected_descriptive_question_ids",
+    "total_hands_on_questions", "selected_hands_on_question_ids",
+    "duration_minutes", "expires_at", "resumed",
+)
+
+
+def _frozen_attempt(expires_at=None):
+    """A fully-populated in-progress attempt with all four sections frozen."""
+    now = datetime.now(timezone.utc)
+    return {
+        "id": MOCK_ATTEMPT_ID,
+        "profile_id": MOCK_PROFILE_ID,
+        "status": "in_progress",
+        "domain_ids": [MOCK_DOMAIN_1_ID],
+        "selected_question_ids": [MOCK_MCQ_1_ID, MOCK_MCQ_2_ID],
+        "total_questions": 2,
+        "selected_coding_problem_ids": [MOCK_CODING_PROBLEM_ID],
+        "total_coding_problems": 1,
+        "selected_descriptive_question_ids": list(FROZEN_DESC_IDS),
+        "total_descriptive_questions": 1,
+        "selected_hands_on_question_ids": list(FROZEN_HANDS_IDS),
+        "total_hands_on_questions": 1,
+        "duration_minutes": 20,
+        "started_at": now.isoformat(),
+        "expires_at": expires_at or (now + timedelta(minutes=20)).isoformat(),
+    }
+
+
+def _table_chains(mock_sb):
+    """Per-table MagicMock chains (same pattern as the hands-on tests)."""
+    chains = {}
+
+    def _table(name):
+        if name not in chains:
+            chains[name] = MagicMock()
+        return chains[name]
+
+    mock_sb.table.side_effect = _table
+    mock_sb._table_chains = chains
+    return chains
+
+
+def _configure_resume_chains(mock_sb, attempt, config=None):
+    """Wire every chain POST /assessment/start touches on the resume path."""
+    chains = _table_chains(mock_sb)
+
+    cfg = chains.setdefault("assessment_config", MagicMock())
+    cfg.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
+        _make_mock_response([config or _make_config()])
+    )
+
+    profiles = chains.setdefault("profiles", MagicMock())
+    profiles.select.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([{"id": MOCK_PROFILE_ID}])
+    )
+
+    candidates = chains.setdefault("candidates", MagicMock())
+    candidates.select.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([{"id": MOCK_CANDIDATE_ID, "semester": 5}])
+    )
+
+    attempts = chains.setdefault("assessment_attempts", MagicMock())
+    # active-attempt lookup: select(...).eq(profile_id).eq(status).execute()
+    attempts.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([{
+            "id": attempt["id"],
+            "expires_at": attempt["expires_at"],
+            "status": "in_progress",
+        }])
+    )
+    # full attempt fetch: select("*").eq(id).execute()
+    attempts.select.return_value.eq.return_value.execute.return_value = (
+        _make_mock_response([attempt])
+    )
+
+    # Eligible pools for the REMOVED top-up queries. These are deliberately
+    # large enough to satisfy a raised descriptive/hands-on count, so that the
+    # old top-up code would pass its length check and actually issue an UPDATE —
+    # which is exactly the mutation these tests assert can no longer happen.
+    desc_pool = chains.setdefault("descriptive_questions", MagicMock())
+    desc_pool.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+        _make_mock_response([
+            {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+            {"id": MOCK_DESC_ID_2, "domain_ids": [MOCK_DOMAIN_1_ID]},
+        ])
+    )
+    hands_pool = chains.setdefault("hands_on_questions", MagicMock())
+    hands_pool.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
+        _make_mock_response([
+            {"id": MOCK_HANDS_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+            {"id": MOCK_HANDS_ID_2, "domain_ids": [MOCK_DOMAIN_1_ID]},
+        ])
+    )
+    return chains
+
+
+class TestAttemptFrozenOnResume:
+    """POST /assessment/start resume must return the frozen attempt, read-only."""
+
+    def _auth(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+
+    def test_resume_ignores_live_config_changes(self, client, mock_supabase):
+        """A/B/C: attempt created with MCQ + descriptive + hands-on, then the
+        live assessment_config is changed, then the attempt is resumed.
+
+        The resume must return the frozen values and write nothing.
+        """
+        attempt = _frozen_attempt()
+        # Live config now asks for more of everything, plus a longer duration.
+        # The counts are small enough that the mocked pools below can satisfy
+        # them — so the OLD top-up code would have persisted an UPDATE. That is
+        # precisely the write asserted against here.
+        changed = _make_config(
+            total_questions=20,
+            coding_problem_count=5,
+            descriptive_question_count=2,
+            hands_on_question_count=2,
+            duration_minutes=99,
+            max_domains=2,
+        )
+        chains = _configure_resume_chains(mock_supabase, attempt, config=changed)
+        self._auth()
+        try:
+            r = client.post(
+                "/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]}
+            )
+            assert r.status_code == 200
+            data = r.json()
+
+            # C: same attempt, same ids, same counts, same duration/expiry.
+            assert data["attempt_id"] == MOCK_ATTEMPT_ID
+            assert data["resumed"] is True
+            assert data["domain_ids"] == [MOCK_DOMAIN_1_ID]
+            assert data["total_mcq_questions"] == 2
+            assert data["total_coding_problems"] == 1
+            assert data["total_descriptive_questions"] == 1
+            assert data["selected_descriptive_question_ids"] == FROZEN_DESC_IDS
+            assert data["total_hands_on_questions"] == 1
+            assert data["selected_hands_on_question_ids"] == FROZEN_HANDS_IDS
+            assert data["duration_minutes"] == 20          # NOT the new 99
+            assert data["expires_at"] == attempt["expires_at"]
+
+            # C: no UPDATE to assessment_attempts, and no top-up query at all.
+            attempts = chains["assessment_attempts"]
+            attempts.update.assert_not_called()
+            attempts.insert.assert_not_called()
+            attempts.delete.assert_not_called()
+            # No re-selection attempt was even started (overlaps is the query
+            # the removed descriptive/hands-on top-ups used).
+            chains["descriptive_questions"].select.return_value.eq.return_value.overlaps.assert_not_called()
+            chains["hands_on_questions"].select.return_value.eq.return_value.overlaps.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_resume_ignores_different_requested_domains(self, client, mock_supabase):
+        """The frozen domain_ids win even when the resume request names another
+        domain set — the removed top-up read the domains from the request body."""
+        attempt = _frozen_attempt()
+        chains = _configure_resume_chains(mock_supabase, attempt)
+        self._auth()
+        try:
+            r = client.post(
+                "/assessment/start", json={"domain_ids": [MOCK_DOMAIN_2_ID]}
+            )
+            assert r.status_code == 200
+            data = r.json()
+            assert data["domain_ids"] == [MOCK_DOMAIN_1_ID]   # frozen, not requested
+            assert data["selected_descriptive_question_ids"] == FROZEN_DESC_IDS
+            assert data["selected_hands_on_question_ids"] == FROZEN_HANDS_IDS
+
+            chains["assessment_attempts"].update.assert_not_called()
+            chains["descriptive_questions"].select.return_value.eq.return_value.overlaps.assert_not_called()
+            chains["hands_on_questions"].select.return_value.eq.return_value.overlaps.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_repeated_resume_is_byte_for_byte_stable(self, client, mock_supabase):
+        """D: repeated resumes return identical payloads and never mutate the
+        stored attempt."""
+        attempt = _frozen_attempt()
+        chains = _configure_resume_chains(mock_supabase, attempt)
+        self._auth()
+        try:
+            snapshot = json.dumps(attempt, sort_keys=True)
+
+            payloads = []
+            for _ in range(4):
+                r = client.post(
+                    "/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]}
+                )
+                assert r.status_code == 200
+                payloads.append(r.json())
+
+            first = json.dumps(payloads[0], sort_keys=True)
+            for later in payloads[1:]:
+                assert json.dumps(later, sort_keys=True) == first
+            for key in _FROZEN_RESUME_KEYS:
+                assert payloads[0][key] == payloads[-1][key]
+
+            # The stored attempt row is unmodified and never written.
+            assert json.dumps(attempt, sort_keys=True) == snapshot
+            chains["assessment_attempts"].update.assert_not_called()
+            chains["assessment_attempts"].insert.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestAttemptFrozenOnQuestionsFetch:
+    """GET /assessment/attempt/{id}/questions reads frozen sections, no writes."""
+
+    def _auth(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+
+    def _configure(self, mock_sb, attempt):
+        chains = _table_chains(mock_sb)
+
+        attempts = chains.setdefault("assessment_attempts", MagicMock())
+        attempts.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        mcq = chains.setdefault("mcq_questions", MagicMock())
+        mcq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([_make_mcq(MOCK_MCQ_1_ID), _make_mcq(MOCK_MCQ_2_ID)])
+        )
+
+        domains = chains.setdefault("domains", MagicMock())
+        domains.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID, "name": "Test Domain"}])
+        )
+
+        answers = chains.setdefault("assessment_answers", MagicMock())
+        answers.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        desc = chains.setdefault("descriptive_questions", MagicMock())
+        desc.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{
+                "id": FROZEN_DESC_IDS[0], "question_text": "Explain your approach.",
+                "image_url": None, "word_limit": None,
+            }])
+        )
+
+        desc_ans = chains.setdefault("assessment_descriptive_answers", MagicMock())
+        desc_ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        hands = chains.setdefault("hands_on_questions", MagicMock())
+        hands.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{
+                "id": FROZEN_HANDS_IDS[0], "title": "SQL Injection",
+                "description": "d", "difficulty": "medium", "points": 100,
+                "challenge_type": "sql_injection_employee_portal",
+                "challenge_url": "http://127.0.0.1:8080",
+            }])
+        )
+
+        hands_res = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hands_res.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        return chains
+
+    @patch("routers.assessment._get_active_config")
+    def test_questions_fetch_is_config_free_and_write_free(
+        self, mock_config, client, mock_supabase
+    ):
+        """C/D on the read path: frozen sections returned, no config read, no
+        re-selection, no write."""
+        attempt = _frozen_attempt()
+        chains = self._configure(mock_supabase, attempt)
+        self._auth()
+        try:
+            before = json.dumps(attempt, sort_keys=True)
+
+            r = client.get(f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions")
+            assert r.status_code == 200
+            data = r.json()
+
+            assert data["total_questions"] == 2
+            assert data["total_descriptive_questions"] == 1
+            assert len(data["descriptive_questions"]) == 1
+            assert data["total_hands_on_questions"] == 1
+            assert len(data["hands_on_questions"]) == 1
+            assert data["duration_minutes"] == 20
+            assert data["expires_at"] == attempt["expires_at"]
+
+            # The read path no longer consults the assessment configuration...
+            mock_config.assert_not_called()
+            # ...so no re-selection can run, and nothing is written.
+            chains["descriptive_questions"].select.return_value.eq.return_value.overlaps.assert_not_called()
+            chains["hands_on_questions"].select.return_value.eq.return_value.overlaps.assert_not_called()
+            attempts = chains["assessment_attempts"]
+            attempts.update.assert_not_called()
+            attempts.insert.assert_not_called()
+
+            assert json.dumps(attempt, sort_keys=True) == before
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestAttemptExpiryUnchanged:
+    """E: the existing expiry / scoring path still behaves as before."""
+
+    def _auth(self):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+
+    @patch("routers.assessment._score_attempt")
+    def test_expired_in_progress_attempt_follows_scoring_path(
+        self, mock_score, client, mock_supabase
+    ):
+        """An expired in-progress attempt is scored, never resumed."""
+        expired = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        attempt = _frozen_attempt(expires_at=expired)
+        chains = _configure_resume_chains(mock_supabase, attempt)
+        # Once scored, the candidate has a scored attempt → a new start is blocked.
+        chains["assessment_attempts"].select.return_value.eq.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_ATTEMPT_ID, "status": "scored"}])
+        )
+        self._auth()
+        try:
+            r = client.post(
+                "/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]}
+            )
+            mock_score.assert_called_once_with(MOCK_ATTEMPT_ID)
+            assert "resumed" not in r.json()
+            assert r.status_code == 409
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_non_expired_attempt_is_not_scored_on_resume(self, client, mock_supabase):
+        """A healthy attempt takes the resume branch, never the scoring path."""
+        attempt = _frozen_attempt()
+        _configure_resume_chains(mock_supabase, attempt)
+        self._auth()
+        try:
+            with patch("routers.assessment._score_attempt") as mock_score:
+                r = client.post(
+                    "/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]}
+                )
+            assert r.status_code == 200
+            assert r.json()["resumed"] is True
+            mock_score.assert_not_called()
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestSharedExpiryHelper:
+    """The duplicated _is_expired / _utcnow copies are now one implementation."""
+
+    def test_both_routers_use_the_shared_helper(self):
+        import routers.assessment as assessment_mod
+        import routers.coding as coding_mod
+        from utils import time_utils
+
+        assert assessment_mod._is_expired is time_utils.is_expired
+        assert coding_mod._is_expired is time_utils.is_expired
+        assert assessment_mod._utcnow is time_utils.utcnow
+        assert coding_mod._utcnow is time_utils.utcnow
+
+    def test_is_expired_semantics_preserved(self):
+        """Both original copies treated a missing expires_at as never expiring,
+        and accepted ISO strings (with or without a Z suffix) or datetimes."""
+        from utils.time_utils import is_expired
+
+        now = datetime.now(timezone.utc)
+
+        assert is_expired({}) is False
+        assert is_expired({"expires_at": None}) is False
+
+        assert is_expired({"expires_at": (now - timedelta(minutes=1)).isoformat()}) is True
+        assert is_expired({"expires_at": (now + timedelta(minutes=1)).isoformat()}) is False
+
+        past_z = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        future_z = (now + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        assert is_expired({"expires_at": past_z}) is True
+        assert is_expired({"expires_at": future_z}) is False
+
+        assert is_expired({"expires_at": now - timedelta(minutes=1)}) is True
+        assert is_expired({"expires_at": now + timedelta(minutes=1)}) is False

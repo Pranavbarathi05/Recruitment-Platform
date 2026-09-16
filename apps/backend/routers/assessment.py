@@ -10,7 +10,7 @@ ONE timer (expires_at), ONE final submission, ONE combined score.
 
 import random
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
 from core.supabase import supabase_client
@@ -18,6 +18,11 @@ from schemas.assessment import (
     AssessmentStartRequest, AnswerSaveRequest, DescriptiveAnswerSaveRequest,
     HandsOnSubmitRequest,
 )
+# One expiry rule, shared with routers/coding.py.
+from utils.time_utils import is_expired as _is_expired, utcnow as _utcnow
+# NEW-attempt planning is delegated to the pure planner through the
+# database-resolution service. Resuming an existing attempt never calls this.
+from services.assessment_planning import PLAN_PERSISTENCE_ENABLED, plan_new_attempt
 
 router = APIRouter(prefix="/assessment", tags=["Assessment"])
 
@@ -46,19 +51,6 @@ def _get_active_config() -> dict:
     config.setdefault("descriptive_question_count", 0)
     config.setdefault("hands_on_question_count", 0)
     return config
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _is_expired(attempt: dict) -> bool:
-    expires_at = attempt.get("expires_at")
-    if not expires_at:
-        return False
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-    return _utcnow() > expires_at
 
 
 def count_words(text: str) -> int:
@@ -404,13 +396,13 @@ def start_assessment(
     profile_id = current_user.id
 
     # 1. Read config
+    #
+    # Still needed: base duration, the global coding count, and (while the
+    # per-domain configuration matrix is authored) the explicit technical
+    # legacy fallback counts. It is NOT the source of domain limits or module
+    # counts for a new attempt any more — the assessment_program row and
+    # assessment_module_config are.
     config = _get_active_config()
-    total_mcq = config["total_questions"]
-    coding_problem_count = config.get("coding_problem_count", 0)
-    descriptive_question_count = config.get("descriptive_question_count", 0)
-    hands_on_question_count = config.get("hands_on_question_count", 0)
-    duration_minutes = config["duration_minutes"]
-    max_domains = config["max_domains"]
 
     # 2. Verify candidate
     profile = (
@@ -453,40 +445,17 @@ def start_assessment(
             _score_attempt(attempt_id)
             # After auto-scoring, fall through to check if a new start is allowed
         else:
-            # Active attempt exists and is not expired — resume it
+            # Active attempt exists and is not expired — resume it.
+            #
+            # FROZEN RESUME: the attempt is returned exactly as stored. Its
+            # domain_ids, every selected_*_ids array, every total_* count,
+            # duration_minutes and expires_at were resolved and frozen when the
+            # attempt was created. This path therefore performs NO re-selection,
+            # NO assessment_config read for the purpose of changing the attempt,
+            # and NO write (INSERT/UPDATE/DELETE) to assessment_attempts — so a
+            # later admin configuration change can never alter an active
+            # attempt.
             attempt = attempt_resp.data[0]
-
-            # Resume gap fix: attempts created before the descriptive feature
-            # (or before descriptive questions were authored) have an empty
-            # selection. If the config now asks for descriptive questions, top
-            # up the attempt so the candidate actually receives the section.
-            # Best-effort: selection failures never block the MCQ/coding resume.
-            selected_desc = attempt.get("selected_descriptive_question_ids") or []
-            want_desc = int(config.get("descriptive_question_count", 0) or 0)
-            if want_desc > 0 and len(selected_desc) < want_desc:
-                try:
-                    top_up = _select_descriptive_questions(want_desc, domain_ids=payload.domain_ids)
-                    supabase_client.table("assessment_attempts").update({
-                        "selected_descriptive_question_ids": top_up,
-                        "total_descriptive_questions": len(top_up),
-                    }).eq("id", attempt["id"]).execute()
-                except HTTPException:
-                    pass  # Not enough eligible questions — resume unchanged
-
-            # Hands-On resume top-up — mirrors the descriptive gap fix above.
-            # Best-effort: selection failures never block the MCQ/coding resume.
-            selected_hands = attempt.get("selected_hands_on_question_ids") or []
-            want_hands = int(config.get("hands_on_question_count", 0) or 0)
-            if want_hands > 0 and len(selected_hands) < want_hands:
-                try:
-                    top_up = _select_hands_on_questions(want_hands, domain_ids=payload.domain_ids)
-                    supabase_client.table("assessment_attempts").update({
-                        "selected_hands_on_question_ids": top_up,
-                        "total_hands_on_questions": len(top_up),
-                    }).eq("id", attempt["id"]).execute()
-                except HTTPException:
-                    pass  # Not enough eligible challenges — resume unchanged
-
             return {
                 "attempt_id": attempt["id"],
                 "total_mcq_questions": attempt["total_questions"],
@@ -517,98 +486,52 @@ def start_assessment(
             detail="You have already completed an assessment. Contact an admin to retake.",
         )
 
-    # 4. Validate domains
-    domain_ids = payload.domain_ids
-    if len(domain_ids) < 1 or len(domain_ids) > max_domains:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Select between 1 and {max_domains} domains",
-        )
-
-    domains_resp = (
-        supabase_client.table("domains")
-        .select("id, name, duration_minutes, is_active")
-        .in_("id", domain_ids)
-        .execute()
-    )
-    if not domains_resp.data or len(domains_resp.data) != len(domain_ids):
-        raise HTTPException(status_code=400, detail="One or more domains not found")
-
-    active_domains = [d for d in domains_resp.data if d["is_active"]]
-    if len(active_domains) != len(domain_ids):
-        raise HTTPException(status_code=400, detail="One or more selected domains are inactive")
-
-    # 5. Select MCQ questions
-    num_domains = len(domain_ids)
-    if num_domains == 1:
-        mcq_per_domain = total_mcq
-    else:
-        if total_mcq % 2 != 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Total MCQ questions ({total_mcq}) must be even for 2-domain split",
-            )
-        mcq_per_domain = total_mcq // 2
-
-    selected_question_ids = []
-    for domain in active_domains:
-        q_resp = (
-            supabase_client.table("mcq_questions")
-            .select("id")
-            .eq("domain_id", domain["id"])
-            .eq("semester", candidate_semester)
-            .eq("is_active", True)
-            .execute()
-        )
-        available = q_resp.data or []
-        if len(available) < mcq_per_domain:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Domain '{domain['name']}' (Semester {candidate_semester}) "
-                    f"has only {len(available)} active MCQ questions, need {mcq_per_domain}"
-                ),
-            )
-        sampled = random.sample(available, mcq_per_domain)
-        selected_question_ids.extend([q["id"] for q in sampled])
-
-    random.shuffle(selected_question_ids)
-
-    # 6. Select coding problems (from global pool, independent of domains)
-    selected_coding_ids = _select_coding_problems(
-        coding_problem_count
+    # 4. Resolve the frozen assessment plan for this NEW attempt.
+    #
+    # From here the PLANNER owns the decision: domain eligibility (exists /
+    # active / scope matches the programme), the selected-domain limit
+    # (programme max_domains), per-domain module configuration, cross-domain
+    # exact allocation of descriptive questions and hands-on challenges, the
+    # global coding selection, and the total duration. It fails loudly (400)
+    # rather than substituting, truncating or topping up anything.
+    plan = plan_new_attempt(
+        config=config,
+        semester=candidate_semester,
+        requested_domain_ids=payload.domain_ids,
     )
 
-    # 7. Select descriptive questions (active, overlapping chosen domains)
-    selected_descriptive_ids = _select_descriptive_questions(
-        descriptive_question_count, domain_ids
-    )
-
-    # 7b. Select hands-on challenges (active, overlapping chosen domains)
-    selected_hands_on_ids = _select_hands_on_questions(
-        hands_on_question_count, domain_ids
-    )
-
-    # 8. Create ONE combined attempt
+    # 5. Create ONE combined attempt from the planner's frozen values.
+    #
+    # The plan snapshot (plan / base_duration_minutes / additional_minutes)
+    # is persisted when PLAN_PERSISTENCE_ENABLED is True (migration 017+).
+    # When False, only the existing frozen columns are written.
     now = _utcnow()
-    expires_at = now + timedelta(minutes=duration_minutes)
+    expires_at = now + timedelta(minutes=plan.duration_minutes)
 
-    result = supabase_client.table("assessment_attempts").insert({
+    insert_payload = {
         "profile_id": profile_id,
         "status": "in_progress",
-        "domain_ids": domain_ids,
-        "selected_question_ids": selected_question_ids,
-        "total_questions": len(selected_question_ids),
-        "selected_coding_problem_ids": selected_coding_ids,
-        "total_coding_problems": len(selected_coding_ids),
-        "selected_descriptive_question_ids": selected_descriptive_ids,
-        "total_descriptive_questions": len(selected_descriptive_ids),
-        "selected_hands_on_question_ids": selected_hands_on_ids,
-        "total_hands_on_questions": len(selected_hands_on_ids),
-        "duration_minutes": duration_minutes,
+        "domain_ids": plan.domain_ids,
+        "selected_question_ids": plan.selected_mcq_ids,
+        "total_questions": plan.mcq_total,
+        "selected_coding_problem_ids": plan.selected_coding_problem_ids,
+        "total_coding_problems": plan.coding_total,
+        "selected_descriptive_question_ids": plan.selected_descriptive_question_ids,
+        "total_descriptive_questions": plan.descriptive_total,
+        "selected_hands_on_question_ids": plan.selected_hands_on_question_ids,
+        "total_hands_on_questions": plan.hands_on_total,
+        "duration_minutes": plan.duration_minutes,
         "started_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
-    }).execute()
+    }
+    if PLAN_PERSISTENCE_ENABLED:
+        insert_payload["plan"] = plan.model_dump(mode="json")
+        insert_payload["base_duration_minutes"] = plan.base_duration_minutes
+        insert_payload["additional_minutes"] = plan.additional_minutes
+
+    result = supabase_client.table("assessment_attempts").insert(
+        insert_payload
+    ).execute()
 
     attempt = result.data[0] if result.data else None
     if not attempt:
@@ -625,7 +548,7 @@ def start_assessment(
         "selected_hands_on_question_ids": attempt.get(
             "selected_hands_on_question_ids", []),
         "duration_minutes": attempt["duration_minutes"],
-        "domain_ids": domain_ids,
+        "domain_ids": plan.domain_ids,
         "expires_at": attempt["expires_at"],
     }
 
@@ -709,47 +632,12 @@ def get_attempt_questions(
         _score_attempt(attempt_id)
         raise HTTPException(status_code=400, detail="Assessment time has expired")
 
+    # FROZEN READ: Descriptive and Hands-on selections were resolved and frozen
+    # at attempt creation. They are read verbatim here — never re-selected, never
+    # topped up — so this endpoint cannot mutate the attempt either.
     question_ids = attempt["selected_question_ids"]
     desc_ids = attempt.get("selected_descriptive_question_ids") or []
     hands_ids = attempt.get("selected_hands_on_question_ids") or []
-
-    # Defensive: if the config asks for descriptive questions but the frozen
-    # selection is empty (attempt predates the feature or a previous selection
-    # failure), top up now instead of silently omitting the section.
-    try:
-        config = _get_active_config()
-        want_desc = int(config.get("descriptive_question_count", 0) or 0)
-    except HTTPException:
-        want_desc = 0
-    if want_desc > 0 and len(desc_ids) < want_desc:
-        try:
-            top_up = _select_descriptive_questions(want_desc, domain_ids=attempt.get("domain_ids") or [])
-            supabase_client.table("assessment_attempts").update({
-                "selected_descriptive_question_ids": top_up,
-                "total_descriptive_questions": len(top_up),
-            }).eq("id", attempt_id).execute()
-            desc_ids = top_up
-            attempt["total_descriptive_questions"] = len(top_up)
-        except HTTPException:
-            pass  # Not enough eligible questions — return whatever exists
-
-    # Hands-On defensive top-up — mirrors the descriptive gap fix above.
-    try:
-        config = _get_active_config()
-        want_hands = int(config.get("hands_on_question_count", 0) or 0)
-    except HTTPException:
-        want_hands = 0
-    if want_hands > 0 and len(hands_ids) < want_hands:
-        try:
-            top_up = _select_hands_on_questions(want_hands, domain_ids=attempt.get("domain_ids") or [])
-            supabase_client.table("assessment_attempts").update({
-                "selected_hands_on_question_ids": top_up,
-                "total_hands_on_questions": len(top_up),
-            }).eq("id", attempt_id).execute()
-            hands_ids = top_up
-            attempt["total_hands_on_questions"] = len(top_up)
-        except HTTPException:
-            pass  # Not enough eligible challenges — return whatever exists
 
     # Fetch MCQ questions (empty list if none selected)
     questions = []

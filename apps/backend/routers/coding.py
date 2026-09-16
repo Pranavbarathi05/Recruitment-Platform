@@ -9,18 +9,15 @@ All endpoints:
 """
 
 import json
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import get_current_user, AuthUser
 from core.supabase import supabase_client
 from schemas.coding import CodingSubmitRequest, CodingDraftSaveRequest, CodingRunRequest
 from services.code_executor import run_code_public, evaluate_submission
+# One expiry rule, shared with routers/assessment.py.
+from utils.time_utils import is_expired as _is_expired, utcnow as _utcnow
 
 router = APIRouter(prefix="/coding", tags=["Coding Assessment"])
-
-
-def _utcnow():
-    return datetime.now(timezone.utc)
 
 
 def _normalize_test_case_expected(test_case: dict) -> dict:
@@ -46,15 +43,6 @@ def _normalize_test_case_expected(test_case: dict) -> dict:
         except ValueError:
             pass
     return test_case
-
-
-def _is_expired(attempt: dict) -> bool:
-    expires_at = attempt.get("expires_at")
-    if not expires_at:
-        return False
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-    return _utcnow() > expires_at
 
 
 def _verify_attempt_ownership(attempt_id: str, user_id: str) -> dict:
