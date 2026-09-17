@@ -136,7 +136,7 @@ def _build_preflight(
 ) -> dict:
     """Build the preflight validation object.
 
-    Two distinct severities, deliberately kept apart:
+    TWO SEVERITIES, deliberately kept apart:
 
     hard_errors
         A PER-DOMAIN pool shortage: the requested count exceeds this domain's
@@ -144,22 +144,17 @@ def _build_preflight(
         caller rejects the request and performs NO write.
 
     warnings
-        Cross-domain feasibility uncertainty, plus the advisory notes specific
-        to the final core semantics. Descriptive questions and hands-on
+        Cross-domain feasibility uncertainty. Descriptive questions and hands-on
         challenges may be shared between domains, and a single-domain preflight
         cannot prove that a multi-domain plan is jointly satisfiable. These are
-        advisory only; the planner's bipartite matching resolves the real
-        allocation when an assessment is created.
+        advisory only; the planner validates the real allocation.
 
-    FINAL CORE SEMANTICS
-        For a TECHNICAL domain, ``mcq_count`` is NOT the MCQ quantity any more:
-        the programme's ``assessment_config``-independent ``mcq_total`` is split
-        across the selected domains by the planner. The configured value is
-        therefore ignored by the engine, so it must NOT be able to block a save
-        — otherwise an author could not configure a senior hands-on module
-        without also satisfying an unrelated MCQ pool. ``descriptive_count`` is
-        rejected at the endpoint for technical domains, so it can never reach
-        this check.
+    FINAL SEMANTICS
+        ``mcq_count`` IS the per-domain MCQ quantity — it is authoritative.
+        For technical domains, it replaces the old programme-level split.
+        For organizational domains, it was always authoritative.
+        ``descriptive_count`` is organizational-only; rejected at the endpoint
+        for technical domains.
     """
     semester = APPLIES_TO_VALIDATION_SEMESTER[applies_to]
     mcq_available = _count_mcq_pool(domain_id, semester)
@@ -169,13 +164,10 @@ def _build_preflight(
     hard_errors = []
     warnings = []
 
-    if is_technical:
-        warnings.append(
-            "Technical MCQ quantity is derived from the assessment programme "
-            "(mcq_total split across the selected domains), so mcq_count is "
-            "not used by the engine and is not validated against this pool"
-        )
-    elif mcq_count > mcq_available:
+    # MCQ pool validation: mcq_count is authoritative for ALL scopes.
+    # mcq_count=0 is valid (domain contributes zero MCQs) and never
+    # triggers a shortage.
+    if mcq_count > mcq_available:
         hard_errors.append(
             f"Requested mcq_count ({mcq_count}) exceeds the available "
             f"MCQ pool ({mcq_available}) for semester {semester}"

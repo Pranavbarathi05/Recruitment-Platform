@@ -229,9 +229,8 @@ class TestProgramResolution:
 
         assert response.status_code == 200
         # The junior programme was the one resolved. Under the final rule the
-        # MCQ quantity is DERIVED from the programme total (2) split across the
-        # one selected domain, so the junior row's mcq_count is not consulted.
-        assert _payload(mock_supabase)["total_questions"] == 2
+        # MCQ quantity comes from the module config's mcq_count.
+        assert _payload(mock_supabase)["total_questions"] == 1
 
     def test_semester_5_resolves_senior_program(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
@@ -632,21 +631,19 @@ class TestModuleConfiguration:
         assert response.status_code == 200
         assert spy.plan.config_source.value == "modular"
         payload = _payload(mock_supabase)
-        # Technical MCQ comes from the programme, so the configured mcq_count=1
-        # is ignored and the full programme total is drawn from the one domain.
-        assert payload["total_questions"] == 2
+        # Technical MCQ comes from module config mcq_count=1 per domain.
+        assert payload["total_questions"] == 1
         # Technical carries no descriptive questions at all, so the configured
-        # descriptive_count=1 (and the unused global 2) are both ignored.
+        # descriptive_count=1 is ignored.
         assert payload["total_descriptive_questions"] == 0
 
-    def test_partially_configured_technical_plan_is_valid(
+    def test_partially_configured_technical_plan_is_rejected(
         self, client, mock_supabase, spy
     ):
-        """One configured domain out of two is a VALID technical plan.
+        """ALL selected domains must have module configuration.
 
-        Nothing technical is derived from module configuration any more, so a
-        partially authored tier carries no hybrid risk: the unconfigured domain
-        simply has no optional module enabled.
+        With module config now authoritative for MCQ counts, a missing row
+        for any selected domain is a hard refusal.
         """
         second_domain = dict(
             TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Web Dev", slug="webDevelopment"
@@ -681,25 +678,16 @@ class TestModuleConfiguration:
         finally:
             client.app.dependency_overrides.clear()
 
-        assert response.status_code == 200
-        # The programme total (2) split evenly across BOTH selected domains:
-        # 1 + 1, regardless of the partial module configuration.
-        assert spy.plan.config_source.value == "modular"
-        payload = _payload(mock_supabase)
-        assert payload["total_questions"] == 2
-        assert sorted(_payload(mock_supabase)["domain_ids"]) == sorted(
-            [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
-        )
+        assert response.status_code == 400
+        assert spy.called, "the planner must have been asked and refused"
 
-    def test_technical_never_receives_the_legacy_global_fallback(
+    def test_technical_requires_module_config_for_mcq_count(
         self, client, mock_supabase, spy
     ):
-        """The pre-modular global bridge no longer exists at all.
+        """Technical MCQ count now comes from module configuration.
 
-        Technical quantities are programme-derived (mcq_total) or global by
-        design (coding count), and descriptive questions are organizational-
-        only, so there is nothing a legacy global count could supply — and the
-        retired fallback input is gone from the planner request model.
+        Without a module row the planner cannot determine how many MCQs to
+        select, so the attempt is refused (MISSING_MODULE_CONFIG).
         """
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
@@ -711,16 +699,12 @@ class TestModuleConfiguration:
         )
         _auth()
         try:
-            assert _post(client).status_code == 200
+            response = _post(client)
         finally:
             client.app.dependency_overrides.clear()
 
-        # The retired fallback is not merely unused: it is not a field any more.
-        assert "legacy_technical_fallback" not in spy.request.model_fields
-        # The assessment still succeeded, deriving its MCQ count from the
-        # programme rather than from assessment_config.total_questions.
-        assert spy.plan.mcq_total == 2
-        assert spy.plan.descriptive_total == 0
+        assert response.status_code == 400
+        assert spy.called, "the planner must have been asked and refused"
 
     def test_missing_organizational_config_is_rejected(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")

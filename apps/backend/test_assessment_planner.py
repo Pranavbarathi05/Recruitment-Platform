@@ -67,11 +67,10 @@ PROGRAM_1 = ProgramInput(
     max_domains=1,
     coding_enabled=False,
 )
-# The FINAL technical MCQ rule: the quantity is a PROGRAM-level total split
-# evenly across the selected domains, so it lives on the program row
-# (migration 018) and not on assessment_module_config. 20 -> a single domain,
-# 10 + 10 -> two domains.
-TECH_MCQ_TOTAL = 20
+# The mcq_total field still exists on assessment_program (migration 018)
+# but the planner no longer reads it for technical MCQ quantity. Technical
+# MCQ counts now come from assessment_module_config.mcq_count per domain.
+TECH_MCQ_TOTAL = 20  # legacy default; tests use configured per-domain values
 
 PROGRAM_3 = ProgramInput(
     semester=3,
@@ -229,9 +228,9 @@ class TestProgramScopes:
         assert plan.scope is Scope.TECHNICAL
         assert plan.tier.value == "junior"
         assert plan.config_source is ConfigSource.MODULAR
-        # Junior technical: the derived 20 MCQs for ONE selected domain.
-        assert plan.mcq_total == 20
-        assert [e.mcq_count for e in plan.domains] == [20]
+        # Junior technical: the configured mcq_count for ONE selected domain.
+        assert plan.mcq_total == 5  # CYBER_JUNIOR mcq=5
+        assert [e.mcq_count for e in plan.domains] == [5]
         # Technical Junior carries NO descriptive questions, ever.
         assert plan.descriptive_total == 0
         assert plan.selected_descriptive_question_ids == []
@@ -248,8 +247,8 @@ class TestProgramScopes:
         )
         assert plan.scope is Scope.TECHNICAL
         assert plan.tier.value == "senior"
-        # Senior technical: the derived 20 MCQs for ONE selected domain.
-        assert plan.mcq_total == 20
+        # Senior technical: the configured mcq_count for ONE selected domain.
+        assert plan.mcq_total == 5  # CYBER_SENIOR mcq=5
         # Technical carries NO descriptive questions, even though the module
         # row still says desc=2 (technical descriptive is not used).
         assert plan.descriptive_total == 0
@@ -396,28 +395,26 @@ class TestDomainSelection:
 
 
 class TestModuleConfiguration:
-    def test_missing_technical_module_config_is_tolerated(self):
-        """FINAL RULE: technical module configuration is OPTIONAL.
+    def test_missing_technical_module_config_is_fatal(self):
+        """Technical module configuration is now REQUIRED.
 
-        A technical assessment derives every quantity it needs from the
-        programme (mcq_total, coding count, base duration) plus the global DSA
-        pool. A module row only switches on OPTIONAL modules, so an unauthored
-        matrix must NOT block a technical assessment — it simply means no
-        optional module (hands-on) is enabled.
+        The planner needs per-domain mcq_count to know how many MCQs to
+        select. A missing row is a hard refusal.
         """
-        plan = plan_assessment(build(PROGRAM_5, [CYBER_ID]))
-        assert plan.config_source is ConfigSource.MODULAR
-        assert plan.mcq_total == 20
-        assert plan.hands_on_total == 0
-        assert plan.practicals == []
+        err = expect_failure(
+            PlanningErrorKind.MISSING_MODULE_CONFIG,
+            program=PROGRAM_5,
+            domain_ids=[CYBER_ID],
+        )
+        assert "technical MCQ counts" in err.detail
 
-    def test_module_config_cannot_change_technical_mcq_quantity(self):
-        """mcq_count must never influence a technical MCQ total.
+    def test_module_config_mcq_count_is_authoritative_for_technical(self):
+        """mcq_count IS the per-domain MCQ quantity for technical.
 
-        Three wildly different configured counts all yield the derived 20,
-        because the quantity comes from program.mcq_total alone.
+        Two wildly different configured counts yield matching plan totals,
+        proving the configured value is authoritative.
         """
-        for configured in (0, 1, 40):
+        for configured in (0, 5, 15):
             plan = plan_assessment(
                 build(
                     PROGRAM_5,
@@ -425,8 +422,8 @@ class TestModuleConfiguration:
                     [cfg(CYBER_ID, "senior", mcq=configured)],
                 )
             )
-            assert plan.mcq_total == TECH_MCQ_TOTAL
-            assert plan.domains[0].mcq_count == TECH_MCQ_TOTAL
+            assert plan.mcq_total == configured
+            assert plan.domains[0].mcq_count == configured
 
     def test_technical_descriptive_count_is_not_used(self):
         """A technical module row cannot introduce descriptive questions."""
@@ -437,33 +434,7 @@ class TestModuleConfiguration:
         assert plan.selected_descriptive_question_ids == []
         assert plan.domains[0].descriptive_count == 0
 
-    def test_odd_technical_mcq_total_cannot_split_across_two_domains(self):
-        odd = ProgramInput(
-            semester=5,
-            scope=Scope.TECHNICAL,
-            tier="senior",
-            max_domains=2,
-            coding_enabled=True,
-            mcq_total=21,
-        )
-        err = expect_failure(
-            PlanningErrorKind.INVALID_PROGRAM,
-            program=odd,
-            domain_ids=[CYBER_ID, WEB_ID],
-        )
-        assert "cannot be split evenly" in err.detail
 
-    def test_odd_technical_mcq_total_is_fine_for_one_domain(self):
-        odd = ProgramInput(
-            semester=5,
-            scope=Scope.TECHNICAL,
-            tier="senior",
-            max_domains=2,
-            coding_enabled=True,
-            mcq_total=21,
-        )
-        plan = plan_assessment(build(odd, [CYBER_ID]))
-        assert plan.mcq_total == 21
 
     def test_missing_organizational_config_fails(self):
         """Organizational content has exactly one source: its module row.
@@ -493,45 +464,41 @@ class TestModuleConfiguration:
             "legacy_technical_fallback" not in AssessmentPlanRequest.model_fields
         )
 
-    def test_partial_technical_config_only_affects_the_configured_domain(self):
-        """A partially authored tier is valid for TECHNICAL scopes.
+    def test_partial_technical_config_fails_for_unconfigured_domain(self):
+        """ALL selected domains must have module configuration.
 
-        There is no longer a hybrid risk to guard against: nothing technical is
-        derived from module configuration any more. Only the configured domain
-        gains the optional hands-on module.
+        With module config now authoritative for MCQ counts, a missing row
+        for any selected domain is a hard refusal.
         """
         cyber = cfg(
             CYBER_ID, "senior", mcq=5, hands_on=True, hands_on_count=1, minutes=20
         )
-        plan = plan_assessment(
-            build(
-                PROGRAM_5,
-                [CYBER_ID, WEB_ID],
-                [cyber],  # WEB deliberately unconfigured
-            )
+        err = expect_failure(
+            PlanningErrorKind.MISSING_MODULE_CONFIG,
+            program=PROGRAM_5,
+            domain_ids=[CYBER_ID, WEB_ID],
+            module_configs=[cyber],  # WEB deliberately unconfigured
         )
-        assert plan.config_source is ConfigSource.MODULAR
-        assert plan.mcq_total == 20
-        assert [e.mcq_count for e in plan.domains] == [10, 10]
-        assert plan.hands_on_total == 1
-        assert [(e.hands_on_enabled, e.hands_on_count) for e in plan.domains] == [
-            (True, 1),
-            (False, 0),
-        ]
+        assert "Web Development" in err.detail
 
     def test_technical_plan_is_always_modular(self):
-        """A technical plan's content source is MODULAR, with or without rows.
+        """A technical plan's content source is MODULAR when configs exist.
 
-        Replaces the old "modular wins over an explicit fallback" check: with
-        the fallback deleted, MODULAR is the only possible source.
+        Module configuration is now required, so a plan can only be created
+        when all selected domains have matching config rows.
         """
         with_rows = plan_assessment(
             build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
         )
-        without_rows = plan_assessment(build(PROGRAM_5, [CYBER_ID]))
-        for plan in (with_rows, without_rows):
-            assert plan.config_source is ConfigSource.MODULAR
-            assert plan.mcq_total == TECH_MCQ_TOTAL
+        assert with_rows.config_source is ConfigSource.MODULAR
+        assert with_rows.mcq_total == 5  # CYBER_SENIOR mcq=5
+        # Without rows: hard refusal
+        err = expect_failure(
+            PlanningErrorKind.MISSING_MODULE_CONFIG,
+            program=PROGRAM_5,
+            domain_ids=[CYBER_ID],
+        )
+        assert "technical MCQ counts" in err.detail
 
     def test_duplicate_module_config_rejected(self):
         err = expect_failure(
@@ -558,20 +525,19 @@ class TestModuleConfiguration:
                 module_configs=[bad],
             )
 
-    def test_config_for_wrong_tier_is_not_used(self):
+    def test_config_for_wrong_tier_is_fatal(self):
         """A junior row must not satisfy a senior programme.
 
-        The row is simply not resolved (it belongs to another configuration
-        family), so the senior plan falls back to "no optional module" instead
-        of borrowing the junior row — and its MCQs still come from the
-        programme, so the plan is unaffected either way.
+        The row belongs to a different configuration family, so the senior
+        plan sees no matching config and refuses.
         """
-        plan = plan_assessment(
-            build(PROGRAM_5, [CYBER_ID], [CYBER_JUNIOR])
+        err = expect_failure(
+            PlanningErrorKind.MISSING_MODULE_CONFIG,
+            program=PROGRAM_5,
+            domain_ids=[CYBER_ID],
+            module_configs=[CYBER_JUNIOR],
         )
-        assert plan.domains[0].config_applies_to is None
-        assert plan.hands_on_total == 0
-        assert plan.mcq_total == TECH_MCQ_TOTAL
+        assert "senior" in err.detail
 
 
 # ---------------------------------------------------------------------------
@@ -581,17 +547,16 @@ class TestModuleConfiguration:
 
 class TestMCQSelection:
     def test_per_domain_mcq_counts(self):
-        """Two junior domains -> an even 10 + 10, ignoring configured counts.
+        """Two junior domains: the configured counts are used directly.
 
-        CYBER_JUNIOR configures mcq=5 and WEB_JUNIOR mcq=4 under the old model;
-        neither value is consulted, and the derived split of the programme's
-        total is used instead.
+        CYBER_JUNIOR configures mcq=5 and WEB_JUNIOR mcq=4. The total is
+        the sum of the two configured values (9), not a derived even split.
         """
         plan = plan_assessment(
             build(PROGRAM_3, [CYBER_ID, WEB_ID], [CYBER_JUNIOR, WEB_JUNIOR])
         )
-        assert [e.mcq_count for e in plan.domains] == [10, 10]
-        assert plan.mcq_total == TECH_MCQ_TOTAL
+        assert [e.mcq_count for e in plan.domains] == [5, 4]
+        assert plan.mcq_total == 9
 
     def test_mcq_pool_is_filtered_by_candidate_semester(self):
         """Only the candidate's semester pool is eligible."""
@@ -613,17 +578,17 @@ class TestMCQSelection:
 
     def test_insufficient_mcq_pool_fails_loudly(self):
         req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
-        req.mcq_pool = mcq_items(CYBER_ID, 5, 19, "q")  # a 19-question pool
+        req.mcq_pool = mcq_items(CYBER_ID, 5, 3, "q")  # only 3 questions
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
         assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_MCQ_POOL
-        # The requirement is the derived 20-for-one-domain share, NOT the 19
-        # that happen to exist, and NOT anything from the module row.
-        assert "only 19 active MCQ questions, need 20" in excinfo.value.detail
+        # The requirement is the configured mcq_count (5), only 3 exist.
+        assert "only 3 active MCQ questions, need 5" in excinfo.value.detail
 
     def test_mcq_does_not_top_up_from_another_domain(self):
         """Web has plenty; Cyber is short. The plan must still fail."""
         req = build(PROGRAM_3, [CYBER_ID, WEB_ID], [CYBER_JUNIOR, WEB_JUNIOR])
+        # Cyber needs 5 (CYBER_JUNIOR mcq=5) but only has 1; Web has plenty.
         req.mcq_pool = mcq_items(CYBER_ID, 3, 1, "cyber") + mcq_items(
             WEB_ID, 3, 40, "web"
         )
@@ -1071,22 +1036,12 @@ class TestDeterminismAndSafety:
             build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], base=90)
         )
         changed_cases = {
-            # The program-level MCQ total IS planning configuration, so it must
-            # move the fingerprint. (`assessment_module_config.mcq_count` and
-            # `.descriptive_count` deliberately do NOT for a technical scope:
-            # neither value is read any more, which is asserted separately in
-            # TestModuleConfiguration.)
-            "program_mcq_total": build(
-                ProgramInput(
-                    semester=5,
-                    scope=Scope.TECHNICAL,
-                    tier="senior",
-                    max_domains=2,
-                    coding_enabled=True,
-                    mcq_total=30,
-                ),
+            # mcq_count IS planning configuration for technical now, so
+            # changing it must move the fingerprint.
+            "mcq_count_changed": build(
+                PROGRAM_5,
                 [CYBER_ID],
-                [CYBER_SENIOR],
+                [cfg(CYBER_ID, "senior", mcq=12)],
                 base=90,
                 mcq_pool=mcq_items(CYBER_ID, 5, 40, "big"),
             ),
@@ -1188,8 +1143,8 @@ class TestDeterminismAndSafety:
     def test_sensitive_extra_fields_on_pool_rows_never_reach_the_plan(self):
         """Supabase rows are usually SELECT *, so extras must be dropped."""
         req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=1)
-        # The technical rule needs the derived 20-for-one-domain share, so the
-        # pool has to be big enough for the selection to succeed.
+        # The technical rule needs the configured mcq_count per domain, so
+        # the pool has to be big enough for the selection to succeed.
         req.mcq_pool = [
             MCQPoolItem(
                 id=f"q{i}",
@@ -1262,9 +1217,9 @@ class TestMultiDomainAggregation:
         plan = plan_assessment(
             build(PROGRAM_5, [CYBER_ID, WEB_ID], [cyber, web], coding=2, base=90)
         )
-        # Two senior domains: the derived 10 + 10 split of the programme total.
-        assert plan.mcq_total == TECH_MCQ_TOTAL
-        assert [e.mcq_count for e in plan.domains] == [10, 10]
+        # Two senior domains: the configured per-domain counts (5 + 5 = 10).
+        assert plan.mcq_total == 10
+        assert [e.mcq_count for e in plan.domains] == [5, 5]
         # Descriptive is organizational-only, so neither domain contributes any.
         assert plan.descriptive_total == 0
         assert plan.hands_on_total == 1
@@ -1284,8 +1239,8 @@ class TestMultiDomainAggregation:
                 base=90,
             )
         )
-        assert plan.mcq_total == TECH_MCQ_TOTAL
-        assert [e.mcq_count for e in plan.domains] == [10, 10]
+        assert plan.mcq_total == 9  # 5 (cyber) + 4 (web)
+        assert [e.mcq_count for e in plan.domains] == [5, 4]
         assert plan.descriptive_total == 0
         assert plan.hands_on_total == 0
         assert plan.selected_hands_on_question_ids == []
@@ -1297,7 +1252,9 @@ class TestMultiDomainAggregation:
         plan = plan_assessment(
             build(PROGRAM_5, [CYBER_ID, WEB_ID], [CYBER_SENIOR, WEB_SENIOR])
         )
+        # 5 (cyber) + 5 (web) = 10
         assert sum(e.mcq_count for e in plan.domains) == plan.mcq_total
+        assert plan.mcq_total == 10
 
     def test_per_domain_descriptive_counts_sum_to_total_after_dedup(self):
         plan = plan_assessment(
@@ -1612,14 +1569,14 @@ class TestPurityGuarantees:
 
     def test_duplicate_mcq_rows_are_counted_once(self):
         req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
-        # 20 unique ids, each supplied twice: the derived single-domain share
-        # is 20, so only deduplication makes this satisfiable.
+        # 20 unique ids, each supplied twice: the configured count is 5,
+        # so only deduplication makes this satisfiable (pool > 5).
         req.mcq_pool = (
             mcq_items(CYBER_ID, 5, 20, "q") + mcq_items(CYBER_ID, 5, 20, "q")
         )
         plan = plan_assessment(req)
-        assert plan.mcq_total == TECH_MCQ_TOTAL
-        assert len(set(plan.selected_mcq_ids)) == TECH_MCQ_TOTAL
+        assert plan.mcq_total == 5  # CYBER_SENIOR mcq=5
+        assert len(set(plan.selected_mcq_ids)) == 5
 
     def test_planner_never_raises_for_missing_pools_when_nothing_is_needed(self):
         """Organizational with zero counts still produces a valid plan."""
@@ -1688,15 +1645,15 @@ class TestMCQOrdering:
         b = plan_assessment(req_b)
         # Both have 10 MCQs (5 per domain), so a different seed should
         # produce a different final order.
-        # Two senior domains -> the derived 10 + 10, so 20 MCQs in total.
-        assert a.mcq_total == TECH_MCQ_TOTAL
-        assert b.mcq_total == TECH_MCQ_TOTAL
+        assert a.mcq_total == 10
+        assert b.mcq_total == 10
         assert a.selected_mcq_ids != b.selected_mcq_ids
 
     def test_mcq_ids_are_not_grouped_by_domain(self):
         """With a seed, MCQs from different domains must be interleaved
 
         rather than appearing as domain-1-then-domain-2 blocks.
+
         With a pool of 25 per domain and 5 MCQs per domain, a seeded
         request should produce interleaving in at least some runs.
         """
@@ -1709,8 +1666,8 @@ class TestMCQOrdering:
         plan = plan_assessment(req)
         ids = plan.selected_mcq_ids
         # All IDs should be from the MCQ pool (domain-prefixed)
-        assert len(ids) == TECH_MCQ_TOTAL
-        assert len(set(ids)) == TECH_MCQ_TOTAL
+        assert len(ids) == 10  # 5 (cyber) + 5 (web)
+        assert len(set(ids)) == 10
         # With a seed, the list should not be purely domain-grouped.
         # Check that at least one transition changes domain prefix.
         domain_prefixes = [qid.split("-")[1] if "-" in qid else "" for qid in ids]
@@ -1777,5 +1734,5 @@ class TestMCQOrdering:
         # Every MCQ must belong to Cyber Security (the only selected domain)
         for qid in plan.selected_mcq_ids:
             assert CYBER_ID in qid or qid.startswith("q" + CYBER_ID)
-        assert len(plan.selected_mcq_ids) == TECH_MCQ_TOTAL
-        assert len(set(plan.selected_mcq_ids)) == TECH_MCQ_TOTAL
+        assert len(plan.selected_mcq_ids) == 5  # CYBER_SENIOR mcq=5
+        assert len(set(plan.selected_mcq_ids)) == 5

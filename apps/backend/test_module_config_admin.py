@@ -619,15 +619,13 @@ class TestCountValidation:
         finally:
             _clear_auth()
 
-    def test_technical_mcq_count_is_not_pool_validated(
+    def test_technical_mcq_count_is_pool_validated(
         self, client, mock_supabase
     ):
-        """Technical mcq_count is advisory only: the programme decides quantity.
+        """Technical mcq_count IS now the per-domain MCQ quantity.
 
-        The planner derives the technical MCQ quantity from the selected-domain
-        count, so blocking a save on an unrelated MCQ pool would make a senior
-        hands-on module impossible to configure. The value is stored but unused,
-        and the preflight says so explicitly.
+        An excessive count must be a hard error because the planner uses
+        this value directly.
         """
         _route_table(mock_supabase, "domains")
         _configure_domains(mock_supabase, [TECH_DOMAIN])
@@ -648,10 +646,8 @@ class TestCountValidation:
                     "hands_on_additional_minutes": 10,
                 },
             )
-            assert resp.status_code == 200
-            preflight = resp.json()["preflight"]
-            assert preflight["hard_errors"] == []
-            assert any("derived" in w.lower() for w in preflight["warnings"])
+            assert resp.status_code == 400
+            assert "mcq_count" in resp.json()["detail"].lower()
         finally:
             _clear_auth()
 

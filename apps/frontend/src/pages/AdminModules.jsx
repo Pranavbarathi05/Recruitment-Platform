@@ -354,7 +354,7 @@ const AdminModules = () => {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <label htmlFor="mcq_count" className="block text-sm font-medium text-theme-primary mb-1">
-                      MCQ count
+                      MCQ count (per selected domain)
                     </label>
                     <input
                       id="mcq_count"
