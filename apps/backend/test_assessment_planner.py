@@ -1719,3 +1719,89 @@ class TestMCQOrdering:
             assert CYBER_ID in qid or qid.startswith("q" + CYBER_ID)
         assert len(plan.selected_mcq_ids) == 20  # PROGRAM_5.mcq_total
         assert len(set(plan.selected_mcq_ids)) == 20
+
+
+class TestTechnicalDescriptiveNeverRequired:
+    """Descriptive questions are strictly an Organizational Roles component.
+
+    Technical assessments (Junior/Senior) must NEVER require, select,
+    validate, or count descriptive questions — regardless of:
+    - assessment_config.descriptive_question_count value
+    - assessment_module_config.descriptive_count on a technical row
+    - presence/absence of descriptive questions in the pool
+    """
+
+    def test_semester_3_technical_succeeds_with_zero_descriptive_pool(self):
+        """Junior technical with no descriptive questions at all: no error."""
+        plan = plan_assessment(
+            build(PROGRAM_3, [CYBER_ID], module_configs=[], coding=2)
+        )
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+        assert plan.mcq_total == 20
+        assert plan.coding_total == 2
+
+    def test_semester_5_technical_succeeds_with_zero_descriptive_pool(self):
+        """Senior technical with no descriptive questions: no error."""
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=2)
+        )
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+        assert plan.mcq_total == 20
+        assert plan.coding_total == 2
+
+    def test_two_technical_domains_no_descriptive(self):
+        """Two technical domains with zero descriptive: succeeds."""
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID, WEB_ID], module_configs=[], coding=2)
+        )
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+        assert plan.mcq_total == 20
+        assert plan.coding_total == 2
+
+    def test_technical_module_config_descriptive_ignored(self):
+        """A technical module row with descriptive_count>0 is still ignored."""
+        bad_config = cfg(CYBER_ID, "senior", mcq=5, desc=3)
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], [bad_config], coding=2)
+        )
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+
+    def test_technical_with_rich_descriptive_pool_still_gets_none(self):
+        """Even with 50 descriptive questions in pool, technical gets zero."""
+        req = build(PROGRAM_5, [CYBER_ID], module_configs=[], coding=2)
+        req.descriptive_pool = desc_items(
+            [f"d{i}" for i in range(50)], [CYBER_ID]
+        )
+        plan = plan_assessment(req)
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+
+    def test_organizational_descriptive_still_validates_pool(self):
+        """Organizational with descriptive=2 but only 1 question: FAILS."""
+        req = build(
+            PROGRAM_1,
+            [ORG_ID],
+            [cfg(ORG_ID, "organizational", mcq=5, desc=2)],
+            descriptive_pool=desc_items(["d1"], [ORG_ID]),
+        )
+        with pytest.raises(AssessmentPlanningError) as excinfo:
+            plan_assessment(req)
+        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_DESCRIPTIVE_POOL
+
+    def test_organizational_descriptive_succeeds_with_sufficient_pool(self):
+        """Organizational with desc=2 and 2 questions: succeeds."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_1,
+                [ORG_ID],
+                [cfg(ORG_ID, "organizational", mcq=5, desc=2)],
+                descriptive_pool=desc_items(["d1", "d2"], [ORG_ID]),
+            )
+        )
+        assert plan.mcq_total == 5
+        assert plan.descriptive_total == 2
+        assert plan.coding_total == 0

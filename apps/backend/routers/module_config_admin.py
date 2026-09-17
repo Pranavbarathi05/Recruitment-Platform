@@ -175,7 +175,10 @@ def _build_preflight(
             f"Requested mcq_count ({mcq_count}) exceeds the available "
             f"MCQ pool ({mcq_available}) for semester {semester}"
         )
-    if descriptive_count > descriptive_available:
+    # Descriptive pool validation: ONLY for organizational scope.
+    # Technical assessments NEVER carry descriptive questions — the planner
+    # hard-codes descriptive_count=0 for technical, so the pool is irrelevant.
+    if not is_technical and descriptive_count > descriptive_available:
         hard_errors.append(
             f"Requested descriptive_count ({descriptive_count}) exceeds the "
             f"available descriptive pool ({descriptive_available})"
@@ -188,7 +191,9 @@ def _build_preflight(
 
     # Advisory only: a single-domain preflight cannot prove that a
     # multi-domain plan is jointly satisfiable when questions are shared.
-    if descriptive_count > 0 and _count_shared_pool(
+    # Descriptive shared-pool advisory is organizational-only: technical
+    # never carries descriptive questions at all.
+    if not is_technical and descriptive_count > 0 and _count_shared_pool(
         "descriptive_questions", domain_id
     ) > 0:
         warnings.append(
