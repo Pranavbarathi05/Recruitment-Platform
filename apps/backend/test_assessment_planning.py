@@ -228,9 +228,9 @@ class TestProgramResolution:
             client.app.dependency_overrides.clear()
 
         assert response.status_code == 200
-        # The junior programme was the one resolved. Under the final rule the
-        # MCQ quantity comes from the module config's mcq_count.
-        assert _payload(mock_supabase)["total_questions"] == 1
+        # The junior programme was the one resolved. Under the master-total
+        # rule the MCQ quantity comes from program.mcq_total (2).
+        assert _payload(mock_supabase)["total_questions"] == 2
 
     def test_semester_5_resolves_senior_program(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
@@ -631,19 +631,19 @@ class TestModuleConfiguration:
         assert response.status_code == 200
         assert spy.plan.config_source.value == "modular"
         payload = _payload(mock_supabase)
-        # Technical MCQ comes from module config mcq_count=1 per domain.
-        assert payload["total_questions"] == 1
+        # Technical MCQ comes from program.mcq_total=2 (senior programme).
+        assert payload["total_questions"] == 2
         # Technical carries no descriptive questions at all, so the configured
         # descriptive_count=1 is ignored.
         assert payload["total_descriptive_questions"] == 0
 
-    def test_partially_configured_technical_plan_is_rejected(
+    def test_partially_configured_technical_plan_succeeds(
         self, client, mock_supabase, spy
     ):
-        """ALL selected domains must have module configuration.
+        """Missing module config for a technical domain is fine.
 
-        With module config now authoritative for MCQ counts, a missing row
-        for any selected domain is a hard refusal.
+        MCQ count comes from program.mcq_total, not module config.
+        Module rows only enable optional modules (hands-on).
         """
         second_domain = dict(
             TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Web Dev", slug="webDevelopment"
@@ -678,16 +678,16 @@ class TestModuleConfiguration:
         finally:
             client.app.dependency_overrides.clear()
 
-        assert response.status_code == 400
-        assert spy.called, "the planner must have been asked and refused"
+        assert response.status_code == 200
+        assert spy.called, "the planner must have been asked and succeeded"
 
-    def test_technical_requires_module_config_for_mcq_count(
+    def test_technical_succeeds_without_module_config(
         self, client, mock_supabase, spy
     ):
-        """Technical MCQ count now comes from module configuration.
+        """Technical MCQ count now comes from program.mcq_total.
 
-        Without a module row the planner cannot determine how many MCQs to
-        select, so the attempt is refused (MISSING_MODULE_CONFIG).
+        Module configs are optional for technical — they only enable
+        optional modules like hands-on.
         """
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
@@ -703,8 +703,8 @@ class TestModuleConfiguration:
         finally:
             client.app.dependency_overrides.clear()
 
-        assert response.status_code == 400
-        assert spy.called, "the planner must have been asked and refused"
+        assert response.status_code == 200
+        assert spy.called, "the planner must have been asked and succeeded"
 
     def test_missing_organizational_config_is_rejected(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")

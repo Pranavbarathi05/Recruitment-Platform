@@ -150,9 +150,11 @@ def _build_preflight(
         advisory only; the planner validates the real allocation.
 
     FINAL SEMANTICS
-        ``mcq_count`` IS the per-domain MCQ quantity — it is authoritative.
-        For technical domains, it replaces the old programme-level split.
-        For organizational domains, it was always authoritative.
+        ``mcq_count`` is the per-domain MCQ quantity for ORGANIZATIONAL
+        domains (where it is authoritative). For technical domains, MCQ
+        quantity comes from ``assessment_program.mcq_total`` (the master
+        total, split evenly), so the module-config mcq_count is NOT
+        validated here.
         ``descriptive_count`` is organizational-only; rejected at the endpoint
         for technical domains.
     """
@@ -164,10 +166,11 @@ def _build_preflight(
     hard_errors = []
     warnings = []
 
-    # MCQ pool validation: mcq_count is authoritative for ALL scopes.
-    # mcq_count=0 is valid (domain contributes zero MCQs) and never
-    # triggers a shortage.
-    if mcq_count > mcq_available:
+    # MCQ pool validation: ONLY for organizational scope where mcq_count is
+    # authoritative. For technical domains the master mcq_total on
+    # assessment_program controls MCQ quantity; this endpoint does not
+    # validate it.
+    if not is_technical and mcq_count > mcq_available:
         hard_errors.append(
             f"Requested mcq_count ({mcq_count}) exceeds the available "
             f"MCQ pool ({mcq_available}) for semester {semester}"
@@ -351,9 +354,10 @@ def upsert_domain_module_config(
         #    assessment alone, so a technical row must configure none. The
         #    planner ignores the value regardless, but rejecting it here stops a
         #    meaningless configuration being authored in the first place.
-        #    mcq_count stays accepted (and stored) but is unused, so it is
-        #    deliberately NOT rejected: an author configuring a senior hands-on
-        #    module should not have to satisfy an unrelated MCQ pool.
+        #    mcq_count stays accepted (and stored) but is NOT used by the
+        #    planner for technical MCQ quantity — that comes from the master
+        #    assessment_program.mcq_total. It is deliberately NOT pool-validated
+        #    here.
         #
         #    JUNIOR: the practical is a senior-only module. A junior row that
         #    enables hands-on would be silently inert at runtime, so it is

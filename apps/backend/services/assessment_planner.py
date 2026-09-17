@@ -17,8 +17,8 @@ WHAT THIS MODULE IS
 
     WHERE EACH QUANTITY COMES FROM
         technical MCQ        program.mcq_total split evenly across the selected
-                             domains (20 for one, 10 + 10 for two). NOT read
-                             from assessment_module_config.mcq_count.
+                             domains (total for one, total//2 + total//2 for two).
+                             Must be even; 0 is valid.
         descriptive          ORGANIZATIONAL only, from the configured
                              descriptive_count. Technical never has any.
         coding (DSA)         GLOBAL and domain-independent, from the global
@@ -359,9 +359,9 @@ class DomainPlanEntry(BaseModel):
     """The resolved module configuration for ONE selected domain.
 
     mcq_count is the number of MCQs drawn FROM this domain. For a technical
-    scope it is the derived even share of the programme's mcq_total (20 for a
-    single domain, 10 of 10 for two), NOT an authored per-domain value. For the
-    organizational scope it is the configured mcq_count.
+    scope it is the derived even share of the programme's mcq_total (total for
+    a single domain, total//2 for each of two), NOT an authored per-domain
+    value. For the organizational scope it is the configured mcq_count.
 
     descriptive_count is always 0 for a technical scope: technical Junior and
     Senior assessments carry no descriptive questions at all.
@@ -702,23 +702,21 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             resolved[domain.id] = config
 
     if missing:
-        # Module configuration is now the authoritative source for MCQ counts
-        # in both organizational and technical scopes. A missing row is fatal:
-        # the planner cannot determine how many MCQs to select for that domain.
         if is_technical:
+            # Technical module configs are OPTIONAL: MCQ quantity comes from
+            # program.mcq_total and coding is global. Module rows exist only
+            # to enable OPTIONAL modules (today just hands-on for senior), so
+            # a missing row simply means no optional module is enabled.
+            pass
+        else:
+            # Organizational scope requires its module row because it derives
+            # its entire content (MCQ + descriptive counts) from it.
             raise AssessmentPlanningError(
                 PlanningErrorKind.MISSING_MODULE_CONFIG,
                 f"No '{family.value}' configuration for domain(s) "
-                f"{[d.name for d in missing]}; technical MCQ counts are "
-                f"configured per-domain via Assessment Modules",
+                f"{[d.name for d in missing]}; the organizational assessment "
+                f"derives its entire content from its module configuration",
             )
-        # Organizational scope.
-        raise AssessmentPlanningError(
-            PlanningErrorKind.MISSING_MODULE_CONFIG,
-            f"No '{family.value}' configuration for domain(s) "
-            f"{[d.name for d in missing]}; the organizational assessment "
-            f"derives its entire content from its module configuration",
-        )
 
     config_source = ConfigSource.MODULAR
     rng = random.Random(request.seed) if request.seed is not None else None
@@ -729,17 +727,28 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
     per_domain_mcq = {}
 
     if is_technical:
-        # AUTHORITY: technical MCQ counts are now per-domain, configured
-        # through Assessment Modules. Each selected domain's mcq_count is
-        # the number of MCQs drawn from that domain's pool. This replaces
-        # the old programme-level mcq_total split.
+        # AUTHORITY: the master technical MCQ total lives on
+        # assessment_program.mcq_total (migration 018). The admin configures
+        # one value that applies to ALL technical programs, and the planner
+        # splits it evenly across the selected domains:
+        #
+        #   1 domain  -> all MCQs go to that domain
+        #   2 domains -> total // 2 for each
         #
         # The 40-question-per-domain-per-semester pool is question-bank
-        # inventory (content inventory), not a configuration value. The
-        # planner simply fails loudly if the pool is smaller than the
-        # configured mcq_count.
-        for domain in selected:
-            per_domain_mcq[domain.id] = resolved[domain.id].mcq_count
+        # inventory (content inventory), not a configuration value.
+        total = program.mcq_total
+        if total % 2 != 0:
+            raise AssessmentPlanningError(
+                PlanningErrorKind.INVALID_PROGRAM,
+                f"technical mcq_total ({total}) must be an even number",
+            )
+        if len(selected) == 1:
+            per_domain_mcq[selected[0].id] = total
+        else:
+            half = total // 2
+            for domain in selected:
+                per_domain_mcq[domain.id] = half
     else:
         # Organizational: the admin configures the MCQ quantity directly.
         for domain in selected:

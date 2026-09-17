@@ -38,6 +38,10 @@ const AdminPanel = () => {
   const [configForm, setConfigForm] = useState({});
   const [configError, setConfigError] = useState('');
 
+  // Technical MCQ total (assessment_program.mcq_total)
+  const [mcqTotal, setMcqTotal] = useState(20);
+  const [mcqTotalError, setMcqTotalError] = useState('');
+
   // Domain form state
   const [showDomainForm, setShowDomainForm] = useState(false);
   const [editingDomain, setEditingDomain] = useState(null);
@@ -110,6 +114,54 @@ const AdminPanel = () => {
   useEffect(() => {
     if (isAdmin) fetchConfigs();
   }, [isAdmin, fetchConfigs]);
+
+  const fetchMcqTotal = useCallback(async () => {
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessment-program/mcq-total`, {
+        credentials: 'include',
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setMcqTotal(data.mcq_total ?? 20);
+      }
+    } catch (err) {
+      console.error('Error fetching mcq total:', err);
+    }
+  }, [apiUrl]);
+
+  useEffect(() => {
+    if (isAdmin) fetchMcqTotal();
+  }, [isAdmin, fetchMcqTotal]);
+
+  const handleMcqTotalUpdate = async (e) => {
+    e.preventDefault();
+    setMcqTotalError('');
+    const val = parseInt(mcqTotal, 10);
+    if (isNaN(val) || val < 0 || val > 20) {
+      setMcqTotalError('Must be between 0 and 20.');
+      return;
+    }
+    if (val % 2 !== 0) {
+      setMcqTotalError('Must be an even number.');
+      return;
+    }
+    try {
+      const resp = await fetch(`${apiUrl}/admin/assessment-program/mcq-total`, {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ mcq_total: val }),
+        credentials: 'include',
+      });
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail);
+      }
+      setMessage('Technical MCQ total updated');
+      setMcqTotal(val);
+    } catch (err) {
+      setMcqTotalError(err.message);
+    }
+  };
 
   // Fetch submissions list
   const fetchSubmissions = useCallback(async () => {
@@ -649,6 +701,35 @@ const AdminPanel = () => {
             {/* Assessment Configuration */}
             <div className="mt-8">
               <h2 className="text-xl font-bold text-theme-primary mb-4">Assessment Configuration</h2>
+
+              {/* Technical MCQ Total */}
+              <div className="bg-theme-secondary rounded-lg p-4 mb-3">
+                <h3 className="font-semibold text-theme-primary mb-2">Technical MCQ Total</h3>
+                <p className="text-xs text-theme-muted mb-3">
+                  Master setting for all technical programmes. MCQs are split
+                  evenly across selected domains (e.g. 20 total → 10 + 10 for
+                  two domains). Must be an even number between 0 and 20.
+                </p>
+                <form onSubmit={handleMcqTotalUpdate} className="flex items-end gap-3">
+                  <div>
+                    <label className="text-xs text-theme-muted mb-1 block">MCQs per Assessment</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="20"
+                      step="2"
+                      value={mcqTotal}
+                      onChange={(e) => setMcqTotal(parseInt(e.target.value, 10) || 0)}
+                      className="w-24 px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                    />
+                  </div>
+                  <button type="submit" className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded text-sm">Save</button>
+                </form>
+                {mcqTotalError && (
+                  <p className="text-xs text-red-400 mt-2">{mcqTotalError}</p>
+                )}
+              </div>
+
               {configs.map((cfg) => (
                 <div key={cfg.id} className="bg-theme-secondary rounded-lg p-4 mb-3">
                   {editingConfig?.id === cfg.id ? (

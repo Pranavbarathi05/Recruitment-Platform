@@ -619,13 +619,14 @@ class TestCountValidation:
         finally:
             _clear_auth()
 
-    def test_technical_mcq_count_is_pool_validated(
+    def test_technical_mcq_count_is_not_pool_validated(
         self, client, mock_supabase
     ):
-        """Technical mcq_count IS now the per-domain MCQ quantity.
+        """Technical mcq_count is NOT pool-validated.
 
-        An excessive count must be a hard error because the planner uses
-        this value directly.
+        MCQ quantity for technical comes from program.mcq_total, not from
+        module config, so the module-config mcq_count is stored but NOT
+        validated against the pool.
         """
         _route_table(mock_supabase, "domains")
         _configure_domains(mock_supabase, [TECH_DOMAIN])
@@ -646,8 +647,7 @@ class TestCountValidation:
                     "hands_on_additional_minutes": 10,
                 },
             )
-            assert resp.status_code == 400
-            assert "mcq_count" in resp.json()["detail"].lower()
+            assert resp.status_code == 200
         finally:
             _clear_auth()
 

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
 from schemas.assessment import (
@@ -861,6 +862,86 @@ def update_config(
         }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Assessment programme — technical MCQ total (admin only)
+# ---------------------------------------------------------------------------
+
+
+class McqTotalUpdate(BaseModel):
+    """Schema for updating the technical MCQ total on assessment_program.
+
+    The value must be an even integer between 0 and 20 inclusive.  It is
+    applied to ALL active technical programmes (semesters 3 and 5) so
+    the setting stays in sync without a third master table.
+    """
+    mcq_total: int = Field(..., ge=0, le=20)
+
+    def model_post_init(self, __context):
+        if self.mcq_total % 2 != 0:
+            raise ValueError(
+                "mcq_total must be an even number between 0 and 20"
+            )
+
+
+@router.put("/assessment-program/mcq-total")
+def update_mcq_total(
+    payload: McqTotalUpdate,
+    admin: AuthUser = Depends(require_admin),
+):
+    """Update the technical MCQ total on all active technical programmes.
+
+    ``assessment_program.mcq_total`` is the master setting: the planner
+    splits it evenly across the selected domains (total for one domain,
+    total//2 for each of two).  This endpoint keeps every active
+    technical row in sync.
+
+    Organizational programmes (semester 1) are untouched.
+    """
+    try:
+        result = (
+            supabase_client.table("assessment_program")
+            .update({"mcq_total": payload.mcq_total})
+            .eq("scope", "technical")
+            .eq("is_active", True)
+            .execute()
+        )
+        updated = result.data or []
+        return {
+            "mcq_total": payload.mcq_total,
+            "updated_programs": len(updated),
+            "programs": updated,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/assessment-program/mcq-total")
+def get_mcq_total(
+    admin: AuthUser = Depends(require_admin),
+):
+    """Read the current technical MCQ total from active programmes."""
+    try:
+        result = (
+            supabase_client.table("assessment_program")
+            .select("semester, scope, tier, mcq_total")
+            .eq("scope", "technical")
+            .eq("is_active", True)
+            .order("semester")
+            .execute()
+        )
+        rows = result.data or []
+        # All technical rows should agree; return the first as canonical.
+        mcq_total = rows[0]["mcq_total"] if rows else 0
+        return {
+            "mcq_total": mcq_total,
+            "programs": rows,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

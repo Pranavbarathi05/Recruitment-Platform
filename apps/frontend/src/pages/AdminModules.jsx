@@ -7,7 +7,7 @@ import { useAuth } from '../hooks/useAuth';
  *
  * Configures the per-domain, per-tier module counts consumed by the
  * assessment planner:
- *   - MCQ count
+ *   - MCQ count (organizational only; technical MCQ total is on the Admin Panel)
  *   - Descriptive count
  *   - Hands-on enabled / count / additional minutes
  *   - Notes
@@ -351,35 +351,39 @@ const AdminModules = () => {
                   </p>
                 )}
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label htmlFor="mcq_count" className="block text-sm font-medium text-theme-primary mb-1">
-                      MCQ count (per selected domain)
-                    </label>
-                    <input
-                      id="mcq_count"
-                      type="number"
-                      min="0"
-                      value={form.mcq_count}
-                      onChange={(e) => setForm({ ...form, mcq_count: toInt(e.target.value) })}
-                      disabled={saving}
-                      className={inputClass}
-                    />
-                  </div>
-                  <div>
-                    <label htmlFor="descriptive_count" className="block text-sm font-medium text-theme-primary mb-1">
-                      Descriptive count
-                    </label>
-                    <input
-                      id="descriptive_count"
-                      type="number"
-                      min="0"
-                      value={form.descriptive_count}
-                      onChange={(e) => setForm({ ...form, descriptive_count: toInt(e.target.value) })}
-                      disabled={saving}
-                      className={inputClass}
-                    />
-                  </div>
+                <div className={`grid grid-cols-1 ${selectedModule?.domain?.assessment_scope === 'organizational' ? 'md:grid-cols-2' : ''} gap-4`}>
+                  {selectedModule?.domain?.assessment_scope === 'organizational' && (
+                    <div>
+                      <label htmlFor="mcq_count" className="block text-sm font-medium text-theme-primary mb-1">
+                        MCQ count
+                      </label>
+                      <input
+                        id="mcq_count"
+                        type="number"
+                        min="0"
+                        value={form.mcq_count}
+                        onChange={(e) => setForm({ ...form, mcq_count: toInt(e.target.value) })}
+                        disabled={saving}
+                        className={inputClass}
+                      />
+                    </div>
+                  )}
+                  {selectedModule?.domain?.assessment_scope === 'organizational' && (
+                    <div>
+                      <label htmlFor="descriptive_count" className="block text-sm font-medium text-theme-primary mb-1">
+                        Descriptive count
+                      </label>
+                      <input
+                        id="descriptive_count"
+                        type="number"
+                        min="0"
+                        value={form.descriptive_count}
+                        onChange={(e) => setForm({ ...form, descriptive_count: toInt(e.target.value) })}
+                        disabled={saving}
+                        className={inputClass}
+                      />
+                    </div>
+                  )}
                 </div>
 
                 {/* Hands-on */}
