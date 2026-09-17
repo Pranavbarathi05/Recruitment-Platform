@@ -159,7 +159,7 @@ def render_login_page(message: str = "", success: dict = None, error: str = "") 
 <body>
   <div class="portal">
     <h1>Employee Portal</h1>
-    <form method="POST" action="/login">
+    <form method="POST" action="login">
       <label for="username">Username</label>
       <input id="username" name="username" autocomplete="off" required>
       <label for="password">Password</label>

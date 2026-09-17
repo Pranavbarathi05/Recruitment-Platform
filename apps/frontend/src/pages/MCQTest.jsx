@@ -7,6 +7,14 @@ import { runCodeLocally, isClientRunnable } from '../execution/runner';
 import { generatePythonStarterCode } from '../utils/codingStarterCode';
 import { countWords, limitToWords } from '../utils/wordLimit';
 
+// Hands-On challenge — the SQLi "Employee Portal" server is reached through
+// the same Gateway as the rest of the platform (Traefik routes /challenge/*
+// to it; see gateway/docker-compose.yml). A relative URL keeps the candidate
+// on the Gateway origin — internal challenge hosts/ports are never exposed.
+// The challenge's challenge_url field is admin metadata for record-keeping;
+// candidate rendering always uses this Gateway-relative path.
+const CHALLENGE_IFRAME_URL = '/challenge/';
+
 /**
  * Combined Assessment Workspace
  *
@@ -25,7 +33,6 @@ const CODING_LANGUAGES = [
   { value: 'python3', label: 'Python 3' },
   { value: 'cpp', label: 'C++' },
   { value: 'java', label: 'Java' },
-  { value: 'c', label: 'C' },
 ];
 
 const INT32_MIN = -2147483648;
@@ -129,17 +136,6 @@ const getDefaultStarter = (lang, problem) => {
   const functionName = problem?.function_name || 'solve';
   const className = problem?.class_name || null;
   const signature = (problem?.function_signature || '').trim();
-  // Language-aware: the shared function_signature field may hold another
-  // language's syntax (e.g. a C 'int* nums, int numsSize' signature on a
-  // multi-language problem). C++/Java starters must not render it — the
-  // backend harness ignores such signatures for C++/Java and uses legacy
-  // shape inference, so the starter falls back the same way. Java's own
-  // array syntax ('int[]') stays valid; C keeps using its signature verbatim.
-  const signatureIsCStyleForLang =
-    (lang === 'cpp' &&
-      (signature.includes('*') || /[A-Za-z_]\w*\s*\[\s*\]/.test(signature))) ||
-    (lang === 'java' && signature.includes('*'));
-  const starterSignature = signatureIsCStyleForLang ? '' : signature;
 
   // --- Python ---
   if (lang === 'python3') {
@@ -171,8 +167,8 @@ const getDefaultStarter = (lang, problem) => {
   // --- C++ ---
   if (lang === 'cpp') {
     const body = (indent) => `${indent}// Write your solution here`;
-    if (starterSignature) {
-      const head = starterSignature.replace(/;\s*$/, '');
+    if (signature) {
+      const head = signature.replace(/;\s*$/, '');
       if (className) {
         return (
           `class ${className} {\npublic:\n` +
@@ -195,36 +191,12 @@ const getDefaultStarter = (lang, problem) => {
     return `${retType} ${functionName}(${paramsText}) {\n    ${body('')}\n}\n`;
   }
 
-  // --- C (server-side only; requires an explicit C function_signature) ---
-  if (lang === 'c') {
-    const body = (indent) => `${indent}// Write your solution here`;
-    const cSignature = signature.trim();
-    if (cSignature) {
-      // The backend harness builds the invocation from this exact signature;
-      // show it verbatim so the starter always agrees with the harness.
-      const head = cSignature.replace(/;\s*$/, '');
-      const usesBool = /\b(_Bool|bool)\b/.test(head);
-      return (
-        (usesBool ? '#include <stdbool.h>\n\n' : '') +
-        `${head} {\n    ${body('')}\n}\n`
-      );
-    }
-    // No signature configured: parameter types cannot be inferred from JSON
-    // test cases for C, and the backend harness will reject the run with a
-    // clear error until the problem defines a C function_signature.
-    return (
-      `// This problem needs a C function_signature (e.g. int add(int a, int b)).\n` +
-      `int solve(void) {\n` +
-      `    ${body('')}\n}\n`
-    );
-  }
-
   // --- Java (harness always invokes an instance method on class_name or "Solution") ---
   {
     const javaClassName = className || 'Solution';
     let method;
-    if (starterSignature) {
-      method = starterSignature.replace(/;\s*$/, '').trim();
+    if (signature) {
+      method = signature.replace(/;\s*$/, '').trim();
       if (!/^public\b/.test(method)) method = `public ${method}`;
       method = `${method} {\n        // Write your solution here\n    }`;
     } else {
@@ -1001,7 +973,7 @@ function HandsOnSection({ questions, results, onSubmit }) {
           <div className="px-4 py-2 border-b border-theme-border flex items-center justify-between">
             <span className="text-sm font-medium text-theme-primary">Challenge Website</span>
             <a
-              href={q.challenge_url}
+              href={CHALLENGE_IFRAME_URL}
               target="_blank"
               rel="noopener noreferrer"
               className="text-xs text-blue-400 hover:text-blue-300"
@@ -1010,7 +982,7 @@ function HandsOnSection({ questions, results, onSubmit }) {
             </a>
           </div>
           <iframe
-            src={q.challenge_url}
+            src={CHALLENGE_IFRAME_URL}
             title="Hands-on challenge"
             className="w-full h-[480px] border-0 bg-white"
             sandbox="allow-scripts allow-same-origin allow-forms"
@@ -1209,7 +1181,7 @@ function CodingSection({
         <div className="flex-1 min-h-0 relative">
           <CodeEditor
             key={problem.id}
-            language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : language === 'c' ? 'c' : 'java'}
+            language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : 'java'}
             value={sourceCode} onChange={(val) => setSourceCode(val || '')}
           />
         </div>

@@ -20,7 +20,6 @@ Language IDs (Judge0 CE 1.13.1):
   - 71: Python 3 (CPython 3.8.1)
   - 54: C++ (GCC 9.2.0)
   - 62: Java (OpenJDK 13.0.1)
-  - 50: C (GCC 9.2.0)
 """
 
 import os
@@ -28,6 +27,7 @@ import json
 import time
 import base64
 import logging
+import threading
 from typing import Optional
 import httpx
 
@@ -35,6 +35,58 @@ logger = logging.getLogger(__name__)
 
 # Judge0 configuration
 JUDGE0_BASE_URL = os.getenv("JUDGE0_BASE_URL", "http://localhost:2358")
+
+# ── Compiler node pool (Compiler-1 / Compiler-2 / Compiler-3) ────────────────
+# Endpoints are configured with COMPILER_1_URL / COMPILER_2_URL / COMPILER_3_URL.
+# Any subset may be set; the order given is the round-robin order. When none of
+# them is set the legacy single JUDGE0_BASE_URL is used and behaviour is
+# unchanged (one compiler node).
+#
+# Requests are distributed round-robin. A node that cannot be reached, or whose
+# queue is full, is skipped and the next node is tried, so one dead execution
+# machine does not fail a candidate's submission while another is healthy. The
+# node that accepted a submission is the one polled for its result, because a
+# Judge0 token exists only on the node that queued it.
+COMPILER_POOL = [
+    url.strip().rstrip("/")
+    for url in (
+        os.getenv("COMPILER_1_URL", ""),
+        os.getenv("COMPILER_2_URL", ""),
+        os.getenv("COMPILER_3_URL", ""),
+    )
+    if url.strip()
+] or [JUDGE0_BASE_URL.rstrip("/")]
+
+_POOL_QUERY = "base64_encoded=true&fields=stdout,stderr,compile_output,status,time,memory,status_id"
+_pool_lock = threading.Lock()
+_pool_cursor = 0
+
+
+def compiler_pool_urls() -> list:
+    """Every configured compiler node, in round-robin order."""
+    return list(COMPILER_POOL)
+
+
+def _next_compiler_node() -> str:
+    """Pick the next compiler node with a deterministic, thread-safe cursor."""
+    global _pool_cursor
+    with _pool_lock:
+        node = COMPILER_POOL[_pool_cursor % len(COMPILER_POOL)]
+        _pool_cursor += 1
+    return node
+
+
+def _failover_order(start_node: str) -> list:
+    """[start_node, ...every other node] — the order to try when a node is down."""
+    return [start_node] + [u for u in COMPILER_POOL if u != start_node]
+
+
+def _submission_url(node: str) -> str:
+    return f"{node}/submissions?{_POOL_QUERY}"
+
+
+def _poll_url(node: str, token: str) -> str:
+    return f"{node}/submissions/{token}?{_POOL_QUERY}"
 JUDGE0_AUTH_TOKEN = os.getenv("JUDGE0_AUTH_TOKEN", "")
 # Judge0 API auth header name. Must match AUTHN_HEADER in judge0.conf
 # (default for this deployment: X-Judge0-Token — same as gateway-api).
@@ -62,7 +114,6 @@ JUDGE0_LANGUAGE_IDS = {
     "python3": 71,   # Python 3.8.1
     "cpp": 54,       # C++ (GCC 9.2.0)
     "java": 62,      # Java (OpenJDK 13.0.1)
-    "c": 50,         # C (GCC 9.2.0)
 }
 
 # Judge0 status IDs
@@ -216,29 +267,50 @@ async def _submit_to_judge0(
 
     headers = _get_auth_headers()
 
-    # Submit asynchronously
-    submit_url = f"{JUDGE0_BASE_URL}/submissions?base64_encoded=true&fields=stdout,stderr,compile_output,status,time,memory,status_id"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(submit_url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            token = data.get("token")
-            if not token:
-                raise CompilerError("Judge0 did not return a submission token")
-    except httpx.ConnectError as e:
-        raise CompilerError(f"Judge0 unavailable: {e}")
-    except httpx.TimeoutException as e:
-        raise CompilerError(f"Judge0 submission timeout: {e}")
-    except httpx.HTTPStatusError as e:
-        raise CompilerError(f"Judge0 HTTP error: {e.response.status_code}")
-    except CompilerError:
-        raise
-    except Exception as e:
-        raise CompilerError(f"Judge0 submission error: {e}")
+    # Submit asynchronously, choosing a compiler node round-robin and failing
+    # over to the other nodes if this one is unreachable or its queue is full.
+    node = ""
+    token = None
+    last_error = None
+    for candidate in _failover_order(_next_compiler_node()):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    _submission_url(candidate), json=payload, headers=headers
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                token = data.get("token")
+                if not token:
+                    raise CompilerError("Judge0 did not return a submission token")
+            node = candidate
+            logger.info("Judge0 submission queued on compiler node %s", candidate)
+            break
+        except httpx.ConnectError as e:
+            last_error = CompilerError(f"Judge0 unavailable at {candidate}: {e}")
+            logger.warning("Compiler node %s unreachable, trying next", candidate)
+        except httpx.TimeoutException as e:
+            last_error = CompilerError(f"Judge0 submission timeout at {candidate}: {e}")
+            logger.warning("Compiler node %s timed out, trying next", candidate)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 503:
+                last_error = CompilerError(
+                    f"Judge0 HTTP error: {e.response.status_code}"
+                )
+                logger.warning("Compiler node %s queue full, trying next", candidate)
+                continue
+            raise CompilerError(f"Judge0 HTTP error: {e.response.status_code}")
+        except CompilerError:
+            raise
+        except Exception as e:
+            raise CompilerError(f"Judge0 submission error: {e}")
+    if not node or not token:
+        raise last_error or CompilerError(
+            "Judge0 unavailable: no compiler node reachable"
+        )
 
-    # Poll for result
-    poll_url = f"{JUDGE0_BASE_URL}/submissions/{token}?base64_encoded=true&fields=stdout,stderr,compile_output,status,time,memory,status_id"
+    # Poll for result on the node that accepted the submission.
+    poll_url = _poll_url(node, token)
     start_time = time.monotonic()
 
     while True:
@@ -485,29 +557,51 @@ def execute_code_sync(
     }
 
     headers = _get_auth_headers()
-    submit_url = f"{JUDGE0_BASE_URL}/submissions?base64_encoded=true&fields=stdout,stderr,compile_output,status,time,memory,status_id"
 
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(submit_url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            token = data.get("token")
-            if not token:
-                raise CompilerError("Judge0 did not return a submission token")
-    except httpx.ConnectError as e:
-        raise CompilerError(f"Judge0 unavailable: {e}")
-    except httpx.TimeoutException as e:
-        raise CompilerError(f"Judge0 submission timeout: {e}")
-    except httpx.HTTPStatusError as e:
-        raise CompilerError(f"Judge0 HTTP error: {e.response.status_code}")
-    except CompilerError:
-        raise
-    except Exception as e:
-        raise CompilerError(f"Judge0 submission error: {e}")
+    # Submit synchronously, choosing a compiler node round-robin and failing
+    # over to the other nodes if this one is unreachable or its queue is full.
+    node = ""
+    token = None
+    last_error = None
+    for candidate in _failover_order(_next_compiler_node()):
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(
+                    _submission_url(candidate), json=payload, headers=headers
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                token = data.get("token")
+                if not token:
+                    raise CompilerError("Judge0 did not return a submission token")
+            node = candidate
+            logger.info("Judge0 submission queued on compiler node %s", candidate)
+            break
+        except httpx.ConnectError as e:
+            last_error = CompilerError(f"Judge0 unavailable at {candidate}: {e}")
+            logger.warning("Compiler node %s unreachable, trying next", candidate)
+        except httpx.TimeoutException as e:
+            last_error = CompilerError(f"Judge0 submission timeout at {candidate}: {e}")
+            logger.warning("Compiler node %s timed out, trying next", candidate)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 503:
+                last_error = CompilerError(
+                    f"Judge0 HTTP error: {e.response.status_code}"
+                )
+                logger.warning("Compiler node %s queue full, trying next", candidate)
+                continue
+            raise CompilerError(f"Judge0 HTTP error: {e.response.status_code}")
+        except CompilerError:
+            raise
+        except Exception as e:
+            raise CompilerError(f"Judge0 submission error: {e}")
+    if not node or not token:
+        raise last_error or CompilerError(
+            "Judge0 unavailable: no compiler node reachable"
+        )
 
-    # Poll synchronously
-    poll_url = f"{JUDGE0_BASE_URL}/submissions/{token}?base64_encoded=true&fields=stdout,stderr,compile_output,status,time,memory,status_id"
+    # Poll synchronously on the node that accepted the submission.
+    poll_url = _poll_url(node, token)
     start_time = time.monotonic()
 
     while True:

@@ -335,7 +335,7 @@ const AdminHandsOn = () => {
                       onChange={(e) => setForm({ ...form, challenge_url: e.target.value })}
                       required
                       className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                      placeholder="http://challenge-host:8080"
+                      placeholder="/challenge/ (served via the Gateway)"
                     />
                   </div>
                 </div>

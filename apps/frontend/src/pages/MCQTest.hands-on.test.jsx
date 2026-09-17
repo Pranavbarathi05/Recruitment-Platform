@@ -121,7 +121,7 @@ describe('MCQTest — Hands-On section', () => {
     expect(screen.getByText('100 pts')).toBeInTheDocument();
 
     const iframe = screen.getByTitle('Hands-on challenge');
-    expect(iframe).toHaveAttribute('src', 'http://127.0.0.1:8080');
+    expect(iframe).toHaveAttribute('src', '/challenge/');
 
     // The expected flag must never be rendered anywhere in the workspace.
     const bodyHtml = document.body.innerHTML;
