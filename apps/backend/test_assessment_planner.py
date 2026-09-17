@@ -23,7 +23,6 @@ from services.assessment_planner import (
     DescriptivePoolItem,
     DomainInput,
     HandsOnPoolItem,
-    LegacyTechnicalFallback,
     MCQPoolItem,
     ModuleConfigInput,
     PlanningErrorKind,
@@ -68,12 +67,19 @@ PROGRAM_1 = ProgramInput(
     max_domains=1,
     coding_enabled=False,
 )
+# The FINAL technical MCQ rule: the quantity is a PROGRAM-level total split
+# evenly across the selected domains, so it lives on the program row
+# (migration 018) and not on assessment_module_config. 20 -> a single domain,
+# 10 + 10 -> two domains.
+TECH_MCQ_TOTAL = 20
+
 PROGRAM_3 = ProgramInput(
     semester=3,
     scope=Scope.TECHNICAL,
     tier="junior",
     max_domains=2,
     coding_enabled=True,
+    mcq_total=TECH_MCQ_TOTAL,
 )
 PROGRAM_5 = ProgramInput(
     semester=5,
@@ -81,6 +87,7 @@ PROGRAM_5 = ProgramInput(
     tier="senior",
     max_domains=2,
     coding_enabled=True,
+    mcq_total=TECH_MCQ_TOTAL,
 )
 PROGRAM_7 = ProgramInput(
     semester=7,
@@ -199,7 +206,7 @@ def expect_failure(kind, **kwargs):
 class TestProgramScopes:
     def test_semester_1_organizational_plan(self):
         plan = plan_assessment(build(PROGRAM_1, [ORG_ID], [ORG_COMMON], coding=5))
-        assert plan.plan_version == 1
+        assert plan.plan_version == 2
         assert plan.semester == 1
         assert plan.scope is Scope.ORGANIZATIONAL
         assert plan.tier is None
@@ -222,9 +229,14 @@ class TestProgramScopes:
         assert plan.scope is Scope.TECHNICAL
         assert plan.tier.value == "junior"
         assert plan.config_source is ConfigSource.MODULAR
-        assert plan.mcq_total == 5
-        assert plan.descriptive_total == 1
+        # Junior technical: the derived 20 MCQs for ONE selected domain.
+        assert plan.mcq_total == 20
+        assert [e.mcq_count for e in plan.domains] == [20]
+        # Technical Junior carries NO descriptive questions, ever.
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
         assert plan.hands_on_total == 0
+        assert plan.practicals == []
         assert plan.coding_enabled is True
         assert plan.coding_total == 2
         assert plan.additional_minutes == 0
@@ -236,9 +248,18 @@ class TestProgramScopes:
         )
         assert plan.scope is Scope.TECHNICAL
         assert plan.tier.value == "senior"
-        assert plan.mcq_total == 5
-        assert plan.descriptive_total == 2
+        # Senior technical: the derived 20 MCQs for ONE selected domain.
+        assert plan.mcq_total == 20
+        # Technical carries NO descriptive questions, even though the module
+        # row still says desc=2 (technical descriptive is not used).
+        assert plan.descriptive_total == 0
         assert plan.hands_on_total == 1
+        # The hands-on challenge is described by the generic practicals shape.
+        assert len(plan.practicals) == 1
+        assert plan.practicals[0].module_kind.value == "single"
+        assert plan.practicals[0].scoring.value == "single"
+        assert plan.practicals[0].arms[0].kind.value == "hands_on"
+        assert plan.practicals[0].arms[0].question_ids == plan.selected_hands_on_question_ids
         assert plan.coding_total == 2
         # Senior CyberSec: hands-on enabled with +20 minutes.
         assert plan.additional_minutes == 20
@@ -370,114 +391,147 @@ class TestDomainSelection:
 
 
 # ---------------------------------------------------------------------------
-# 9-10, 29. Module configuration + the legacy fallback boundary
+# 9-10, 29. Module configuration (the only content source)
 # ---------------------------------------------------------------------------
 
 
 class TestModuleConfiguration:
-    def test_missing_module_config_fails_in_modular_mode(self):
-        err = expect_failure(
-            PlanningErrorKind.MISSING_MODULE_CONFIG,
-            program=PROGRAM_5,
-            domain_ids=[CYBER_ID],
+    def test_missing_technical_module_config_is_tolerated(self):
+        """FINAL RULE: technical module configuration is OPTIONAL.
+
+        A technical assessment derives every quantity it needs from the
+        programme (mcq_total, coding count, base duration) plus the global DSA
+        pool. A module row only switches on OPTIONAL modules, so an unauthored
+        matrix must NOT block a technical assessment — it simply means no
+        optional module (hands-on) is enabled.
+        """
+        plan = plan_assessment(build(PROGRAM_5, [CYBER_ID]))
+        assert plan.config_source is ConfigSource.MODULAR
+        assert plan.mcq_total == 20
+        assert plan.hands_on_total == 0
+        assert plan.practicals == []
+
+    def test_module_config_cannot_change_technical_mcq_quantity(self):
+        """mcq_count must never influence a technical MCQ total.
+
+        Three wildly different configured counts all yield the derived 20,
+        because the quantity comes from program.mcq_total alone.
+        """
+        for configured in (0, 1, 40):
+            plan = plan_assessment(
+                build(
+                    PROGRAM_5,
+                    [CYBER_ID],
+                    [cfg(CYBER_ID, "senior", mcq=configured)],
+                )
+            )
+            assert plan.mcq_total == TECH_MCQ_TOTAL
+            assert plan.domains[0].mcq_count == TECH_MCQ_TOTAL
+
+    def test_technical_descriptive_count_is_not_used(self):
+        """A technical module row cannot introduce descriptive questions."""
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], [cfg(CYBER_ID, "senior", mcq=5, desc=9)])
         )
-        assert "no technical legacy fallback was supplied" in err.detail
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+        assert plan.domains[0].descriptive_count == 0
+
+    def test_odd_technical_mcq_total_cannot_split_across_two_domains(self):
+        odd = ProgramInput(
+            semester=5,
+            scope=Scope.TECHNICAL,
+            tier="senior",
+            max_domains=2,
+            coding_enabled=True,
+            mcq_total=21,
+        )
+        err = expect_failure(
+            PlanningErrorKind.INVALID_PROGRAM,
+            program=odd,
+            domain_ids=[CYBER_ID, WEB_ID],
+        )
+        assert "cannot be split evenly" in err.detail
+
+    def test_odd_technical_mcq_total_is_fine_for_one_domain(self):
+        odd = ProgramInput(
+            semester=5,
+            scope=Scope.TECHNICAL,
+            tier="senior",
+            max_domains=2,
+            coding_enabled=True,
+            mcq_total=21,
+        )
+        plan = plan_assessment(build(odd, [CYBER_ID]))
+        assert plan.mcq_total == 21
 
     def test_missing_organizational_config_fails(self):
-        err = expect_failure(
-            PlanningErrorKind.MISSING_MODULE_CONFIG,
-            program=PROGRAM_1,
-            domain_ids=[ORG_ID],
-        )
-        assert "no legacy fallback" in err.detail
+        """Organizational content has exactly one source: its module row.
 
-    def test_organizational_missing_config_never_falls_back_to_legacy(self):
-        """The critical boundary: organizational has NO legacy fallback.
-
-        The fallback is supplied and the pools would satisfy it — the planner
-        must still refuse rather than silently inherit global counts (which
-        would wrongly grant hands-on and coding time).
+        There is no fallback of any kind — not the retired global counts, and
+        not anything else — so a missing row is a hard refusal.
         """
         err = expect_failure(
             PlanningErrorKind.MISSING_MODULE_CONFIG,
             program=PROGRAM_1,
             domain_ids=[ORG_ID],
-            legacy_technical_fallback=LegacyTechnicalFallback(
-                total_questions=10,
-                descriptive_question_count=2,
-                hands_on_question_count=1,
-            ),
         )
-        assert "organizational assessment has no legacy fallback" in err.detail
+        assert "module configuration" in err.detail
 
-    def test_partial_technical_config_does_not_mix_with_legacy(self):
-        """All-or-nothing: one missing row must not produce a hybrid plan."""
-        erg = expect_failure(
-            PlanningErrorKind.MISSING_MODULE_CONFIG,
-            program=PROGRAM_5,
-            domain_ids=[CYBER_ID, WEB_ID],
-            module_configs=[CYBER_SENIOR],  # WEB_SENIOR deliberately absent
+    def test_legacy_fallback_inputs_no_longer_exist(self):
+        """The retired pre-modular fallback model is gone from the planner.
+
+        Guards the cleanup: nothing may re-introduce a second content source,
+        and the request model must not silently accept one (input models
+        ignore unknown fields, so a stray kwarg would otherwise be dropped).
+        """
+        import services.assessment_planner as planner
+
+        assert not hasattr(planner, "LegacyTechnicalFallback")
+        assert not hasattr(planner, "_legacy_union_selection")
+        assert (
+            "legacy_technical_fallback" not in AssessmentPlanRequest.model_fields
         )
-        assert "Web Development" in erg.detail
 
-    def test_technical_legacy_fallback_is_explicit_and_works(self):
-        """Legacy technical behaviour is representable via explicit opt-in."""
-        fallback = LegacyTechnicalFallback(
-            total_questions=10,
-            descriptive_question_count=2,
-            hands_on_question_count=1,
+    def test_partial_technical_config_only_affects_the_configured_domain(self):
+        """A partially authored tier is valid for TECHNICAL scopes.
+
+        There is no longer a hybrid risk to guard against: nothing technical is
+        derived from module configuration any more. Only the configured domain
+        gains the optional hands-on module.
+        """
+        cyber = cfg(
+            CYBER_ID, "senior", mcq=5, hands_on=True, hands_on_count=1, minutes=20
         )
         plan = plan_assessment(
             build(
                 PROGRAM_5,
                 [CYBER_ID, WEB_ID],
-                coding=2,
-                legacy_technical_fallback=fallback,
-            )
-        )
-        assert plan.config_source is ConfigSource.LEGACY_TECHNICAL_FALLBACK
-        # 10 global MCQs split 5/5 across the two domains.
-        assert plan.mcq_total == 10
-        assert [e.mcq_count for e in plan.domains] == [5, 5]
-        # Global descriptive/hands-on counts applied once, not per domain.
-        assert plan.descriptive_total == 2
-        assert plan.hands_on_total == 1
-        # Legacy has no additional-time concept.
-        assert plan.additional_minutes == 0
-        assert plan.duration_minutes == 90
-
-    def test_legacy_odd_total_rejected_for_two_domains(self):
-        fallback = LegacyTechnicalFallback(total_questions=9)
-        expect_failure(
-            PlanningErrorKind.INVALID_MODULE_CONFIG,
-            program=PROGRAM_5,
-            domain_ids=[CYBER_ID, WEB_ID],
-            legacy_technical_fallback=fallback,
-        )
-
-    def test_legacy_odd_total_allowed_for_one_domain(self):
-        fallback = LegacyTechnicalFallback(total_questions=9)
-        plan = plan_assessment(
-            build(
-                PROGRAM_5,
-                [CYBER_ID],
-                legacy_technical_fallback=fallback,
-            )
-        )
-        assert plan.mcq_total == 9
-
-    def test_legacy_fallback_ignored_when_modular_config_complete(self):
-        """Complete modular config wins; the fallback is not consulted."""
-        plan = plan_assessment(
-            build(
-                PROGRAM_5,
-                [CYBER_ID],
-                [CYBER_SENIOR],
-                legacy_technical_fallback=LegacyTechnicalFallback(total_questions=99),
+                [cyber],  # WEB deliberately unconfigured
             )
         )
         assert plan.config_source is ConfigSource.MODULAR
-        assert plan.mcq_total == 5
+        assert plan.mcq_total == 20
+        assert [e.mcq_count for e in plan.domains] == [10, 10]
+        assert plan.hands_on_total == 1
+        assert [(e.hands_on_enabled, e.hands_on_count) for e in plan.domains] == [
+            (True, 1),
+            (False, 0),
+        ]
+
+    def test_technical_plan_is_always_modular(self):
+        """A technical plan's content source is MODULAR, with or without rows.
+
+        Replaces the old "modular wins over an explicit fallback" check: with
+        the fallback deleted, MODULAR is the only possible source.
+        """
+        with_rows = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
+        )
+        without_rows = plan_assessment(build(PROGRAM_5, [CYBER_ID]))
+        for plan in (with_rows, without_rows):
+            assert plan.config_source is ConfigSource.MODULAR
+            assert plan.mcq_total == TECH_MCQ_TOTAL
 
     def test_duplicate_module_config_rejected(self):
         err = expect_failure(
@@ -505,13 +559,19 @@ class TestModuleConfiguration:
             )
 
     def test_config_for_wrong_tier_is_not_used(self):
-        """A junior row cannot satisfy a senior program."""
-        expect_failure(
-            PlanningErrorKind.MISSING_MODULE_CONFIG,
-            program=PROGRAM_5,
-            domain_ids=[CYBER_ID],
-            module_configs=[CYBER_JUNIOR],
+        """A junior row must not satisfy a senior programme.
+
+        The row is simply not resolved (it belongs to another configuration
+        family), so the senior plan falls back to "no optional module" instead
+        of borrowing the junior row — and its MCQs still come from the
+        programme, so the plan is unaffected either way.
+        """
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], [CYBER_JUNIOR])
         )
+        assert plan.domains[0].config_applies_to is None
+        assert plan.hands_on_total == 0
+        assert plan.mcq_total == TECH_MCQ_TOTAL
 
 
 # ---------------------------------------------------------------------------
@@ -521,11 +581,17 @@ class TestModuleConfiguration:
 
 class TestMCQSelection:
     def test_per_domain_mcq_counts(self):
+        """Two junior domains -> an even 10 + 10, ignoring configured counts.
+
+        CYBER_JUNIOR configures mcq=5 and WEB_JUNIOR mcq=4 under the old model;
+        neither value is consulted, and the derived split of the programme's
+        total is used instead.
+        """
         plan = plan_assessment(
             build(PROGRAM_3, [CYBER_ID, WEB_ID], [CYBER_JUNIOR, WEB_JUNIOR])
         )
-        assert [e.mcq_count for e in plan.domains] == [5, 4]
-        assert plan.mcq_total == 9
+        assert [e.mcq_count for e in plan.domains] == [10, 10]
+        assert plan.mcq_total == TECH_MCQ_TOTAL
 
     def test_mcq_pool_is_filtered_by_candidate_semester(self):
         """Only the candidate's semester pool is eligible."""
@@ -547,11 +613,13 @@ class TestMCQSelection:
 
     def test_insufficient_mcq_pool_fails_loudly(self):
         req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
-        req.mcq_pool = mcq_items(CYBER_ID, 5, 4, "q")  # needs 5
+        req.mcq_pool = mcq_items(CYBER_ID, 5, 19, "q")  # a 19-question pool
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
         assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_MCQ_POOL
-        assert "only 4 active MCQ questions, need 5" in excinfo.value.detail
+        # The requirement is the derived 20-for-one-domain share, NOT the 19
+        # that happen to exist, and NOT anything from the module row.
+        assert "only 19 active MCQ questions, need 20" in excinfo.value.detail
 
     def test_mcq_does_not_top_up_from_another_domain(self):
         """Web has plenty; Cyber is short. The plan must still fail."""
@@ -581,77 +649,101 @@ class TestMCQSelection:
 
 
 class TestDescriptiveSelection:
-    def test_per_domain_descriptive_counts(self):
+    """Descriptive questions are an ORGANIZATIONAL-only module.
+
+    The organizational assessment is exactly one domain, so the descriptive
+    quota is a plain configured count. Cross-domain allocation no longer
+    applies to descriptive questions at all; the shared allocator is still
+    exercised through hands-on (see TestHandsOnSelection and TestExactAllocation),
+    which is the only multi-domain allocatable module left.
+    """
+
+    def test_organizational_descriptive_count_is_configurable(self):
         plan = plan_assessment(
-            build(PROGRAM_5, [CYBER_ID, WEB_ID], [CYBER_SENIOR, WEB_SENIOR])
+            build(PROGRAM_1, [ORG_ID], [cfg(ORG_ID, "organizational", mcq=10, desc=3)])
         )
-        assert [e.descriptive_count for e in plan.domains] == [2, 1]
         assert plan.descriptive_total == 3
+        assert [e.descriptive_count for e in plan.domains] == [3]
+        assert len(set(plan.selected_descriptive_question_ids)) == 3
 
-    def test_descriptive_cross_domain_deduplication(self):
-        """Domain A needs 2, Domain B needs 2, with overlapping candidates."""
-        shared = desc_items(["s1", "s2"], [CYBER_ID, WEB_ID])
-        cyber_only = desc_items(["c1", "c2"], [CYBER_ID])
-        web_only = desc_items(["w1", "w2"], [WEB_ID])
-        both_two = [
-            cfg(CYBER_ID, "senior", desc=2),
-            cfg(WEB_ID, "senior", desc=2),
-        ]
-        req = build(
-            PROGRAM_5,
-            [CYBER_ID, WEB_ID],
-            both_two,
-            descriptive_pool=shared + cyber_only + web_only,
+    def test_organizational_zero_descriptive_is_allowed(self):
+        """20 MCQ + 0 descriptive must be representable."""
+        plan = plan_assessment(
+            build(PROGRAM_1, [ORG_ID], [cfg(ORG_ID, "organizational", mcq=20, desc=0)])
+        )
+        assert plan.mcq_total == 20
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+
+    def test_organizational_zero_mcq_is_allowed(self):
+        """0 MCQ + 5 descriptive must be representable, with no fixed total."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_1,
+                [ORG_ID],
+                [cfg(ORG_ID, "organizational", mcq=0, desc=5)],
+                descriptive_pool=desc_items(
+                    [f"od{i}" for i in range(8)], [ORG_ID]
+                ),
+            )
+        )
+        assert plan.mcq_total == 0
+        assert plan.selected_mcq_ids == []
+        assert plan.descriptive_total == 5
+
+    def test_organizational_mcq_and_descriptive_mix_independently(self):
+        """Two different mixes with different totals must both be exact."""
+        rich_desc = desc_items([f"od{i}" for i in range(8)], [ORG_ID])
+        fifteen_three = plan_assessment(
+            build(
+                PROGRAM_1,
+                [ORG_ID],
+                [cfg(ORG_ID, "organizational", mcq=15, desc=3)],
+                descriptive_pool=rich_desc,
+            )
+        )
+        ten_five = plan_assessment(
+            build(
+                PROGRAM_1,
+                [ORG_ID],
+                [cfg(ORG_ID, "organizational", mcq=10, desc=5)],
+                descriptive_pool=rich_desc,
+            )
+        )
+        assert (fifteen_three.mcq_total, fifteen_three.descriptive_total) == (15, 3)
+        assert (ten_five.mcq_total, ten_five.descriptive_total) == (10, 5)
+        assert fifteen_three.config_fingerprint != ten_five.config_fingerprint
+
+    def test_technical_never_selects_descriptive_even_with_a_rich_pool(self):
+        """The pool is deliberately generous and technical still gets none."""
+        req = build(PROGRAM_5, [CYBER_ID, WEB_ID], [CYBER_SENIOR, WEB_SENIOR])
+        req.descriptive_pool = desc_items(
+            [f"d{i}" for i in range(20)], [CYBER_ID, WEB_ID]
         )
         plan = plan_assessment(req)
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+        assert [e.descriptive_count for e in plan.domains] == [0, 0]
 
-        # 6 unique questions are available for a 4 question quota, so the
-        # quota is met with exactly 4 DISTINCT questions.
-        assert plan.descriptive_total == 4
-        assert len(set(plan.selected_descriptive_question_ids)) == 4
-        assert [e.descriptive_count for e in plan.domains] == [2, 2]
-        # Cyber Security sorts first, so it takes its own exclusive questions
-        # and the shared ones fall to Web.
-        assert plan.selected_descriptive_question_ids == ["c1", "c2", "s1", "s2"]
-
-    def test_descriptive_dedup_when_both_domains_want_the_same_shared_pool(self):
-        """Two domains each needing 2 from a pool they entirely share."""
-        shared = desc_items(["s1", "s2", "s3", "s4"], [CYBER_ID, WEB_ID])
+    def test_descriptive_does_not_reduce_the_requested_count(self):
         req = build(
-            PROGRAM_5,
-            [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-            descriptive_pool=shared,
-        )
-        plan = plan_assessment(req)
-        assert plan.descriptive_total == 4
-        assert sorted(plan.selected_descriptive_question_ids) == [
-            "s1",
-            "s2",
-            "s3",
-            "s4",
-        ]
-
-    def test_descriptive_overlap_quota_shortfall_fails(self):
-        """2 + 2 quota but only 3 unique overlapping questions exist."""
-        shared = desc_items(["s1", "s2", "s3"], [CYBER_ID, WEB_ID])
-        req = build(
-            PROGRAM_5,
-            [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-            descriptive_pool=shared,
+            PROGRAM_1,
+            [ORG_ID],
+            [cfg(ORG_ID, "organizational", mcq=10, desc=2)],
+            descriptive_pool=desc_items(["d1"], [ORG_ID]),  # needs 2
         )
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
         assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_DESCRIPTIVE_POOL
-        assert "cross-domain deduplication" in excinfo.value.detail
 
-    def test_descriptive_does_not_reduce_the_requested_count(self):
+    def test_inactive_descriptive_questions_excluded(self):
         req = build(
-            PROGRAM_5,
-            [CYBER_ID],
-            [CYBER_SENIOR],
-            descriptive_pool=desc_items(["d1"], [CYBER_ID]),  # needs 2
+            PROGRAM_1,
+            [ORG_ID],
+            [cfg(ORG_ID, "organizational", mcq=10, desc=4)],
+            descriptive_pool=desc_items(
+                ["d1", "d2", "d3", "d4"], [ORG_ID], active=False
+            ),
         )
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
@@ -660,41 +752,35 @@ class TestDescriptiveSelection:
     def test_shared_question_is_reallocated_so_both_domains_are_satisfied(self):
         """The case a greedy pass in domain order used to get WRONG.
 
-        Web's only eligible question is the one shared with Cyber, and it sorts
-        before Cyber's exclusive question. Taking the lowest-sorted id per
-        domain therefore starves Web unless the allocator can move Cyber onto
-        its exclusive question instead. The plan must succeed.
+        Now expressed with hands-on challenges, the only multi-domain
+        allocatable module: Web's only eligible challenge is the one shared
+        with Cyber, and it sorts before Cyber's exclusive one. A lowest-sorted
+        greedy pass therefore starves Web unless the allocator can move Cyber
+        onto its exclusive challenge instead. The plan must succeed.
         """
-        pool = desc_items(["a-shared"], [CYBER_ID, WEB_ID]) + desc_items(
+        pool = hands_items(["a-shared"], [CYBER_ID, WEB_ID]) + hands_items(
             ["b-cyber-only"], [CYBER_ID]
         )
         req = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=1), cfg(WEB_ID, "senior", desc=1)],
-            descriptive_pool=pool,
+            [
+                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=1),
+                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=1),
+            ],
+            hands_on_pool=pool,
         )
         plan = plan_assessment(req)
 
-        assert plan.descriptive_total == 2
-        assert sorted(plan.selected_descriptive_question_ids) == [
+        assert plan.hands_on_total == 2
+        assert sorted(plan.selected_hands_on_question_ids) == [
             "a-shared",
             "b-cyber-only",
         ]
-        assert [e.descriptive_count for e in plan.domains] == [1, 1]
-
-    def test_inactive_descriptive_questions_excluded(self):
-        req = build(
-            PROGRAM_5,
-            [CYBER_ID],
-            [CYBER_SENIOR],
-            descriptive_pool=desc_items(
-                ["d1", "d2", "d3", "d4"], [CYBER_ID], active=False
-            ),
-        )
-        with pytest.raises(AssessmentPlanningError) as excinfo:
-            plan_assessment(req)
-        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_DESCRIPTIVE_POOL
+        assert [(e.hands_on_enabled, e.hands_on_count) for e in plan.domains] == [
+            (True, 1),
+            (True, 1),
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +984,37 @@ class TestCoding:
             plan_assessment(req)
         assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_CODING_POOL
 
+    def test_exactly_two_dsa_problems_are_drawn_from_a_larger_pool(self):
+        """The DSA pool will hold 4-5 active problems; each attempt gets 2.
+
+        The draw must be a genuine subset selection (not the first two of the
+        pool), and different per-attempt seeds must be able to yield different
+        pairs — otherwise every candidate would receive the same problems.
+        """
+        pool_ids = {f"dsa-{i:02d}" for i in range(5)}
+        draws = set()
+        for seed in range(1, 12):
+            req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=2)
+            req.coding_pool = coding_items(5, "dsa")
+            req.seed = seed
+            selected = plan_assessment(req).selected_coding_problem_ids
+            assert len(selected) == 2
+            assert len(set(selected)) == 2
+            assert set(selected) <= pool_ids
+            draws.add(tuple(selected))
+        assert len(draws) > 1
+
+    def test_a_seeded_coding_draw_is_reproducible(self):
+        """Same seed + same inputs => the same frozen DSA pair, across calls."""
+
+        def once():
+            req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=2)
+            req.coding_pool = coding_items(5, "dsa")
+            req.seed = 99
+            return plan_assessment(req).selected_coding_problem_ids
+
+        assert once() == once()
+
 
 # ---------------------------------------------------------------------------
 # 25-28. Determinism, fingerprint, purity, safety
@@ -954,36 +1071,29 @@ class TestDeterminismAndSafety:
             build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], base=90)
         )
         changed_cases = {
-            "mcq_count": build(
-                PROGRAM_5,
+            # The program-level MCQ total IS planning configuration, so it must
+            # move the fingerprint. (`assessment_module_config.mcq_count` and
+            # `.descriptive_count` deliberately do NOT for a technical scope:
+            # neither value is read any more, which is asserted separately in
+            # TestModuleConfiguration.)
+            "program_mcq_total": build(
+                ProgramInput(
+                    semester=5,
+                    scope=Scope.TECHNICAL,
+                    tier="senior",
+                    max_domains=2,
+                    coding_enabled=True,
+                    mcq_total=30,
+                ),
                 [CYBER_ID],
-                [
-                    cfg(
-                        CYBER_ID,
-                        "senior",
-                        mcq=6,
-                        desc=2,
-                        hands_on=True,
-                        hands_on_count=1,
-                        minutes=20,
-                    )
-                ],
+                [CYBER_SENIOR],
                 base=90,
+                mcq_pool=mcq_items(CYBER_ID, 5, 40, "big"),
             ),
-            "descriptive_count": build(
+            "hands_on_enabled": build(
                 PROGRAM_5,
                 [CYBER_ID],
-                [
-                    cfg(
-                        CYBER_ID,
-                        "senior",
-                        mcq=5,
-                        desc=3,
-                        hands_on=True,
-                        hands_on_count=1,
-                        minutes=20,
-                    )
-                ],
+                [cfg(CYBER_ID, "senior", mcq=5, desc=2)],
                 base=90,
             ),
             "hands_on_count": build(
@@ -1078,6 +1188,8 @@ class TestDeterminismAndSafety:
     def test_sensitive_extra_fields_on_pool_rows_never_reach_the_plan(self):
         """Supabase rows are usually SELECT *, so extras must be dropped."""
         req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=1)
+        # The technical rule needs the derived 20-for-one-domain share, so the
+        # pool has to be big enough for the selection to succeed.
         req.mcq_pool = [
             MCQPoolItem(
                 id=f"q{i}",
@@ -1086,7 +1198,7 @@ class TestDeterminismAndSafety:
                 correct_option="A",
                 explanation="because",  # type: ignore
             )
-            for i in range(10)
+            for i in range(40)
         ]
         req.descriptive_pool = [
             DescriptivePoolItem(
@@ -1124,7 +1236,7 @@ class TestDeterminismAndSafety:
 
         plan = plan_assessment(build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=2))
         round_tripped = json.loads(plan.model_dump_json())
-        assert round_tripped["plan_version"] == 1
+        assert round_tripped["plan_version"] == 2
         assert round_tripped["config_source"] == "modular"
         assert round_tripped["coding_total"] == 2
 
@@ -1150,8 +1262,11 @@ class TestMultiDomainAggregation:
         plan = plan_assessment(
             build(PROGRAM_5, [CYBER_ID, WEB_ID], [cyber, web], coding=2, base=90)
         )
-        assert plan.mcq_total == 10
-        assert plan.descriptive_total == 3
+        # Two senior domains: the derived 10 + 10 split of the programme total.
+        assert plan.mcq_total == TECH_MCQ_TOTAL
+        assert [e.mcq_count for e in plan.domains] == [10, 10]
+        # Descriptive is organizational-only, so neither domain contributes any.
+        assert plan.descriptive_total == 0
         assert plan.hands_on_total == 1
         assert plan.coding_total == 2
         assert plan.additional_minutes == 20
@@ -1169,10 +1284,12 @@ class TestMultiDomainAggregation:
                 base=90,
             )
         )
-        assert plan.mcq_total == 9
-        assert plan.descriptive_total == 2
+        assert plan.mcq_total == TECH_MCQ_TOTAL
+        assert [e.mcq_count for e in plan.domains] == [10, 10]
+        assert plan.descriptive_total == 0
         assert plan.hands_on_total == 0
         assert plan.selected_hands_on_question_ids == []
+        assert plan.practicals == []
         assert plan.additional_minutes == 0
         assert plan.duration_minutes == 90
 
@@ -1197,30 +1314,36 @@ class TestExactAllocation:
     """
 
     def test_cascading_reallocation_solves_what_greedy_could_not(self):
-        """Both domains want 2; Web can only use the two shared questions.
+        """Both domains want 2; Web can only use the two shared challenges.
 
         The shared ids sort before Cyber's exclusives, so a greedy pass would
-        hand both shared questions to Cyber and then fail Web. Feasibility
-        requires Cyber to end up on its two exclusive questions instead.
+        hand both shared challenges to Cyber and then fail Web. Feasibility
+        requires Cyber to end up on its two exclusive challenges instead.
+
+        (Expressed with hands-on: it is the only allocatable module that can
+        span two domains now that descriptive is organizational-only.)
         """
         req = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-            descriptive_pool=(
-                desc_items(["a1", "a2"], [CYBER_ID, WEB_ID])
-                + desc_items(["z1", "z2"], [CYBER_ID])
+            [
+                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=2),
+                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=2),
+            ],
+            hands_on_pool=(
+                hands_items(["a1", "a2"], [CYBER_ID, WEB_ID])
+                + hands_items(["z1", "z2"], [CYBER_ID])
             ),
         )
         plan = plan_assessment(req)
-        assert plan.descriptive_total == 4
-        assert sorted(plan.selected_descriptive_question_ids) == [
+        assert plan.hands_on_total == 4
+        assert sorted(plan.selected_hands_on_question_ids) == [
             "a1",
             "a2",
             "z1",
             "z2",
         ]
-        assert [e.descriptive_count for e in plan.domains] == [2, 2]
+        assert [e.hands_on_count for e in plan.domains] == [2, 2]
 
     def test_hands_on_shared_challenge_is_reallocated(self):
         """The hands-on equivalent of the descriptive reallocation case."""
@@ -1266,16 +1389,19 @@ class TestExactAllocation:
         ]
 
     def test_impossible_quota_set_still_fails(self):
-        """A 2 + 2 quota over only 3 unique questions is genuinely infeasible."""
+        """A 2 + 2 quota over only 3 unique challenges is genuinely infeasible."""
         req = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-            descriptive_pool=desc_items(["s1", "s2", "s3"], [CYBER_ID, WEB_ID]),
+            [
+                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=2),
+                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=2),
+            ],
+            hands_on_pool=hands_items(["s1", "s2", "s3"], [CYBER_ID, WEB_ID]),
         )
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
-        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_DESCRIPTIVE_POOL
+        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL
         assert "No valid allocation" in excinfo.value.detail
 
     def test_impossible_hands_on_quota_set_still_fails(self):
@@ -1297,12 +1423,15 @@ class TestExactAllocation:
         req = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=1), cfg(WEB_ID, "senior", desc=5)],
-            descriptive_pool=desc_items(["s1", "s2"], [CYBER_ID, WEB_ID]),
+            [
+                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=1),
+                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=5),
+            ],
+            hands_on_pool=hands_items(["s1", "s2"], [CYBER_ID, WEB_ID]),
         )
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
-        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_DESCRIPTIVE_POOL
+        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL
 
     def test_selected_ids_are_globally_unique(self):
         """Heavy overlap: no id may appear twice anywhere in the plan."""
@@ -1314,6 +1443,8 @@ class TestExactAllocation:
                 cfg(CYBER_ID, "senior", desc=2, hands_on=True, hands_on_count=2),
                 cfg(WEB_ID, "senior", desc=2, hands_on=True, hands_on_count=2),
             ],
+            # A generous descriptive pool is supplied deliberately: technical
+            # must ignore it entirely.
             descriptive_pool=(
                 desc_items(shared, [CYBER_ID, WEB_ID])
                 + desc_items(["c1", "c2"], [CYBER_ID])
@@ -1334,54 +1465,67 @@ class TestExactAllocation:
             plan.selected_coding_problem_ids,
         ):
             assert len(selection) == len(set(selection))
-        # Quotas are met exactly, never reduced.
-        assert plan.descriptive_total == 4
+        # Technical never takes descriptive, whatever the configured counts say.
+        assert plan.descriptive_total == 0
+        # Hands-on quotas are met exactly, never reduced.
         assert plan.hands_on_total == 4
-        assert [e.descriptive_count for e in plan.domains] == [2, 2]
+        assert [e.descriptive_count for e in plan.domains] == [0, 0]
         assert [e.hands_on_count for e in plan.domains] == [2, 2]
 
     def test_allocation_is_deterministic_across_repeated_calls(self):
         request = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-            descriptive_pool=(
-                desc_items(["a1", "a2"], [CYBER_ID, WEB_ID])
-                + desc_items(["z1", "z2"], [CYBER_ID])
+            [
+                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=2),
+                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=2),
+            ],
+            hands_on_pool=(
+                hands_items(["a1", "a2"], [CYBER_ID, WEB_ID])
+                + hands_items(["z1", "z2"], [CYBER_ID])
             ),
         )
         dumps = [plan_assessment(request).model_dump() for _ in range(5)]
         assert all(dump == dumps[0] for dump in dumps)
+        assert dumps[0]["hands_on_total"] == 4
 
     def test_allocation_is_deterministic_under_a_seed(self):
         def run():
             request = build(
                 PROGRAM_5,
                 [CYBER_ID, WEB_ID],
-                [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-                descriptive_pool=desc_items(
-                    ["q1", "q2", "q3", "q4", "q5"], [CYBER_ID, WEB_ID]
+                [
+                    cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=2),
+                    cfg(WEB_ID, "senior", hands_on=True, hands_on_count=2),
+                ],
+                hands_on_pool=hands_items(
+                    ["q1", "q2", "q3", "q4", "q5", "q6"], [CYBER_ID, WEB_ID]
                 ),
             )
             request.seed = 7
             return plan_assessment(request).model_dump()
 
-        assert run() == run()
+        first = run()
+        assert first == run()
+        assert first["hands_on_total"] == 4
 
     def test_allocation_still_meets_quotas_with_a_seed(self):
         request = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
-            [cfg(CYBER_ID, "senior", desc=2), cfg(WEB_ID, "senior", desc=2)],
-            descriptive_pool=desc_items(
+            [
+                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=2),
+                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=2),
+            ],
+            hands_on_pool=hands_items(
                 ["q1", "q2", "q3", "q4", "q5", "q6"], [CYBER_ID, WEB_ID]
             ),
         )
         request.seed = 99
         plan = plan_assessment(request)
-        assert plan.descriptive_total == 4
-        assert len(set(plan.selected_descriptive_question_ids)) == 4
-        assert [e.descriptive_count for e in plan.domains] == [2, 2]
+        assert plan.hands_on_total == 4
+        assert len(set(plan.selected_hands_on_question_ids)) == 4
+        assert [e.hands_on_count for e in plan.domains] == [2, 2]
 
     def test_via_the_allocator_api_directly(self):
         """Unit-test the allocator on the raw structure, not via a request."""
@@ -1451,11 +1595,13 @@ class TestPurityGuarantees:
     def test_duplicate_rows_in_a_pool_are_counted_once(self):
         """Pool ids are primary keys, so a repeated id is one question —
         a duplicated row must never satisfy two slots."""
-        dupes = desc_items(["d1", "d1"], [CYBER_ID]) + desc_items(["d2"], [CYBER_ID])
+        # Descriptive duplication is checked through the organizational scope,
+        # the only one that selects descriptive questions now.
+        dupes = desc_items(["d1", "d1"], [ORG_ID]) + desc_items(["d2"], [ORG_ID])
         req = build(
-            PROGRAM_5,
-            [CYBER_ID],
-            [cfg(CYBER_ID, "senior", desc=3)],
+            PROGRAM_1,
+            [ORG_ID],
+            [cfg(ORG_ID, "organizational", mcq=10, desc=3)],
             descriptive_pool=dupes,
         )
         with pytest.raises(AssessmentPlanningError) as excinfo:
@@ -1466,10 +1612,14 @@ class TestPurityGuarantees:
 
     def test_duplicate_mcq_rows_are_counted_once(self):
         req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
-        req.mcq_pool = mcq_items(CYBER_ID, 5, 5, "q") + mcq_items(CYBER_ID, 5, 5, "q")
+        # 20 unique ids, each supplied twice: the derived single-domain share
+        # is 20, so only deduplication makes this satisfiable.
+        req.mcq_pool = (
+            mcq_items(CYBER_ID, 5, 20, "q") + mcq_items(CYBER_ID, 5, 20, "q")
+        )
         plan = plan_assessment(req)
-        assert plan.mcq_total == 5
-        assert len(set(plan.selected_mcq_ids)) == 5
+        assert plan.mcq_total == TECH_MCQ_TOTAL
+        assert len(set(plan.selected_mcq_ids)) == TECH_MCQ_TOTAL
 
     def test_planner_never_raises_for_missing_pools_when_nothing_is_needed(self):
         """Organizational with zero counts still produces a valid plan."""
@@ -1538,8 +1688,9 @@ class TestMCQOrdering:
         b = plan_assessment(req_b)
         # Both have 10 MCQs (5 per domain), so a different seed should
         # produce a different final order.
-        assert a.mcq_total == 10
-        assert b.mcq_total == 10
+        # Two senior domains -> the derived 10 + 10, so 20 MCQs in total.
+        assert a.mcq_total == TECH_MCQ_TOTAL
+        assert b.mcq_total == TECH_MCQ_TOTAL
         assert a.selected_mcq_ids != b.selected_mcq_ids
 
     def test_mcq_ids_are_not_grouped_by_domain(self):
@@ -1558,8 +1709,8 @@ class TestMCQOrdering:
         plan = plan_assessment(req)
         ids = plan.selected_mcq_ids
         # All IDs should be from the MCQ pool (domain-prefixed)
-        assert len(ids) == 10
-        assert len(set(ids)) == 10
+        assert len(ids) == TECH_MCQ_TOTAL
+        assert len(set(ids)) == TECH_MCQ_TOTAL
         # With a seed, the list should not be purely domain-grouped.
         # Check that at least one transition changes domain prefix.
         domain_prefixes = [qid.split("-")[1] if "-" in qid else "" for qid in ids]
@@ -1572,6 +1723,36 @@ class TestMCQOrdering:
         assert transitions >= 1, (
             f"Expected interleaving across domains, got prefixes: " f"{domain_prefixes}"
         )
+
+    def test_junior_technical_never_carries_a_practical(self):
+        """Requirement: Junior = MCQs + 2 DSA/Coding, no practical of any kind.
+
+        A junior module row that wrongly enables hands-on must not leak a
+        challenge or its additional minutes into a junior assessment.
+        """
+        wrong = cfg(
+            CYBER_ID, "junior", mcq=5, hands_on=True, hands_on_count=1, minutes=30
+        )
+        req = build(PROGRAM_3, [CYBER_ID], [wrong], base=90)
+        req.hands_on_pool = hands_items(["h1"], [CYBER_ID])
+        plan = plan_assessment(req)
+        assert plan.hands_on_total == 0
+        assert plan.selected_hands_on_question_ids == []
+        assert plan.practicals == []
+        assert plan.additional_minutes == 0
+        assert plan.duration_minutes == 90
+
+    def test_senior_technical_single_domain_carries_one_single_arm_module(self):
+        req = build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR])
+        req.hands_on_pool = hands_items(["h1", "h2"], [CYBER_ID])
+        plan = plan_assessment(req)
+        assert len(plan.practicals) == 1
+        module = plan.practicals[0]
+        assert module.module_kind.value == "single"
+        assert module.scoring.value == "single"
+        assert len(module.arms) == 1
+        assert module.arms[0].kind.value == "hands_on"
+        assert len(module.arms[0].question_ids) == 1
 
     def test_no_seed_keeps_sorted_mcq_order(self):
         """Without a seed, MCQs remain in the deterministic sorted order."""
@@ -1596,5 +1777,5 @@ class TestMCQOrdering:
         # Every MCQ must belong to Cyber Security (the only selected domain)
         for qid in plan.selected_mcq_ids:
             assert CYBER_ID in qid or qid.startswith("q" + CYBER_ID)
-        assert len(plan.selected_mcq_ids) == 5
-        assert len(set(plan.selected_mcq_ids)) == 5
+        assert len(plan.selected_mcq_ids) == TECH_MCQ_TOTAL
+        assert len(set(plan.selected_mcq_ids)) == TECH_MCQ_TOTAL

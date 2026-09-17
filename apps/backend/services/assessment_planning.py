@@ -5,10 +5,8 @@ This module is the ONLY bridge between the database and the pure planner in
 
     1. resolves the candidate's assessment programme (semester -> scope/tier),
     2. resolves the selected domains and their assessment_module_config rows,
-    3. builds the explicit technical legacy fallback when modular config is
-       still being authored,
-    4. fetches the candidate-eligible content pools,
-    5. hands everything to the pure planner and returns the frozen plan.
+    3. fetches the candidate-eligible content pools,
+    4. hands everything to the pure planner and returns the frozen plan.
 
 The planner itself stays free of database access: nothing here leaks into it,
 and every value it receives is an already-resolved plain input model.
@@ -17,13 +15,23 @@ WHY THIS IS SEPARATE FROM THE ROUTER
     ``routers/assessment.py`` should stay an HTTP layer. All the query shapes
     and the planner wiring live here so the endpoint body stays small.
 
-LEGACY TECHNICAL FALLBACK
-    ``assessment_module_config`` is intentionally empty while the per-domain
-    configuration matrix is authored. Until it is populated, technical
-    assessments keep working by passing the CURRENT global ``assessment_config``
-    counts to the planner as an EXPLICIT fallback. The fallback is never
-    implicit: the planner refuses organizational assessments outright, and it
-    ignores the fallback the moment modular configuration is complete.
+TECHNICAL MODULE CONFIGURATION IS OPTIONAL
+    A technical assessment needs no module rows at all: its MCQ quantity is
+    derived from ``assessment_program.mcq_total`` and the number of selected
+    domains, its coding selection is global, and descriptive questions do not
+    exist for it. Module rows exist only to switch on OPTIONAL modules (today
+    just hands-on), so an unauthored matrix simply means no optional module is
+    enabled. The organizational scope is the opposite: it derives its whole
+    content from its module row, so a missing row is a hard 400.
+
+LEGACY TECHNICAL FALLBACK (removed)
+    The pre-modular bridge that fed the global ``assessment_config`` counts to
+    the planner no longer exists: neither the ``LegacyTechnicalFallback`` input
+    model nor ``build_legacy_technical_fallback`` is defined any more. Nothing
+    derives technical MCQ or descriptive quantity from the global config — the
+    derived programme rule replaced it and descriptive questions became
+    organizational-only — so there is no path left that could mix the two
+    models.
 
 WHAT THIS MODULE DOES NOT DO
     - It never writes. The only write in the whole creation flow is the router's
@@ -49,7 +57,6 @@ from services.assessment_planner import (
     DescriptivePoolItem,
     DomainInput,
     HandsOnPoolItem,
-    LegacyTechnicalFallback,
     MCQPoolItem,
     ModuleConfigInput,
     ProgramInput,
@@ -58,12 +65,6 @@ from services.assessment_planner import (
 )
 
 logger = logging.getLogger(__name__)
-
-# The plan snapshot columns (assessment_attempts.plan / base_duration_minutes /
-# additional_minutes) were added by migration 017. Flip this off to revert to
-# the pre-persistence behaviour where only the existing frozen columns were
-# written.
-PLAN_PERSISTENCE_ENABLED = True
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +82,9 @@ def resolve_program(semester: int) -> ProgramInput:
     """
     response = (
         supabase_client.table("assessment_program")
-        .select("semester, scope, tier, max_domains, coding_enabled")
+        .select(
+            "semester, scope, tier, max_domains, coding_enabled, mcq_total"
+        )
         .eq("semester", semester)
         .eq("is_active", True)
         .execute()
@@ -179,20 +182,6 @@ def load_module_configs(domain_ids, family) -> list:
         .execute()
     )
     return [ModuleConfigInput(**row) for row in response.data or []]
-
-
-def build_legacy_technical_fallback(config: dict) -> LegacyTechnicalFallback:
-    """Explicit opt-in fallback built from the CURRENT global config.
-
-    The router resolves these values; the planner never reads them itself.
-    """
-    return LegacyTechnicalFallback(
-        total_questions=int(config.get("total_questions", 0) or 0),
-        descriptive_question_count=int(
-            config.get("descriptive_question_count", 0) or 0
-        ),
-        hands_on_question_count=int(config.get("hands_on_question_count", 0) or 0),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -294,16 +283,17 @@ def generate_seed() -> int:
     return secrets.randbits(63)
 
 
-def _pool_required(legacy_count: int, modular_counts) -> bool:
+def _pool_required(modular_counts) -> bool:
     """Whether a descriptive/hands-on pool fetch can possibly be needed.
 
-    A zero quota in every configuration path means the planner cannot ask for
-    anything from this pool, so the query is skipped — preserving the existing
-    behaviour of not querying a section that is switched off. Anything else
-    fetches conservatively: the planner remains the authority on how many of
-    the fetched items are actually used, and it fails loudly on a shortfall.
+    Module configuration is the ONLY thing that can request items from these
+    pools, so a zero quota in every relevant row means the planner cannot ask
+    for anything and the query is skipped — preserving the existing behaviour
+    of not querying a section that is switched off. Anything else fetches
+    conservatively: the planner remains the authority on how many of the
+    fetched items are actually used, and it fails loudly on a shortfall.
     """
-    return legacy_count > 0 or any(count > 0 for count in modular_counts)
+    return any(count > 0 for count in modular_counts)
 
 
 # ---------------------------------------------------------------------------
@@ -335,17 +325,15 @@ def plan_new_attempt(
         )
 
     # 2. Per-domain module configuration for this programme's family.
+    #
+    # For a technical scope these rows only switch on OPTIONAL modules, so the
+    # result may legitimately be empty or partial. For the organizational scope
+    # the row is the source of the assessment's content and a missing one makes
+    # the planner refuse the plan.
     family = config_family_for(program)
     module_configs = load_module_configs(domain_ids, family)
 
-    # 3. Explicit technical legacy fallback. Organizational NEVER gets one.
-    legacy = (
-        build_legacy_technical_fallback(config)
-        if program.scope is Scope.TECHNICAL
-        else None
-    )
-
-    # 4. Global, module-independent values.
+    # 3. Global, module-independent values.
     coding_problem_count = int(config.get("coding_problem_count", 0) or 0)
     coding_enabled = bool(program.coding_enabled) and program.scope is Scope.TECHNICAL
 
@@ -355,23 +343,26 @@ def plan_new_attempt(
         requested_domain_ids=domain_ids,
         domains=load_domain_catalogue(domain_ids),
         module_configs=module_configs,
-        legacy_technical_fallback=legacy,
         base_duration_minutes=int(config["duration_minutes"]),
         global_coding_problem_count=coding_problem_count,
         mcq_pool=load_mcq_pool(domain_ids, semester),
+        # Descriptive questions exist for the ORGANIZATIONAL assessment only, so
+        # a technical attempt never even queries the pool. That is stricter than
+        # the old "skip when every configured count is zero" rule and removes
+        # any chance of a technical assessment acquiring descriptive content.
         descriptive_pool=(
             load_descriptive_pool(domain_ids)
-            if _pool_required(
-                legacy.descriptive_question_count if legacy else 0,
-                [c.descriptive_count for c in module_configs],
-            )
+            if program.scope is Scope.ORGANIZATIONAL
+            and _pool_required([c.descriptive_count for c in module_configs])
             else []
         ),
+        # The module row is the only switch that can request hands-on content,
+        # so a count of zero in every ENABLED row means the pool query is
+        # skipped.
         hands_on_pool=(
             load_hands_on_pool(domain_ids)
             if _pool_required(
-                legacy.hands_on_question_count if legacy else 0,
-                [c.hands_on_count for c in module_configs if c.hands_on_enabled],
+                [c.hands_on_count for c in module_configs if c.hands_on_enabled]
             )
             else []
         ),

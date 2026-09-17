@@ -19,6 +19,7 @@ from test_main import (
     FROZEN_DESC_IDS,
     FROZEN_HANDS_IDS,
     MOCK_ATTEMPT_ID,
+    MOCK_CANDIDATE_ID,
     MOCK_CODING_PROBLEM_ID,
     MOCK_DESC_ID,
     MOCK_DOMAIN_1_ID,
@@ -30,7 +31,6 @@ from test_main import (
     _configure_resume_chains,
     _configure_start_mocks,
     _frozen_attempt,
-    _make_config,
     _make_mock_response,
     _make_module_config,
     _make_program,
@@ -228,8 +228,10 @@ class TestProgramResolution:
             client.app.dependency_overrides.clear()
 
         assert response.status_code == 200
-        # The JUNIOR row was the one used (1 MCQ), not the legacy global 2.
-        assert _payload(mock_supabase)["total_questions"] == 1
+        # The junior programme was the one resolved. Under the final rule the
+        # MCQ quantity is DERIVED from the programme total (2) split across the
+        # one selected domain, so the junior row's mcq_count is not consulted.
+        assert _payload(mock_supabase)["total_questions"] == 2
 
     def test_semester_5_resolves_senior_program(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
@@ -619,7 +621,7 @@ class TestModuleConfiguration:
                     descriptive_count=1,
                 )
             ],
-            descriptive_count=2,  # legacy says 2; modular must win with 1
+            descriptive_count=2,  # the unused global count; module config wins
         )
         _auth()
         try:
@@ -630,12 +632,22 @@ class TestModuleConfiguration:
         assert response.status_code == 200
         assert spy.plan.config_source.value == "modular"
         payload = _payload(mock_supabase)
-        assert payload["total_questions"] == 1
-        assert payload["total_descriptive_questions"] == 1
+        # Technical MCQ comes from the programme, so the configured mcq_count=1
+        # is ignored and the full programme total is drawn from the one domain.
+        assert payload["total_questions"] == 2
+        # Technical carries no descriptive questions at all, so the configured
+        # descriptive_count=1 (and the unused global 2) are both ignored.
+        assert payload["total_descriptive_questions"] == 0
 
-    def test_partially_configured_uses_legacy_fallback_for_whole_plan(
+    def test_partially_configured_technical_plan_is_valid(
         self, client, mock_supabase, spy
     ):
+        """One configured domain out of two is a VALID technical plan.
+
+        Nothing technical is derived from module configuration any more, so a
+        partially authored tier carries no hybrid risk: the unconfigured domain
+        simply has no optional module enabled.
+        """
         second_domain = dict(
             TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Web Dev", slug="webDevelopment"
         )
@@ -670,18 +682,25 @@ class TestModuleConfiguration:
             client.app.dependency_overrides.clear()
 
         assert response.status_code == 200
-        # Legacy for the WHOLE plan: global total_questions=2 split 1/1 = 2,
-        # NOT the partial modular config.
-        assert spy.plan.config_source.value == "legacy_technical_fallback"
+        # The programme total (2) split evenly across BOTH selected domains:
+        # 1 + 1, regardless of the partial module configuration.
+        assert spy.plan.config_source.value == "modular"
         payload = _payload(mock_supabase)
         assert payload["total_questions"] == 2
         assert sorted(_payload(mock_supabase)["domain_ids"]) == sorted(
             [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
         )
 
-    def test_technical_always_receives_explicit_legacy_fallback(
+    def test_technical_never_receives_the_legacy_global_fallback(
         self, client, mock_supabase, spy
     ):
+        """The pre-modular global bridge no longer exists at all.
+
+        Technical quantities are programme-derived (mcq_total) or global by
+        design (coding count), and descriptive questions are organizational-
+        only, so there is nothing a legacy global count could supply — and the
+        retired fallback input is gone from the planner request model.
+        """
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
             mock_supabase,
@@ -696,11 +715,12 @@ class TestModuleConfiguration:
         finally:
             client.app.dependency_overrides.clear()
 
-        fallback = spy.request.legacy_technical_fallback
-        assert fallback is not None
-        assert fallback.descriptive_question_count == 1
-        # Built from the CURRENT assessment_config, not from the planner.
-        assert fallback.total_questions == 2
+        # The retired fallback is not merely unused: it is not a field any more.
+        assert "legacy_technical_fallback" not in spy.request.model_fields
+        # The assessment still succeeded, deriving its MCQ count from the
+        # programme rather than from assessment_config.total_questions.
+        assert spy.plan.mcq_total == 2
+        assert spy.plan.descriptive_total == 0
 
     def test_missing_organizational_config_is_rejected(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
@@ -726,7 +746,11 @@ class TestModuleConfiguration:
     def test_organizational_never_uses_legacy_global_counts(
         self, client, mock_supabase, spy
     ):
-        """The critical boundary: no organizational fallback, ever."""
+        """The critical boundary: organizational content has ONE source.
+
+        A module row is the only place its mcq/descriptive quantities can come
+        from, so a missing row is refused rather than filled from anything else.
+        """
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
             mock_supabase,
@@ -746,7 +770,7 @@ class TestModuleConfiguration:
 
         assert response.status_code == 400
         assert spy.called, "the planner must have been asked and refused"
-        assert spy.request.legacy_technical_fallback is None
+        assert "legacy_technical_fallback" not in spy.request.model_fields
 
     def test_organizational_config_is_loaded_with_organizational_family(
         self, client, mock_supabase, spy
@@ -867,7 +891,8 @@ class TestPlannerIntegration:
 
         # And the plan actually contains content (not a vacuous match).
         assert plan.mcq_total == 2
-        assert plan.descriptive_total == 1
+        # Technical never selects descriptive questions.
+        assert plan.descriptive_total == 0
         assert plan.hands_on_total == 1
         assert plan.coding_total == 1
 
@@ -913,7 +938,7 @@ class TestPlannerIntegration:
             module_configs=[],
             descriptive_count=0,
             hands_on_count=0,
-            # Only 1 eligible MCQ, but the legacy global count asks for 2.
+            # Only 1 eligible MCQ, but the programme's mcq_total asks for 2.
             mcq_available=[{"id": MOCK_MCQ_1_ID, "domain_id": MOCK_DOMAIN_1_ID}],
         )
         try:
@@ -1425,7 +1450,7 @@ class TestPlanPersistence:
         """
         migrations = Path(__file__).resolve().parent / "migrations"
         files = sorted(migrations.glob("*.sql"))
-        assert [int(p.name.split("_")[0]) for p in files] == list(range(1, 18))
+        assert [int(p.name.split("_")[0]) for p in files] == list(range(1, 20))
 
         m017 = migrations / "017_plan_snapshot_columns.sql"
         assert m017.exists()
@@ -1434,10 +1459,62 @@ class TestPlanPersistence:
         assert "base_duration_minutes" in content
         assert "additional_minutes" in content
 
-    def test_plan_persistence_flag_is_on(self):
-        from services.assessment_planning import PLAN_PERSISTENCE_ENABLED
+    def test_migration_018_adds_the_program_mcq_total(self):
+        """Static guard: migration 018 adds assessment_program.mcq_total."""
+        migrations = Path(__file__).resolve().parent / "migrations"
+        m018 = migrations / "018_program_mcq_total.sql"
+        assert m018.exists()
+        content = m018.read_text(encoding="utf-8")
+        assert "mcq_total INTEGER NOT NULL DEFAULT 20" in content
+        assert "assessment_program_mcq_total_check" in content
 
-        assert PLAN_PERSISTENCE_ENABLED is True
+    def test_migration_019_is_the_data_only_domain_catalogue_fix(self):
+        """Static guard: migration 019 adds DevOps and reactivates CyberSec."""
+        migrations = Path(__file__).resolve().parent / "migrations"
+        m019 = migrations / "019_domain_catalogue_final.sql"
+        assert m019.exists()
+        content = m019.read_text(encoding="utf-8")
+        assert "'devOps'" in content
+        assert "UPDATE public.domains" in content
+        assert "'cyberSecurity'" in content
+        # Data-only: it must not create or alter any table.
+        assert "CREATE TABLE" not in content
+        assert "ALTER TABLE" not in content
+
+    def test_migration_019_leaves_the_other_domains_alone(self):
+        """Backend Development / User Interface are deliberately untouched.
+
+        Their fate is a separate product decision, so the catalogue fix must
+        neither deactivate nor rename them: only their slugs would appear in
+        the migration if it did.
+        """
+        migrations = Path(__file__).resolve().parent / "migrations"
+        content = (migrations / "019_domain_catalogue_final.sql").read_text(
+            encoding="utf-8"
+        )
+        # Ignore the prose header: only executable statements matter.
+        statements = "\n".join(
+            line for line in content.splitlines() if not line.strip().startswith("--")
+        )
+        assert "backendDevelopment" not in statements
+        assert "userInterface" not in statements
+        # Exactly two catalogue writes: one INSERT + one targeted UPDATE.
+        assert statements.count("INSERT INTO") == 1
+        assert statements.count("UPDATE public.domains") == 1
+        assert "DELETE" not in statements.upper()
+
+    def test_plan_persistence_flag_has_been_removed(self):
+        """Phase 5's temporary rollout flag is gone.
+
+        Migration 017 is applied and the frozen plan snapshot is part of the
+        final architecture, so neither the planning service nor the router may
+        expose a switch that could silently stop persisting it.
+        """
+        import routers.assessment as assessment_router
+        import services.assessment_planning as ap
+
+        assert not hasattr(ap, "PLAN_PERSISTENCE_ENABLED")
+        assert not hasattr(assessment_router, "PLAN_PERSISTENCE_ENABLED")
 
     def test_new_attempt_persists_plan_snapshot(self, client, mock_supabase, spy):
         """A new attempt must include plan/base_duration_minutes/additional_minutes."""
@@ -1537,22 +1614,26 @@ class TestPlanPersistence:
         ):
             assert key in plan_json, f"Missing key: {key}"
 
-    def test_plan_persistence_flag_can_be_toggled(self, client, mock_supabase, monkeypatch):
-        """When PLAN_PERSISTENCE_ENABLED is False, the old behaviour holds."""
-        # Patch BOTH the service module and the router's imported binding.
-        import routers.assessment as assessment_router
-        import services.assessment_planning as ap
+    def test_organizational_attempt_also_persists_the_plan_snapshot(
+        self, client, mock_supabase, spy
+    ):
+        """Persistence is unconditional across scopes, not just technical.
 
-        monkeypatch.setattr(ap, "PLAN_PERSISTENCE_ENABLED", False)
-        monkeypatch.setattr(assessment_router, "PLAN_PERSISTENCE_ENABLED", False)
+        The removed feature flag used to gate the snapshot; with it gone, an
+        organizational plan is frozen the same way a technical one is.
+        """
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
             mock_supabase,
-            program=SENIOR_PROGRAM,
-            domains=[TECH_DOMAIN],
+            program=ORG_PROGRAM,
+            semester=1,
+            domains=[ORG_DOMAIN],
             module_configs=[
                 _make_module_config(
-                    domain_id=MOCK_DOMAIN_1_ID, applies_to="senior", mcq_count=2
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="organizational",
+                    mcq_count=1,
+                    descriptive_count=1,
                 )
             ],
         )
@@ -1563,8 +1644,11 @@ class TestPlanPersistence:
             client.app.dependency_overrides.clear()
 
         payload = _payload(mock_supabase)
-        for key in ("plan", "base_duration_minutes", "additional_minutes"):
-            assert key not in payload
+        plan = spy.plan
+        assert plan.scope.value == "organizational"
+        assert payload["plan"] == plan.model_dump(mode="json")
+        assert payload["base_duration_minutes"] == plan.base_duration_minutes
+        assert payload["additional_minutes"] == plan.additional_minutes
 
     def test_only_one_write_happens_and_it_is_the_attempt_insert(
         self, client, mock_supabase
@@ -1595,6 +1679,289 @@ class TestPlanPersistence:
             assert not chain.insert.called, table
             assert not chain.update.called, table
             assert not chain.delete.called, table
+
+
+# ===========================================================================
+# K. DOMAIN AVAILABILITY / ELIGIBILITY
+# ===========================================================================
+
+
+class TestDomainAvailability:
+    """GET /assessment/available-domains returns candidate-eligible domains
+
+    based on their authenticated semester and assessment_program scope.
+    """
+
+    def _get(self, client):
+        return client.get("/assessment/available-domains")
+
+    def _configure_availability(
+        self, mock_sb, semester=5, program=None, domains=None
+    ):
+        """Configure mock chains for the availability endpoint.
+
+        The endpoint queries (in order):
+          candidates       -> select("id, semester").eq("profile_id", ...)
+          assessment_program -> select(...).eq("semester", ...).eq("is_active", True)
+          domains          -> select(...).eq("is_active", True).eq("assessment_scope", ...)
+        """
+        if program is None:
+            program = _make_program(semester=semester)
+        if domains is None:
+            domains = []
+
+        chains = mock_sb._table_chains
+
+        candidates_chain = chains.setdefault("candidates", MagicMock())
+        candidates_chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_CANDIDATE_ID, "semester": semester}])
+        )
+
+        program_chain = chains.setdefault("assessment_program", MagicMock())
+        program_chain.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([program])
+        )
+
+        domains_chain = chains.setdefault("domains", MagicMock())
+        domains_chain.select.return_value.eq.return_value.eq.return_value.order.return_value.execute.return_value = (
+            _make_mock_response(domains)
+        )
+
+    def test_semester_3_receives_technical_domains(self, client, mock_supabase):
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=3,
+            program=JUNIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["semester"] == 3
+            assert data["scope"] == "technical"
+            assert data["tier"] == "junior"
+            assert data["max_domains"] == 2
+            assert len(data["domains"]) == 1
+            assert data["domains"][0]["id"] == MOCK_DOMAIN_1_ID
+            assert data["domains"][0]["name"] == "Cyber Security"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_semester_5_receives_senior_tier(self, client, mock_supabase):
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["semester"] == 5
+            assert data["scope"] == "technical"
+            assert data["tier"] == "senior"
+            assert data["max_domains"] == 2
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_semester_1_receives_organizational_domains(self, client, mock_supabase):
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["semester"] == 1
+            assert data["scope"] == "organizational"
+            assert data["tier"] is None
+            assert data["max_domains"] == 1
+            assert len(data["domains"]) == 1
+            assert data["domains"][0]["assessment_scope"] == "organizational"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_semester_7_returns_no_domains(self, client, mock_supabase):
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=7,
+            program=NONE_PROGRAM,
+            domains=[],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["semester"] == 7
+            assert data["scope"] == "none"
+            assert data["domains"] == []
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_inactive_domains_are_excluded(self, client, mock_supabase):
+        _route_table(mock_supabase, "candidates")
+        # The mock returns only active domains — the endpoint filters
+        # at the DB level via .eq("is_active", True). Verify the
+        # endpoint does not expose inactive domains by confirming the
+        # query filters on is_active.
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            # Verify the domains query used .eq("is_active", True)
+            mock_supabase._table_chains["domains"].select.return_value.eq.assert_called()
+            # The chain is: select().eq("is_active", True).eq("assessment_scope", ...).order("name")
+            # Just verify all returned domains are active (the mock only returns active ones)
+            data = resp.json()
+            for d in data["domains"]:
+                assert d["assessment_scope"] in ("technical", "organizational")
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_wrong_scope_domains_are_excluded(self, client, mock_supabase):
+        """A technical candidate must not see organizational domains."""
+        _route_table(mock_supabase, "candidates")
+        # Mock returns only technical domains
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["scope"] == "technical"
+            for d in data["domains"]:
+                assert d["assessment_scope"] == "technical"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_semester_cannot_be_client_controlled(self, client, mock_supabase):
+        """The endpoint ignores any client-supplied semester."""
+        _route_table(mock_supabase, "candidates")
+        # Candidate is semester 3 but client sends semester=5
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=3,
+            program=JUNIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = client.get("/assessment/available-domains?semester=5")
+            assert resp.status_code == 200
+            data = resp.json()
+            # Must use the authenticated semester, not the query param
+            assert data["semester"] == 3
+            assert data["tier"] == "junior"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_unauthenticated_request_is_rejected(self, client, mock_supabase):
+        _route_table(mock_supabase, "candidates")
+        resp = client.get("/assessment/available-domains")
+        assert resp.status_code in (401, 403)
+
+    def test_module_config_not_required(self, client, mock_supabase):
+        """Domain availability works even when module config is empty."""
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            # Domains are returned even though module config is empty
+            assert len(data["domains"]) == 1
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_missing_candidate_rejected(self, client, mock_supabase):
+        """No candidate row -> 404."""
+        _route_table(mock_supabase, "candidates")
+        chains = mock_supabase._table_chains
+        candidates_chain = chains.setdefault("candidates", MagicMock())
+        candidates_chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 404
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_missing_program_rejected(self, client, mock_supabase):
+        """No active program -> 400."""
+        _route_table(mock_supabase, "candidates")
+        chains = mock_supabase._table_chains
+        candidates_chain = chains.setdefault("candidates", MagicMock())
+        candidates_chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_CANDIDATE_ID, "semester": 99}])
+        )
+        program_chain = chains.setdefault("assessment_program", MagicMock())
+        program_chain.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 400
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_response_exposes_no_sensitive_data(self, client, mock_supabase):
+        """The response must not leak internal planner/config data."""
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            # Top-level keys must be exactly the expected set
+            assert set(data.keys()) == {
+                "semester", "scope", "tier", "max_domains", "domains",
+            }
+            # Domain keys must be exactly the expected set
+            for d in data["domains"]:
+                assert set(d.keys()) == {
+                    "id", "name", "slug", "assessment_scope",
+                }
+        finally:
+            client.app.dependency_overrides.clear()
 
 
 # ===========================================================================
@@ -1641,35 +2008,20 @@ class TestPlanningServiceUnits:
             is None
         )
 
-    def test_legacy_fallback_maps_the_global_config(self):
-        from services.assessment_planning import build_legacy_technical_fallback
+    def test_legacy_fallback_builder_is_gone(self):
+        """The retired fallback constructor was removed from the service."""
+        import services.assessment_planning as ap
 
-        fallback = build_legacy_technical_fallback(
-            _make_config(
-                total_questions=10,
-                descriptive_question_count=3,
-                hands_on_question_count=1,
-            )
-        )
-        assert fallback.total_questions == 10
-        assert fallback.descriptive_question_count == 3
-        assert fallback.hands_on_question_count == 1
+        assert not hasattr(ap, "build_legacy_technical_fallback")
 
-    def test_legacy_fallback_tolerates_missing_optional_counts(self):
-        from services.assessment_planning import build_legacy_technical_fallback
-
-        fallback = build_legacy_technical_fallback({"total_questions": 5})
-        assert fallback.total_questions == 5
-        assert fallback.descriptive_question_count == 0
-        assert fallback.hands_on_question_count == 0
-
-    def test_pool_required_skips_only_when_every_path_is_zero(self):
+    def test_pool_required_skips_when_no_module_requests_content(self):
+        """Module configuration is the only thing that can request a pool."""
         from services.assessment_planning import _pool_required
 
-        assert _pool_required(0, []) is False
-        assert _pool_required(0, [0, 0]) is False
-        assert _pool_required(1, []) is True
-        assert _pool_required(0, [0, 1]) is True
+        assert _pool_required([]) is False
+        assert _pool_required([0, 0]) is False
+        assert _pool_required([1]) is True
+        assert _pool_required([0, 1]) is True
 
     def test_load_mcq_pool_scopes_to_domain_and_semester(self, mock_supabase):
         from services.assessment_planning import load_mcq_pool

@@ -10,19 +10,34 @@ WHAT THIS MODULE IS
     It is the planning half of the approved architecture:
 
         Candidate semester
-            -> assessment_program        (scope / tier / max_domains)
+            -> assessment_program        (scope / tier / max_domains / mcq_total)
             -> selected domains          (validated + deterministically ordered)
-            -> assessment_module_config  (per-domain counts + additional time)
+            -> assessment_module_config  (OPTIONAL modules only + additional time)
             -> AssessmentPlan            (frozen, ready to persist)
+
+    WHERE EACH QUANTITY COMES FROM
+        technical MCQ        program.mcq_total split evenly across the selected
+                             domains (20 for one, 10 + 10 for two). NOT read
+                             from assessment_module_config.mcq_count.
+        descriptive          ORGANIZATIONAL only, from the configured
+                             descriptive_count. Technical never has any.
+        coding (DSA)         GLOBAL and domain-independent, from the global
+                             assessment_config.coding_problem_count.
+        practicals           OPTIONAL per-domain switches on the module config.
+                             Only the hands-on challenge exists today.
+        duration             global base + additional minutes of enabled modules.
 
 WHAT THIS MODULE DELIBERATELY IS NOT
     - It performs NO database access. It does not import the Supabase client,
       fastapi, psycopg or anything that can reach a database, and it never
       reads live configuration itself. Callers resolve rows and pass them in.
     - It writes NOTHING. It never inserts or updates an attempt.
-    - It is NOT wired into any endpoint. Phase 3 delivers the planner and its
-      tests only; POST /assessment/start still uses the legacy inline
-      selection logic and is unchanged.
+    - It carries NO legacy selection path. The pre-modular global fallback (a
+      single assessment_config.total_questions split evenly across the selected
+      domains, with global descriptive/hands-on counts drawn from the union of
+      the pools) has been deleted. Every quantity now has exactly ONE source,
+      listed above, so there is nothing left that can silently mix the two
+      models.
     - It exposes no secret: no correct answers, explanations, scores, hidden
       test cases, hands-on expected flags or admin remarks ever enter the
       output. Input models ignore unknown fields, so a raw Supabase row
@@ -62,7 +77,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Bumped whenever the plan's shape or resolution rules change in a way that
 # makes an older frozen plan interpret differently.
-PLAN_VERSION = 1
+#
+# v2 (final core architecture): the technical MCQ quantity is DERIVED from
+#   assessment_program.mcq_total and the number of selected domains rather
+#   than read from assessment_module_config.mcq_count; technical scopes carry
+#   no descriptive questions at all; and the plan gained the generic
+#   `practicals` structure described below.
+PLAN_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -100,12 +121,51 @@ class DomainScope(str, Enum):
     ORGANIZATIONAL = "organizational"
 
 
+class PracticalKind(str, Enum):
+    """The kind of practical module a plan arm carries.
+
+    ONLY hands_on is implemented. The arm/module shape below, and this enum,
+    exist so a new kind can be added without reshaping the frozen plan — but
+    no code produces anything other than HANDS_ON today.
+    """
+
+    HANDS_ON = "hands_on"
+
+
+class PracticalModuleKind(str, Enum):
+    """How the arms of one practical module relate to each other."""
+
+    # Exactly one arm: the candidate must do it, and it contributes in full.
+    SINGLE = "single"
+    # Several interchangeable arms: the candidate may attempt any subset and
+    # only the best arm contributes. No kind produces this yet.
+    ELECTIVE = "elective"
+
+
+class PracticalScoring(str, Enum):
+    """How a practical module's arms combine into one contribution."""
+
+    # The single arm's score.
+    SINGLE = "single"
+    # max(arm scores) — arms are alternatives, never additive.
+    MAX = "max"
+
+
 class ConfigSource(str, Enum):
     """Where the resolved module counts came from.
 
-    MODULAR is the target architecture. LEGACY_TECHNICAL_FALLBACK is the
-    approved TEMPORARY bridge for technical assessments whose module rows have
-    not been authored yet. Organizational assessments have NO fallback.
+    MODULAR is the ONLY source a new plan can use: the module configuration
+    rows (plus, for a technical scope, the programme-derived MCQ total, the
+    global coding count and the optional per-domain hands-on switch). The
+    organizational scope has no other source at all.
+
+    LEGACY_TECHNICAL_FALLBACK is retained as HISTORICAL PLAN VOCABULARY ONLY.
+    Exactly one attempt created before the programme/module architecture landed
+    has ``config_source = "legacy_technical_fallback"`` stored in its
+    assessment_attempts.plan snapshot, and that frozen JSON must stay
+    deserialisable with AssessmentPlan, so the member cannot be deleted. No
+    code path can produce it any more: the fallback that generated it was
+    removed, and ``config_source`` is now always MODULAR for a new plan.
     """
 
     MODULAR = "modular"
@@ -159,13 +219,22 @@ class _Input(BaseModel):
 
 
 class ProgramInput(_Input):
-    """One assessment_program row (migration 014)."""
+    """One assessment_program row (migrations 014 + 018)."""
 
     semester: int
     scope: Scope
     tier: Optional[Tier] = None
     max_domains: int
     coding_enabled: bool = False
+
+    # The PROGRAM-level MCQ total (migration 018). For a technical scope this
+    # is the whole assessment's MCQ count, split evenly across the selected
+    # domains: 20 -> a single domain, 10+10 -> two domains. It is deliberately
+    # NOT a per-domain value, so it cannot come from module configuration.
+    #
+    # Ignored for the organizational scope, which derives its MCQ quantity
+    # from its own configurable module count instead.
+    mcq_total: int = Field(default=20, gt=0)
 
 
 class DomainInput(_Input):
@@ -188,25 +257,6 @@ class ModuleConfigInput(_Input):
     hands_on_enabled: bool = False
     hands_on_count: int = 0
     hands_on_additional_minutes: int = 0
-
-
-class LegacyTechnicalFallback(_Input):
-    """The pre-modular GLOBAL counts, for TECHNICAL scopes only.
-
-    Mirrors the legacy assessment_config columns exactly, because the legacy
-    aggregation is global rather than per-domain:
-      - total_questions is split evenly across the selected domains
-        (and must be even when two domains are selected),
-      - descriptive_question_count / hands_on_question_count are a SINGLE
-        count drawn from the union of the selected domains' pools.
-
-    Passing this is an explicit opt-in. It is refused for organizational
-    assessments, which must never inherit technical/global behaviour.
-    """
-
-    total_questions: int
-    descriptive_question_count: int = 0
-    hands_on_question_count: int = 0
 
 
 class MCQPoolItem(_Input):
@@ -253,10 +303,6 @@ class AssessmentPlanRequest(_Input):
     # the plan falls back (technical only) / fails.
     module_configs: list[ModuleConfigInput] = Field(default_factory=list)
 
-    # Explicit opt-in legacy bridge. Only honoured for scope=technical, and
-    # only when modular configuration is unavailable.
-    legacy_technical_fallback: Optional[LegacyTechnicalFallback] = None
-
     # Global, module-independent values (assessment_config.duration_minutes and
     # assessment_config.coding_problem_count). Coding count stays global by
     # design and is never per-domain.
@@ -279,18 +325,46 @@ class AssessmentPlanRequest(_Input):
 # ---------------------------------------------------------------------------
 
 
+class PracticalArm(BaseModel):
+    """One selectable option inside a practical module.
+
+    Carries ids only. Content, expected values and scores are never part of
+    the plan: they are resolved per-request at serve time and the expected
+    values never leave the backend.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: PracticalKind
+    question_ids: list[str] = Field(default_factory=list)
+
+
+class PracticalModule(BaseModel):
+    """A frozen practical module: what the candidate is offered, and how it scores.
+
+    Today the planner emits at most one module, with module_kind=SINGLE,
+    scoring=SINGLE and exactly one HANDS_ON arm. The ELECTIVE/MAX vocabulary is
+    declared so the frozen plan already has a place to describe an elective
+    without the serialized shape having to change later.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    module_kind: PracticalModuleKind
+    scoring: PracticalScoring
+    arms: list[PracticalArm] = Field(default_factory=list)
+
+
 class DomainPlanEntry(BaseModel):
     """The resolved module configuration for ONE selected domain.
 
-    In MODULAR plans these counts are the authored per-domain config, and the
-    mcq/descriptive/hands-on counts sum to the plan totals (descriptive and
-    hands-on after cross-domain deduplication).
+    mcq_count is the number of MCQs drawn FROM this domain. For a technical
+    scope it is the derived even share of the programme's mcq_total (20 for a
+    single domain, 10 of 10 for two), NOT an authored per-domain value. For the
+    organizational scope it is the configured mcq_count.
 
-    In LEGACY_TECHNICAL_FALLBACK plans there is no per-domain configuration:
-    only mcq_count is meaningful (the even split of the global total). The
-    descriptive and hands-on columns are reported as 0 because the legacy
-    counts are global and cannot be attributed to one domain; the plan-level
-    totals remain authoritative.
+    descriptive_count is always 0 for a technical scope: technical Junior and
+    Senior assessments carry no descriptive questions at all.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -330,6 +404,10 @@ class AssessmentPlan(BaseModel):
     selected_descriptive_question_ids: list[str]
     selected_hands_on_question_ids: list[str]
     selected_coding_problem_ids: list[str]
+
+    # The frozen practical modules. At most one today. Kept generic so a new
+    # practical kind is an added enum member rather than a plan reshape.
+    practicals: list[PracticalModule] = Field(default_factory=list)
 
     coding_enabled: bool
     coding_count: int
@@ -462,22 +540,6 @@ def _allocation_error(kind, label, selected, quotas, eligible_by_domain):
         f"({summary}), but only {len(union)} unique eligible item(s) remain "
         f"after cross-domain deduplication",
     )
-
-
-def _legacy_union_selection(pool, selected, need, rng, kind, label):
-    """Legacy global behaviour: ONE count from the union of eligible items."""
-    union = sorted(
-        item.id
-        for item in pool
-        if item.is_active and any(domain.id in item.domain_ids for domain in selected)
-    )
-    if len(union) < need:
-        raise AssessmentPlanningError(
-            kind,
-            f"Only {len(union)} active {label} available for the selected "
-            f"domains, need {need}",
-        )
-    return _pick(union, need, rng)
 
 
 def _family_for(program: ProgramInput) -> ConfigFamily:
@@ -639,31 +701,29 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             _validate_module_config(config, domain)
             resolved[domain.id] = config
 
-    legacy = None
     if missing:
-        # Resolution is all-or-nothing. A partially authored tier must not
-        # produce a hybrid plan that mixes per-domain counts with global ones.
+        # The organizational assessment derives its ENTIRE content from the
+        # authored module row (mcq_count + descriptive_count), so a missing row
+        # is fatal: there is no other source it could use.
         if not is_technical:
             raise AssessmentPlanningError(
                 PlanningErrorKind.MISSING_MODULE_CONFIG,
                 f"No '{family.value}' configuration for domain(s) "
                 f"{[d.name for d in missing]}; the organizational assessment "
-                f"has no legacy fallback",
+                f"derives its entire content from its module configuration",
             )
-        if request.legacy_technical_fallback is None:
-            raise AssessmentPlanningError(
-                PlanningErrorKind.MISSING_MODULE_CONFIG,
-                f"No '{family.value}' configuration for domain(s) "
-                f"{[d.name for d in missing]} and no technical legacy "
-                f"fallback was supplied",
-            )
-        legacy = request.legacy_technical_fallback
+        # TECHNICAL: module configuration is OPTIONAL.
+        #
+        # Every quantity a technical assessment needs is programme-level
+        # (mcq_total, coding count, base duration, the global DSA pool), so a
+        # module row exists only to switch on OPTIONAL modules — today just
+        # hands-on. A missing row therefore means "no optional module is
+        # enabled for this domain", NOT "invalid configuration", and a
+        # technical assessment runs even while the module matrix is
+        # unauthored. A partially authored tier is likewise fine: hands-on is
+        # per-domain and there is no global count to mix with it.
 
-    config_source = (
-        ConfigSource.LEGACY_TECHNICAL_FALLBACK
-        if legacy is not None
-        else ConfigSource.MODULAR
-    )
+    config_source = ConfigSource.MODULAR
     rng = random.Random(request.seed) if request.seed is not None else None
 
     # -- 4. MCQ: per domain, semester-aware ---------------------------------
@@ -671,22 +731,34 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
     selected_mcq_ids = []
     per_domain_mcq = {}
 
-    if legacy is not None:
-        # Legacy global behaviour: split the single global total across the
-        # selected domains, requiring an even total for a two-domain split
-        # (identical to the existing engine's rule).
-        if len(selected) == 1:
-            per_domain_mcq[selected[0].id] = legacy.total_questions
-        else:
-            if legacy.total_questions % 2 != 0:
-                raise AssessmentPlanningError(
-                    PlanningErrorKind.INVALID_MODULE_CONFIG,
-                    f"Legacy total_questions ({legacy.total_questions}) must be "
-                    f"even for a {len(selected)}-domain split",
-                )
-            for domain in selected:
-                per_domain_mcq[domain.id] = legacy.total_questions // len(selected)
+    if is_technical:
+        # DERIVED technical quantity.
+        #
+        # The number of MCQs is a PROGRAMME rule (assessment_program.mcq_total)
+        # split evenly across the selected domains:
+        #     one domain  -> 20
+        #     two domains -> 10 + 10
+        # so every technical candidate receives the same total (20) regardless
+        # of how many domains they picked. assessment_module_config.mcq_count is
+        # deliberately NOT consulted here: being keyed per (domain, tier) it
+        # cannot express the split (20 per domain would yield 40 for a
+        # two-domain candidate, 10 would starve a single-domain one).
+        #
+        # The 40-question-per-domain-per-semester pool is question-bank
+        # inventory, not a configuration value, so it never appears here — the
+        # eligibility check below simply fails loudly if the pool is too small.
+        total = program.mcq_total
+        if total % len(selected) != 0:
+            raise AssessmentPlanningError(
+                PlanningErrorKind.INVALID_PROGRAM,
+                f"The technical MCQ total ({total}) cannot be split evenly "
+                f"across {len(selected)} selected domain(s)",
+            )
+        for domain in selected:
+            per_domain_mcq[domain.id] = total // len(selected)
     else:
+        # Organizational: the admin configures the MCQ quantity directly, and
+        # there is no fixed total to respect.
         for domain in selected:
             per_domain_mcq[domain.id] = resolved[domain.id].mcq_count
 
@@ -721,18 +793,17 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
     selected_descriptive_ids = []
     per_domain_descriptive = {}
 
-    if legacy is not None:
-        # Legacy global behaviour: ONE count drawn from the union of the
-        # selected domains' eligible questions.
-        selected_descriptive_ids = _legacy_union_selection(
-            desc_pool,
-            selected,
-            legacy.descriptive_question_count,
-            rng,
-            PlanningErrorKind.INSUFFICIENT_DESCRIPTIVE_POOL,
-            "descriptive questions",
-        )
+    if is_technical:
+        # TECHNICAL Junior/Senior assessments carry NO descriptive questions at
+        # all — not for one selected domain and not for two. This holds
+        # regardless of any descriptive_count an authoring mistake may have left
+        # on a technical module row. Descriptive questions belong to the
+        # ORGANIZATIONAL assessment alone.
+        per_domain_descriptive = {d.id: 0 for d in selected}
     else:
+        # Organizational only, and the organizational scope REQUIRES a module row
+        # (the planner refused above if any was missing), so every selected
+        # domain is guaranteed to be present here.
         quotas = {d.id: resolved[d.id].descriptive_count for d in selected}
         eligible = {
             d.id: _candidate_order(
@@ -759,66 +830,98 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             selected_descriptive_ids.extend(allocation[domain.id])
 
     # -- 6. Hands-on: exact cross-domain allocation --------------------------
+    #
+    # Practicals are a SENIOR-technical module. A Junior technical assessment is
+    # MCQs + 2 DSA/Coding problems and carries no practical at all (and no
+    # practical time), and the organizational scope has none either. The guard
+    # lives here as well as at authoring time so a mis-authored junior row can
+    # never hand a junior candidate a challenge or its additional minutes.
+    practicals_allowed = is_technical and program.tier is Tier.SENIOR
+
     hands_pool = _dedupe_by_id(request.hands_on_pool)
     selected_hands_on_ids = []
     per_domain_hands_on = {}
     additional_minutes = 0
 
-    if legacy is not None:
-        # Legacy has no hands-on additional-time concept at all: total time is
-        # the base duration, exactly as today.
-        selected_hands_on_ids = _legacy_union_selection(
-            hands_pool,
-            selected,
-            legacy.hands_on_question_count,
-            rng,
-            PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL,
-            "hands-on challenges",
+    # Module configuration is OPTIONAL for a technical scope, so a selected
+    # domain may legitimately have no row at all: that simply means no optional
+    # module is enabled for it. Never index `resolved` directly.
+    def _hands_on_enabled(domain):
+        config = resolved.get(domain.id)
+        return bool(config is not None and config.hands_on_enabled)
+
+    quotas = {
+        d.id: (
+            resolved[d.id].hands_on_count
+            if practicals_allowed and _hands_on_enabled(d)
+            else 0
         )
-        for domain in selected:
+        for d in selected
+    }
+    eligible = {
+        d.id: _candidate_order(
+            (
+                item.id
+                for item in hands_pool
+                if item.is_active and d.id in item.domain_ids
+            ),
+            rng,
+        )
+        for d in selected
+    }
+    allocation = _allocate_quotas([d.id for d in selected], quotas, eligible)
+    if allocation is None:
+        raise _allocation_error(
+            PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL,
+            "hands-on challenge(s)",
+            selected,
+            quotas,
+            eligible,
+        )
+    for domain in selected:
+        config = resolved.get(domain.id)
+        if (
+            not practicals_allowed
+            or config is None
+            or not config.hands_on_enabled
+        ):
+            # Disabled: contributes no challenges AND no time.
             per_domain_hands_on[domain.id] = (False, 0, 0)
-    else:
-        quotas = {
-            d.id: (
-                resolved[d.id].hands_on_count if resolved[d.id].hands_on_enabled else 0
+            continue
+        selected_hands_on_ids.extend(allocation[domain.id])
+        # Additional time belongs to the module that carries it, so it is
+        # summed only for ENABLED hands-on modules.
+        additional_minutes += config.hands_on_additional_minutes
+        per_domain_hands_on[domain.id] = (
+            True,
+            config.hands_on_count,
+            config.hands_on_additional_minutes,
+        )
+
+    # -- 6b. Practical modules ----------------------------------------------
+    # Frozen description of what the candidate is offered. Today the only
+    # implemented practical is the hands-on challenge, so at most ONE module
+    # with ONE arm is produced (scoring SINGLE). The arm/module/scoring
+    # vocabulary is generic, so a future practical kind becomes an added enum
+    # member plus another arm here — the frozen plan's shape does not change.
+    #
+    # Selection itself is untouched by this structure: the hands-on ids were
+    # already resolved above through the exact cross-domain allocator, and the
+    # module simply describes them.
+    practicals = []
+    if selected_hands_on_ids:
+        practicals.append(
+            PracticalModule(
+                module_kind=PracticalModuleKind.SINGLE,
+                scoring=PracticalScoring.SINGLE,
+                arms=[
+                    PracticalArm(
+                        kind=PracticalKind.HANDS_ON,
+                        question_ids=list(selected_hands_on_ids),
+                    )
+                ],
             )
-            for d in selected
-        }
-        eligible = {
-            d.id: _candidate_order(
-                (
-                    item.id
-                    for item in hands_pool
-                    if item.is_active and d.id in item.domain_ids
-                ),
-                rng,
-            )
-            for d in selected
-        }
-        allocation = _allocate_quotas([d.id for d in selected], quotas, eligible)
-        if allocation is None:
-            raise _allocation_error(
-                PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL,
-                "hands-on challenge(s)",
-                selected,
-                quotas,
-                eligible,
-            )
-        for domain in selected:
-            config = resolved[domain.id]
-            if not config.hands_on_enabled:
-                # Disabled: contributes no challenges AND no time.
-                per_domain_hands_on[domain.id] = (False, 0, 0)
-                continue
-            selected_hands_on_ids.extend(allocation[domain.id])
-            # Additional time belongs to the module that carries it, so it is
-            # summed only for ENABLED hands-on modules.
-            additional_minutes += config.hands_on_additional_minutes
-            per_domain_hands_on[domain.id] = (
-                True,
-                config.hands_on_count,
-                config.hands_on_additional_minutes,
-            )
+        )
 
     # -- 7. Coding: GLOBAL and domain-independent ---------------------------
     # Organizational and "none" scopes never carry coding, regardless of what
@@ -870,19 +973,11 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             "scope": program.scope.value,
             "tier": program.tier.value if program.tier else None,
             "max_domains": program.max_domains,
+            "program_mcq_total": program.mcq_total,
             "config_source": config_source.value,
             "coding_enabled": coding_enabled,
             "coding_count": coding_count,
             "base_duration_minutes": base_duration,
-            "legacy_technical_fallback": (
-                {
-                    "total_questions": legacy.total_questions,
-                    "descriptive_question_count": legacy.descriptive_question_count,
-                    "hands_on_question_count": legacy.hands_on_question_count,
-                }
-                if legacy is not None
-                else None
-            ),
             "domains": [
                 {
                     "domain_id": entry.domain_id,
@@ -898,6 +993,18 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
                     "hands_on_additional_minutes": entry.hands_on_additional_minutes,
                 }
                 for entry in domain_entries
+            ],
+            # The SHAPE of the practicals being offered — a configuration
+            # fact. Deliberately excludes the arm question_ids: which specific
+            # challenge was drawn is a draw, not configuration, so it must not
+            # move the fingerprint (the same reason `seed` is excluded).
+            "practicals": [
+                {
+                    "module_kind": module.module_kind.value,
+                    "scoring": module.scoring.value,
+                    "arms": [{"kind": arm.kind.value} for arm in module.arms],
+                }
+                for module in practicals
             ],
         }
     )
@@ -915,6 +1022,7 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
         selected_descriptive_question_ids=selected_descriptive_ids,
         selected_hands_on_question_ids=selected_hands_on_ids,
         selected_coding_problem_ids=selected_coding_ids,
+        practicals=practicals,
         coding_enabled=coding_enabled,
         coding_count=coding_count,
         mcq_total=len(selected_mcq_ids),

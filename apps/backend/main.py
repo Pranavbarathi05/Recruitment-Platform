@@ -14,6 +14,7 @@ from routers import coding
 from routers import coding_admin
 from routers import descriptive_admin
 from routers import hands_on_admin
+from routers import module_config_admin
 from routers import auth
 
 app = FastAPI(
@@ -44,6 +45,7 @@ app.include_router(coding.router)
 app.include_router(coding_admin.router)
 app.include_router(descriptive_admin.router)
 app.include_router(hands_on_admin.router)
+app.include_router(module_config_admin.router)
 
 
 @app.get("/")

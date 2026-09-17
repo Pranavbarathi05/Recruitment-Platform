@@ -8,7 +8,6 @@ ONE assessment attempt contains BOTH:
 ONE timer (expires_at), ONE final submission, ONE combined score.
 """
 
-import random
 import re
 from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,18 +21,105 @@ from schemas.assessment import (
 from utils.time_utils import is_expired as _is_expired, utcnow as _utcnow
 # NEW-attempt planning is delegated to the pure planner through the
 # database-resolution service. Resuming an existing attempt never calls this.
-from services.assessment_planning import PLAN_PERSISTENCE_ENABLED, plan_new_attempt
+from services.assessment_planning import (
+    plan_new_attempt,
+    resolve_program,
+)
+from services.assessment_planner import Scope as ProgramScope
 
 router = APIRouter(prefix="/assessment", tags=["Assessment"])
 
 
 # ---------------------------------------------------------------------------
+# Domain availability / eligibility
+# ---------------------------------------------------------------------------
 
+
+@router.get("/available-domains")
+def get_available_domains(
+    current_user: AuthUser = Depends(get_current_user),
+):
+    """Return the domains the authenticated candidate may select.
+
+    Eligibility is derived from:
+        candidate semester  ->  assessment_program  ->  scope
+        domains with matching assessment_scope + is_active
+
+    This is a discovery/selection-UI endpoint.  The actual assessment
+    planner (POST /assessment/start) remains the authoritative validator.
+    """
+    profile_id = current_user.id
+
+    # 1. Resolve candidate semester.
+    candidate = (
+        supabase_client.table("candidates")
+        .select("id, semester")
+        .eq("profile_id", profile_id)
+        .execute()
+    )
+    if not candidate.data:
+        raise HTTPException(status_code=404, detail="Candidate record not found")
+
+    candidate_semester = candidate.data[0]["semester"]
+
+    # 2. Resolve active assessment_program for this semester.
+    #    Reuses the same DB resolution as the planner service.
+    try:
+        program = resolve_program(candidate_semester)
+    except HTTPException:
+        raise
+
+    # 3. Scope 'none' -> no assessment available.
+    if program.scope is ProgramScope.NONE:
+        return {
+            "semester": candidate_semester,
+            "scope": program.scope.value,
+            "tier": None,
+            "max_domains": program.max_domains,
+            "domains": [],
+        }
+
+    # 4. Fetch active domains whose assessment_scope matches the program.
+    response = (
+        supabase_client.table("domains")
+        .select("id, name, slug, assessment_scope")
+        .eq("is_active", True)
+        .eq("assessment_scope", program.scope.value)
+        .order("name")
+        .execute()
+    )
+
+    domains = [
+        {
+            "id": d["id"],
+            "name": d["name"],
+            "slug": d["slug"],
+            "assessment_scope": d["assessment_scope"],
+        }
+        for d in (response.data or [])
+    ]
+
+    return {
+        "semester": candidate_semester,
+        "scope": program.scope.value,
+        "tier": program.tier.value if program.tier else None,
+        "max_domains": program.max_domains,
+        "domains": domains,
+    }
+
+
+# ---------------------------------------------------------------------------
 def _get_active_config() -> dict:
     """Read the active assessment configuration.
 
-    Returns a plain dict with a defensive default for
-    descriptive_question_count so callers can rely on the key existing.
+    Only two of its settings still feed a NEW attempt: the base duration and
+    the GLOBAL coding count. The pre-modular quantities
+    (total_questions / descriptive_question_count / hands_on_question_count)
+    and the domain cap are no longer consumed here — technical MCQ quantity
+    comes from assessment_program.mcq_total, the domain limit from
+    assessment_program.max_domains, and module quantities from
+    assessment_module_config. Their columns remain in the row for historical
+    compatibility but are not defaulted or read in.
     """
     result = (
         supabase_client.table("assessment_config")
@@ -47,10 +133,7 @@ def _get_active_config() -> dict:
             status_code=500,
             detail="No active assessment configuration found. Contact an admin.",
         )
-    config = dict(result.data[0])
-    config.setdefault("descriptive_question_count", 0)
-    config.setdefault("hands_on_question_count", 0)
-    return config
+    return dict(result.data[0])
 
 
 def count_words(text: str) -> int:
@@ -281,105 +364,13 @@ def _score_attempt(attempt_id: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-
-def _select_descriptive_questions(
-    descriptive_question_count: int,
-    domain_ids: list,
-) -> list[str]:
-    """Select descriptive questions for the attempt.
-
-    Only ACTIVE questions overlapping the candidate's chosen domains are
-    eligible (same conceptual domain filtering as MCQ selection — MCQs by
-    domain_id, descriptive by domain_ids overlap). Raises 400 if fewer
-    eligible questions exist than requested, mirroring the MCQ/coding
-    behavior of failing loudly rather than creating invalid attempts.
-    """
-    if descriptive_question_count <= 0:
-        return []
-
-    desc_resp = (
-        supabase_client.table("descriptive_questions")
-        .select("id")
-        .eq("is_active", True)
-        .overlaps("domain_ids", domain_ids)
-        .execute()
-    )
-    available = desc_resp.data or []
-    if len(available) < descriptive_question_count:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Only {len(available)} active descriptive questions "
-                f"available for selected domains, need {descriptive_question_count}"
-            ),
-        )
-    sampled = random.sample(available, descriptive_question_count)
-    return [d["id"] for d in sampled]
-
-
-def _select_hands_on_questions(
-    hands_on_question_count: int,
-    domain_ids: list,
-) -> list[str]:
-    """Select Hands-On challenges for the attempt.
-
-    Only ACTIVE challenges overlapping the candidate's chosen domains are
-    eligible (same conceptual domain filtering as descriptive selection).
-    Raises 400 if fewer eligible challenges exist than requested — loud
-    failure instead of a silently invalid attempt (mirrors MCQ/descriptive).
-    """
-    if hands_on_question_count <= 0:
-        return []
-
-    resp = (
-        supabase_client.table("hands_on_questions")
-        .select("id")
-        .eq("is_active", True)
-        .overlaps("domain_ids", domain_ids)
-        .execute()
-    )
-    available = resp.data or []
-    if len(available) < hands_on_question_count:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Only {len(available)} active hands-on challenges "
-                f"available for selected domains, need {hands_on_question_count}"
-            ),
-        )
-    sampled = random.sample(available, hands_on_question_count)
-    return [h["id"] for h in sampled]
-
-
-def _select_coding_problems(
-    coding_problem_count: int,
-) -> list[str]:
-    """Select coding problems from the GLOBAL active problem pool.
-
-    Coding problems are domain-independent.
-    Selection ignores the candidate's chosen domains entirely.
-    """
-    if coding_problem_count == 0:
-        return []
-
-    q_resp = (
-        supabase_client.table("coding_problems")
-        .select("id")
-        .eq("is_active", True)
-        .execute()
-    )
-    available = q_resp.data or []
-    if len(available) < coding_problem_count:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Only {len(available)} active coding problems available, "
-                f"need {coding_problem_count}"
-            ),
-        )
-    sampled = random.sample(available, coding_problem_count)
-    return [p["id"] for p in sampled]
+# NOTE: the pre-planner selection helpers (_select_descriptive_questions,
+# _select_hands_on_questions, _select_coding_problems) used to live here. They
+# were the legacy inline selection model — global counts sampled from a pool and
+# stitched into the attempt by this router. The pure planner replaced them
+# entirely: descriptive/hands-on allocation is solved as a cross-domain exact
+# matching inside services.assessment_planner, and coding is drawn from the
+# global pool there. Nothing called them any more, so they were deleted.
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +388,13 @@ def start_assessment(
 
     # 1. Read config
     #
-    # Still needed: base duration, the global coding count, and (while the
-    # per-domain configuration matrix is authored) the explicit technical
-    # legacy fallback counts. It is NOT the source of domain limits or module
-    # counts for a new attempt any more — the assessment_program row and
-    # assessment_module_config are.
+    # Only TWO global values are still consumed by the planner: the base
+    # duration and the global coding count (coding stays domain-independent).
+    # The legacy technical counts (total_questions / descriptive_question_count
+    # / hands_on_question_count) are NOT read for a new attempt any more —
+    # technical MCQ quantity comes from assessment_program.mcq_total, the
+    # optional modules come from assessment_module_config, and the domain limit
+    # comes from assessment_program.max_domains.
     config = _get_active_config()
 
     # 2. Verify candidate
@@ -502,9 +495,10 @@ def start_assessment(
 
     # 5. Create ONE combined attempt from the planner's frozen values.
     #
-    # The plan snapshot (plan / base_duration_minutes / additional_minutes)
-    # is persisted when PLAN_PERSISTENCE_ENABLED is True (migration 017+).
-    # When False, only the existing frozen columns are written.
+    # The frozen plan snapshot (plan / base_duration_minutes /
+    # additional_minutes) is persisted UNCONDITIONALLY: migration 017 added
+    # those columns and plan persistence is part of the final architecture.
+    # The existing frozen columns below are written alongside it.
     now = _utcnow()
     expires_at = now + timedelta(minutes=plan.duration_minutes)
 
@@ -524,10 +518,9 @@ def start_assessment(
         "started_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
-    if PLAN_PERSISTENCE_ENABLED:
-        insert_payload["plan"] = plan.model_dump(mode="json")
-        insert_payload["base_duration_minutes"] = plan.base_duration_minutes
-        insert_payload["additional_minutes"] = plan.additional_minutes
+    insert_payload["plan"] = plan.model_dump(mode="json")
+    insert_payload["base_duration_minutes"] = plan.base_duration_minutes
+    insert_payload["additional_minutes"] = plan.additional_minutes
 
     result = supabase_client.table("assessment_attempts").insert(
         insert_payload

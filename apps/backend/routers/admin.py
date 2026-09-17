@@ -3,7 +3,7 @@ from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
 from schemas.assessment import (
     DomainCreate, DomainUpdate, MCQCreate, MCQUpdate,
-    AssessmentConfigUpdate, AssessmentConfigUpdateHandsOn,
+    AssessmentConfigUpdate,
     VALID_SEMESTERS, SEMESTER_LABELS, AdminRemarkUpdate,
 )
 
@@ -749,9 +749,35 @@ def get_assessment_results(
 # Assessment configuration management
 # ---------------------------------------------------------------------------
 
+# assessment_config columns that no longer drive planning and are therefore no
+# longer exposed (or accepted) by the admin API:
+#
+#   total_questions            -> assessment_program.mcq_total
+#   max_domains                -> assessment_program.max_domains
+#   descriptive_question_count -> assessment_module_config.descriptive_count
+#   hands_on_question_count    -> assessment_module_config hands-on fields
+#
+# The columns remain in the table for historical compatibility; they are simply
+# not part of the admin contract any more.
+RETIRED_CONFIG_FIELDS = frozenset(
+    {
+        "total_questions",
+        "max_domains",
+        "descriptive_question_count",
+        "hands_on_question_count",
+    }
+)
+
+
 @router.get("/config")
 def list_config(admin: AuthUser = Depends(require_admin)):
-    """List all assessment configurations. Admin only."""
+    """List all assessment configurations. Admin only.
+
+    The retired pre-modular knobs are stripped from every row before it is
+    returned: they are no longer accepted on update and no longer read when an
+    attempt is planned, so advertising them would only mislead an admin. Every
+    other column is passed through untouched.
+    """
     try:
         result = (
             supabase_client.table("assessment_config")
@@ -759,7 +785,14 @@ def list_config(admin: AuthUser = Depends(require_admin)):
             .order("created_at")
             .execute()
         )
-        return result.data or []
+        return [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in RETIRED_CONFIG_FIELDS
+            }
+            for row in (result.data or [])
+        ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -767,10 +800,24 @@ def list_config(admin: AuthUser = Depends(require_admin)):
 @router.put("/config/{config_id}")
 def update_config(
     config_id: str,
-    payload: AssessmentConfigUpdateHandsOn,
+    payload: AssessmentConfigUpdate,
     admin: AuthUser = Depends(require_admin),
 ):
-    """Update an assessment configuration. Admin only."""
+    """Update an assessment configuration. Admin only.
+
+    Only the settings that still drive the runtime are accepted (see
+    ``AssessmentConfigUpdate``): the base duration, the GLOBAL coding count,
+    and row management (name / is_active). The pre-modular knobs
+    (total_questions, max_domains, descriptive_question_count,
+    hands_on_question_count) are no longer exposed, and the cross-field
+    "even split" validation that existed solely to police them is gone with
+    them: technical MCQ quantity now comes from assessment_program.mcq_total
+    (split by the planner), domain limits from assessment_program.max_domains,
+    and descriptive/hands-on quantities from assessment_module_config.
+
+    The legacy columns remain in the table for historical compatibility and
+    are left untouched by this endpoint.
+    """
     try:
         existing = (
             supabase_client.table("assessment_config")
@@ -784,32 +831,6 @@ def update_config(
         updates = payload.model_dump(exclude_unset=True)
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
-
-        # Validate configuration consistency
-        if any(k in updates for k in ("total_questions", "coding_problem_count", "max_domains")):
-            current = (
-                supabase_client.table("assessment_config")
-                .select("total_questions, coding_problem_count, max_domains")
-                .eq("id", config_id)
-                .execute()
-            )
-            if current.data:
-                cur = current.data[0]
-                tq = updates.get("total_questions", cur["total_questions"])
-                cc = updates.get("coding_problem_count", cur.get("coding_problem_count", 0))
-                md = updates.get("max_domains", cur["max_domains"])
-                if md > 2:
-                    raise HTTPException(status_code=400, detail="max_domains cannot exceed 2")
-                if md == 2 and tq % 2 != 0:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"total_questions ({tq}) must be even when max_domains is 2",
-                    )
-                if md == 2 and cc % 2 != 0:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"coding_problem_count ({cc}) must be even when max_domains is 2",
-                    )
 
         # If this config is being activated, deactivate all other configs first.
         # The DB partial unique index enforces at most one active config,
@@ -829,7 +850,15 @@ def update_config(
             .eq("id", config_id)
             .execute()
         )
-        return result.data[0] if result.data else {"status": "updated"}
+        if not result.data:
+            return {"status": "updated"}
+        # Same response contract as the list endpoint: the retired knobs are
+        # never advertised, even though the stored row still contains them.
+        return {
+            key: value
+            for key, value in result.data[0].items()
+            if key not in RETIRED_CONFIG_FIELDS
+        }
     except HTTPException:
         raise
     except Exception as e:

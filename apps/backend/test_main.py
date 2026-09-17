@@ -208,7 +208,7 @@ class TestAssessmentConfig:
 
     def test_config_update_requires_auth(self, client):
         response = client.put(f"/admin/config/{MOCK_CONFIG_ID}", json={
-            "total_questions": 30,
+            "duration_minutes": 30,
         })
         assert response.status_code in (401, 403)
 
@@ -237,38 +237,190 @@ class TestAssessmentConfig:
         # but we verify the auth requirement is in place
         assert response.status_code in (200, 401, 403, 500)
 
-    def test_config_update_rejects_invalid_total_questions(self, client, mock_supabase):
-        """total_questions must be > 0."""
-        from schemas.assessment import AssessmentConfigUpdate
-        with pytest.raises(Exception):
-            AssessmentConfigUpdate(total_questions=0)
-
     def test_config_update_rejects_invalid_duration(self, client, mock_supabase):
-        """duration_minutes must be > 0."""
+        """duration_minutes must be > 0 — still an active setting."""
         from schemas.assessment import AssessmentConfigUpdate
         with pytest.raises(Exception):
             AssessmentConfigUpdate(duration_minutes=0)
 
-    def test_config_update_rejects_invalid_max_domains(self, client, mock_supabase):
-        """max_domains must be >= 1 and <= 2."""
+    def test_config_update_accepts_the_active_settings(self, client, mock_supabase):
+        """The settings that still drive the runtime remain configurable."""
         from schemas.assessment import AssessmentConfigUpdate
+        cfg = AssessmentConfigUpdate(
+            name="Default", duration_minutes=30, coding_problem_count=2
+        )
+        assert cfg.name == "Default"
+        assert cfg.duration_minutes == 30
+        assert cfg.coding_problem_count == 2
         with pytest.raises(Exception):
-            AssessmentConfigUpdate(max_domains=0)  # Too low
-        with pytest.raises(Exception):
-            AssessmentConfigUpdate(max_domains=3)  # Too high
+            AssessmentConfigUpdate(coding_problem_count=-1)
 
-    def test_config_update_accepts_descriptive_count(self, client, mock_supabase):
-        """descriptive_question_count must be >= 0."""
+    def test_config_update_schema_has_no_legacy_knobs(self, client, mock_supabase):
+        """The four pre-modular knobs are absent from the admin schema.
+
+        Absent — not merely ignored at runtime — so an admin cannot configure
+        total_questions, the legacy max_domains, descriptive_question_count or
+        hands_on_question_count through this endpoint at all.
+        """
         from schemas.assessment import AssessmentConfigUpdate
-        # Valid: 0
-        cfg = AssessmentConfigUpdate(descriptive_question_count=0)
-        assert cfg.descriptive_question_count == 0
-        # Valid: positive
-        cfg = AssessmentConfigUpdate(descriptive_question_count=5)
-        assert cfg.descriptive_question_count == 5
-        # Invalid: negative
-        with pytest.raises(Exception):
-            AssessmentConfigUpdate(descriptive_question_count=-1)
+        for field in (
+            "total_questions",
+            "max_domains",
+            "descriptive_question_count",
+            "hands_on_question_count",
+        ):
+            assert field not in AssessmentConfigUpdate.model_fields
+
+    def test_config_update_ignores_a_legacy_only_payload(self, client, mock_supabase):
+        """A payload of only retired knobs produces NO fields to update."""
+        from schemas.assessment import AssessmentConfigUpdate
+        cfg = AssessmentConfigUpdate(
+            total_questions=30,
+            max_domains=2,
+            descriptive_question_count=5,
+            hands_on_question_count=3,
+        )
+        assert cfg.model_dump(exclude_unset=True) == {}
+
+
+class TestRetiredAssessmentConfigKnobs:
+    """PUT /admin/config/{id} no longer accepts the pre-modular knobs.
+
+    The planner stopped reading these fields when the programme/module
+    architecture landed; the admin API stops offering them here. The DB
+    columns stay for historical compatibility and must never be written by
+    this endpoint.
+    """
+
+    LEGACY_FIELDS = (
+        "total_questions",
+        "max_domains",
+        "descriptive_question_count",
+        "hands_on_question_count",
+    )
+
+    def _set_admin_override(self):
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id="admin-user-id", email="admin@test.com"
+        )
+
+    def _clear(self):
+        from main import app
+        app.dependency_overrides.clear()
+
+    def _config_chain(self, mock_supabase, update_result=None):
+        """Route table lookups and configure the assessment_config chain."""
+        _route_table(mock_supabase, "assessment_config")
+        chain = _table_chains(mock_supabase).setdefault(
+            "assessment_config", MagicMock()
+        )
+        chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_CONFIG_ID}])
+        )
+        chain.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(update_result or [{"id": MOCK_CONFIG_ID}])
+        )
+        return chain
+
+    def test_legacy_only_payload_is_rejected_without_writing(self, client, mock_supabase):
+        self._set_admin_override()
+        chain = self._config_chain(mock_supabase)
+        try:
+            response = client.put(
+                f"/admin/config/{MOCK_CONFIG_ID}",
+                json={field: 5 for field in self.LEGACY_FIELDS},
+            )
+        finally:
+            self._clear()
+
+        assert response.status_code == 400
+        assert "no fields" in response.json()["detail"].lower()
+        chain.update.assert_not_called()
+
+    def test_active_settings_are_the_only_keys_written(self, client, mock_supabase):
+        """duration/coding still update; legacy keys are never written."""
+        self._set_admin_override()
+        chain = self._config_chain(
+            mock_supabase, update_result=[{"id": MOCK_CONFIG_ID}]
+        )
+        try:
+            response = client.put(
+                f"/admin/config/{MOCK_CONFIG_ID}",
+                json={
+                    "duration_minutes": 45,
+                    "coding_problem_count": 2,
+                    # Legacy knobs in the same request must be dropped.
+                    "total_questions": 30,
+                    "max_domains": 2,
+                    "descriptive_question_count": 5,
+                    "hands_on_question_count": 3,
+                },
+            )
+        finally:
+            self._clear()
+
+        assert response.status_code == 200
+        written = chain.update.call_args.args[0]
+        assert written == {"duration_minutes": 45, "coding_problem_count": 2}
+        for field in self.LEGACY_FIELDS:
+            assert field not in written
+
+    def test_config_list_strips_the_legacy_knobs(self, client, mock_supabase):
+        """GET /admin/config must not advertise settings with no effect."""
+        self._set_admin_override()
+        _route_table(mock_supabase, "assessment_config")
+        chain = _table_chains(mock_supabase).setdefault(
+            "assessment_config", MagicMock()
+        )
+        chain.select.return_value.order.return_value.execute.return_value = (
+            _make_mock_response(
+                [
+                    _make_config(
+                        coding_problem_count=2,
+                        descriptive_question_count=1,
+                        hands_on_question_count=1,
+                    )
+                ]
+            )
+        )
+        try:
+            response = client.get("/admin/config")
+        finally:
+            self._clear()
+
+        assert response.status_code == 200
+        row = response.json()[0]
+        # The settings that still drive planning survive.
+        assert row["name"] == "MCQ Assessment"
+        assert row["duration_minutes"] == 20
+        assert row["coding_problem_count"] == 2
+        assert row["is_active"] is True
+        # The retired knobs are stripped from the response.
+        for field in self.LEGACY_FIELDS:
+            assert field not in row
+
+    def test_no_cross_field_even_split_validation_remains(self, client, mock_supabase):
+        """The legacy 'must be even when max_domains is 2' rule is gone.
+
+        It existed only to police the retired knobs, so an odd coding count is
+        now perfectly acceptable (coding is global and never split per domain).
+        """
+        self._set_admin_override()
+        chain = self._config_chain(
+            mock_supabase, update_result=[{"id": MOCK_CONFIG_ID}]
+        )
+        try:
+            response = client.put(
+                f"/admin/config/{MOCK_CONFIG_ID}",
+                json={"coding_problem_count": 3},
+            )
+        finally:
+            self._clear()
+
+        assert response.status_code == 200
+        assert chain.update.call_args.args[0] == {"coding_problem_count": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -443,80 +595,55 @@ class TestSchemaValidation:
         with pytest.raises(Exception):
             MCQUpdate(semester=99)  # Invalid semester
 
-    def test_config_update_validates_total_questions(self):
-        from schemas.assessment import AssessmentConfigUpdate
-        with pytest.raises(Exception):
-            AssessmentConfigUpdate(total_questions=0)
-
     def test_config_update_validates_duration(self):
         from schemas.assessment import AssessmentConfigUpdate
         with pytest.raises(Exception):
             AssessmentConfigUpdate(duration_minutes=0)
 
-    def test_config_update_validates_max_domains(self):
-        from schemas.assessment import AssessmentConfigUpdate
-        with pytest.raises(Exception):
-            AssessmentConfigUpdate(max_domains=0)
-
     def test_config_update_accepts_valid_values(self):
+        """Only the settings with an active runtime purpose are accepted."""
         from schemas.assessment import AssessmentConfigUpdate
         cfg = AssessmentConfigUpdate(
-            total_questions=30,
+            name="Default",
             duration_minutes=30,
-            max_domains=2,
+            coding_problem_count=2,
         )
-        assert cfg.total_questions == 30
+        assert cfg.name == "Default"
         assert cfg.duration_minutes == 30
-        assert cfg.max_domains == 2
+        assert cfg.coding_problem_count == 2
 
     def test_config_update_accepts_partial_update(self):
         from schemas.assessment import AssessmentConfigUpdate
-        cfg = AssessmentConfigUpdate(total_questions=25)
-        assert cfg.total_questions == 25
+        cfg = AssessmentConfigUpdate(coding_problem_count=2)
+        assert cfg.coding_problem_count == 2
         assert cfg.duration_minutes is None
-        assert cfg.max_domains is None
+        assert cfg.name is None
 
-    def test_config_update_rejects_max_domains_3(self):
-        """max_domains cannot exceed 2."""
+    def test_config_update_has_no_legacy_knob_fields(self):
+        """total_questions / max_domains / descriptive / hands-on are retired."""
+        from schemas.assessment import AssessmentConfigUpdate
+        for field in (
+            "total_questions",
+            "max_domains",
+            "descriptive_question_count",
+            "hands_on_question_count",
+        ):
+            assert field not in AssessmentConfigUpdate.model_fields
+
+    def test_config_update_drops_legacy_knobs_from_the_payload(self):
+        from schemas.assessment import AssessmentConfigUpdate
+        cfg = AssessmentConfigUpdate(
+            total_questions=30,
+            max_domains=2,
+            descriptive_question_count=5,
+            hands_on_question_count=3,
+        )
+        assert cfg.model_dump(exclude_unset=True) == {}
+
+    def test_config_update_rejects_negative_coding_count(self):
         from schemas.assessment import AssessmentConfigUpdate
         with pytest.raises(Exception):
-            AssessmentConfigUpdate(max_domains=3)
-
-    def test_config_update_accepts_max_domains_1(self):
-        from schemas.assessment import AssessmentConfigUpdate
-        cfg = AssessmentConfigUpdate(max_domains=1)
-        assert cfg.max_domains == 1
-
-    def test_config_update_accepts_max_domains_2(self):
-        from schemas.assessment import AssessmentConfigUpdate
-        cfg = AssessmentConfigUpdate(max_domains=2)
-        assert cfg.max_domains == 2
-
-    def test_config_update_accepts_odd_total_with_single_domain(self):
-        """Odd total_questions is valid when max_domains=1."""
-        from schemas.assessment import AssessmentConfigUpdate
-        cfg = AssessmentConfigUpdate(total_questions=15, max_domains=1)
-        assert cfg.total_questions == 15
-        assert cfg.max_domains == 1
-
-    def test_config_update_accepts_even_total_with_two_domains(self):
-        """Even total_questions is valid when max_domains=2."""
-        from schemas.assessment import AssessmentConfigUpdate
-        cfg = AssessmentConfigUpdate(total_questions=20, max_domains=2)
-        assert cfg.total_questions == 20
-        assert cfg.max_domains == 2
-
-    def test_config_update_accepts_any_positive_total(self):
-        """total_questions just needs to be > 0 at schema level."""
-        from schemas.assessment import AssessmentConfigUpdate
-        for n in [1, 2, 5, 10, 50, 100]:
-            cfg = AssessmentConfigUpdate(total_questions=n)
-            assert cfg.total_questions == n
-
-    def test_config_update_rejects_negative_total(self):
-        from schemas.assessment import AssessmentConfigUpdate
-        with pytest.raises(Exception):
-            AssessmentConfigUpdate(total_questions=-1)
+            AssessmentConfigUpdate(coding_problem_count=-1)
 
     def test_config_update_rejects_zero_duration(self):
         from schemas.assessment import AssessmentConfigUpdate
@@ -1687,16 +1814,18 @@ class TestAssessmentStartWithCoding:
             assert data["total_coding_problems"] >= 0
 
     def test_coding_problems_are_global_no_domain_filter(self, client, mock_supabase):
-        """Coding problem selection does not filter by domain."""
-        # Verify the coding_problems table query doesn't use domain_id
-        from routers.assessment import _select_coding_problems
-        # This function should only take coding_problem_count
+        """Coding problem selection does not filter by domain.
+
+        The old inline selector is gone; coding is now drawn inside the pure
+        planner from load_coding_pool(), which has no domain filter at all.
+        """
         import inspect
-        sig = inspect.signature(_select_coding_problems)
-        params = list(sig.parameters.keys())
-        assert 'active_domains' not in params, 'Coding problems should not depend on domains'
-        assert 'domain' not in params, 'Coding problems should not depend on domains'
-        assert params == ['coding_problem_count'], f'Expected only coding_problem_count, got {params}'
+        from services.assessment_planning import load_coding_pool
+
+        assert list(inspect.signature(load_coding_pool).parameters) == []
+        src = inspect.getsource(load_coding_pool)
+        assert "domain_id" not in src
+        assert "overlaps" not in src
 
 
 # =====================================================================
@@ -4598,13 +4727,36 @@ class TestDescriptiveAdminCRUD:
         assert result[0]["domain_names"] == ["Web Dev"]
 
 
-class TestDescriptiveInAssessment:
-    """Descriptive question integration in assessment start."""
+class TestActiveConfigNoLongerDefaultsLegacyCounts:
+    """_get_active_config() stopped injecting the retired count keys.
 
-    def test_config_default_descriptive_count(self):
-        """Config without descriptive_question_count defaults to 0."""
-        config = _make_config()
-        assert config.get("descriptive_question_count", 0) == 0
+    Nothing consumes descriptive or hands-on quantity from assessment_config
+    any more — those come from assessment_module_config (organizational) and
+    from the module rows' optional hands-on switch (technical) — so the router
+    no longer fabricates defaults for keys no caller reads.
+    """
+
+    @patch("routers.assessment.supabase_client")
+    def test_legacy_counts_are_not_injected(self, mock_sb):
+        from routers.assessment import _get_active_config
+        chain = mock_sb.table.return_value.select.return_value.eq.return_value
+        chain.limit.return_value.execute.return_value = _make_mock_response(
+            [
+                {
+                    "id": MOCK_CONFIG_ID,
+                    "duration_minutes": 20,
+                    "coding_problem_count": 2,
+                }
+            ]
+        )
+        config = _get_active_config()
+
+        # Still supplied to the planner.
+        assert config["duration_minutes"] == 20
+        assert config["coding_problem_count"] == 2
+        # No longer fabricated: the planner never reads them.
+        assert "descriptive_question_count" not in config
+        assert "hands_on_question_count" not in config
 
 
 # =====================================================================
@@ -4612,74 +4764,25 @@ class TestDescriptiveInAssessment:
 # =====================================================================
 
 
-class TestDescriptiveSelection:
-    """_select_descriptive_questions: active + domain-overlap filtering."""
+class TestLegacySelectionHelpersRemoved:
+    """The pre-planner inline selection helpers no longer exist.
 
-    def _select(self, mock_sb, count, domain_ids, available, expect_error=False):
-        from routers.assessment import _select_descriptive_questions
-        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
-            _make_mock_response(available)
-        )
-        if expect_error:
-            with pytest.raises(HTTPException) as exc_info:
-                _select_descriptive_questions(count, domain_ids)
-            return exc_info.value
-        return _select_descriptive_questions(count, domain_ids)
+    They sampled global counts inside the router; the pure planner now owns
+    eligibility, allocation and ordering. Pool filtering stays covered by the
+    planner/planning suites (semester-aware MCQ pool, cross-domain descriptive
+    and hands-on matching), so these guards only assert the old entry points
+    are unreachable.
+    """
 
-    @patch("routers.assessment.supabase_client")
-    def test_selects_requested_number(self, mock_sb):
-        available = [
-            {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
-            {"id": MOCK_DESC_ID_2, "domain_ids": [MOCK_DOMAIN_1_ID]},
-        ]
-        result = self._select(mock_sb, 2, [MOCK_DOMAIN_1_ID], available)
-        assert sorted(result) == sorted([MOCK_DESC_ID, MOCK_DESC_ID_2])
+    def test_router_no_longer_exposes_the_inline_selectors(self):
+        import routers.assessment as assessment_router
 
-    @patch("routers.assessment.supabase_client")
-    def test_zero_count_selects_nothing_without_query(self, mock_sb):
-        from routers.assessment import _select_descriptive_questions
-        result = _select_descriptive_questions(0, [MOCK_DOMAIN_1_ID])
-        assert result == []
-        mock_sb.table.assert_not_called()
-
-    @patch("routers.assessment.supabase_client")
-    def test_raises_400_when_insufficient_eligible(self, mock_sb):
-        """Fewer eligible questions than requested → loud 400, not a short attempt."""
-        available = [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}]
-        exc = self._select(mock_sb, 3, [MOCK_DOMAIN_1_ID], available, expect_error=True)
-        assert exc.status_code == 400
-        assert "descriptive" in exc.detail.lower()
-
-    @patch("routers.assessment.supabase_client")
-    def test_filters_by_active_flag(self, mock_sb):
-        """The selection query filters is_active=True."""
-        self._select(
-            mock_sb, 1, [MOCK_DOMAIN_1_ID],
-            [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}],
-        )
-        # The chained filter must include is_active=True
-        mock_sb.table.return_value.select.return_value.eq.assert_called_with("is_active", True)
-
-    @patch("routers.assessment.supabase_client")
-    def test_filters_by_domain_overlap(self, mock_sb):
-        """The selection query overlaps domain_ids with the chosen domains."""
-        self._select(
-            mock_sb, 1, [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID],
-            [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}],
-        )
-        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.assert_called_with(
-            "domain_ids", [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
-        )
-
-    @patch("routers.assessment.supabase_client")
-    def test_inactive_question_not_selected(self, mock_sb):
-        """Available pool as returned by the (active-filtered) query is used;
-        verify a question not returned by the DB is never selected."""
-        # DB returns only the active overlapping one
-        available = [{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}]
-        result = self._select(mock_sb, 1, [MOCK_DOMAIN_1_ID], available)
-        assert result == [MOCK_DESC_ID]
-        assert MOCK_DESC_ID_2 not in result  # inactive/ineligible one absent
+        for name in (
+            "_select_descriptive_questions",
+            "_select_hands_on_questions",
+            "_select_coding_problems",
+        ):
+            assert not hasattr(assessment_router, name), name
 
 
 def _route_table(mock_sb, table_name):
@@ -4703,14 +4806,22 @@ def _route_table(mock_sb, table_name):
 
 
 def _make_program(semester=5, scope="technical", tier="senior",
-                  max_domains=2, coding_enabled=True):
-    """A mock assessment_program row (mirrors the seeded DEV rows)."""
+                  max_domains=2, coding_enabled=True, mcq_total=2):
+    """A mock assessment_program row (mirrors the seeded DEV rows).
+
+    ``mcq_total`` (migration 018) is the PROGRAMME-level MCQ quantity for a
+    technical scope, split evenly across the selected domains. It defaults to 2
+    here so it matches the two-item MCQ pool these mocks serve: that keeps the
+    derived rule (one domain -> 2, two domains -> 1 + 1) numerically identical
+    to the pre-modular global split these tests were written against.
+    """
     return {
         "semester": semester,
         "scope": scope,
         "tier": tier,
         "max_domains": max_domains,
         "coding_enabled": coding_enabled,
+        "mcq_total": mcq_total,
     }
 
 
@@ -4753,8 +4864,14 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
       hands_on_questions   → select().eq().overlaps().execute()
 
     ``program=None`` defaults to the seeded SENIOR technical programme and
-    ``module_configs=None`` to NO configuration rows, so by default these mocks
-    exercise the technical LEGACY FALLBACK path driven by assessment_config.
+    ``module_configs=None`` to NO configuration rows.
+
+    Under the FINAL core rules an unconfigured technical scope is a VALID plan:
+    the MCQ quantity is derived from ``assessment_program.mcq_total`` (split
+    evenly across the selected domains) and coding comes from the global
+    ``assessment_config.coding_problem_count``, so module rows only switch on
+    optional modules such as hands-on. The pre-modular legacy fallback has been
+    removed entirely, so module rows are the only optional-module switch.
     """
     if program is None:
         program = _make_program(semester=semester)
@@ -4815,14 +4932,30 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
     attempts_chain.select.return_value.eq.return_value.in_.return_value.execute.return_value = (
         _make_mock_response([])  # no submitted/scored attempts
     )
+    # The response echoes the row the INSERT returns, so the mock has to reflect
+    # the FINAL core rules rather than the legacy global counts:
+    #   descriptive  -> ORGANIZATIONAL scopes only (technical never has any)
+    #   hands-on     -> enabled per-domain through assessment_module_config
+    #                  (assessment_config.hands_on_question_count is no longer
+    #                  consulted by the start path)
+    effective_descriptive = (
+        sum(c.get("descriptive_count", 0) for c in module_configs)
+        if program.get("scope") == "organizational"
+        else 0
+    )
+    effective_hands_on = sum(
+        c.get("hands_on_count", 0) for c in module_configs if c.get("hands_on_enabled")
+    )
     attempts_chain.insert.return_value.execute.return_value = (
         _make_mock_response([{
             "id": MOCK_ATTEMPT_ID,
             "total_questions": 2,
             "total_coding_problems": 0,
-            "total_descriptive_questions": descriptive_count,
-            "total_hands_on_questions": hands_on_count,
-            "selected_hands_on_question_ids": [MOCK_HANDS_ID] if hands_on_count else [],
+            "total_descriptive_questions": effective_descriptive,
+            "total_hands_on_questions": effective_hands_on,
+            "selected_hands_on_question_ids": (
+                [MOCK_HANDS_ID] if effective_hands_on else []
+            ),
             "duration_minutes": 20,
             "expires_at": "2025-01-01T00:20:00Z",
         }])
@@ -4835,8 +4968,8 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
     )
 
     # assessment_module_config — per-domain counts for this tier.
-    # Empty means "not authored yet" → the planner uses the explicit technical
-    # legacy fallback built from assessment_config.
+    # Empty means "not authored yet" → a technical plan still succeeds (no
+    # optional module enabled), while an organizational plan is refused.
     module_chain = chains.setdefault("assessment_module_config", MagicMock())
     module_chain.select.return_value.in_.return_value.eq.return_value.execute.return_value = (
         _make_mock_response(module_configs)
@@ -4884,9 +5017,37 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
 class TestDescriptiveStartFlow:
     """POST /assessment/start persists and returns descriptive selections.
 
+    Descriptive questions are an ORGANIZATIONAL-only module under the final
+    core rules, so these tests run a semester-1 organizational candidate whose
+    module row configures the descriptive count. A technical candidate never
+    receives descriptive questions at all.
+
     Uses app.dependency_overrides to bypass cookie JWT verification, matching
     the TestAssessmentDeleteAndBulk convention above.
     """
+
+    ORG_DOMAIN = {
+        "id": MOCK_DOMAIN_1_ID,
+        "name": "Organizational Roles",
+        "slug": "organizationalRoles",
+        "assessment_scope": "organizational",
+        "is_active": True,
+    }
+    ORG_PROGRAM = _make_program(
+        semester=1,
+        scope="organizational",
+        tier=None,
+        max_domains=1,
+        coding_enabled=False,
+    )
+
+    def _org_config(self, descriptive_count):
+        return _make_module_config(
+            domain_id=MOCK_DOMAIN_1_ID,
+            applies_to="organizational",
+            mcq_count=2,
+            descriptive_count=descriptive_count,
+        )
 
     def _set_auth_override(self):
         from core.auth import get_current_user
@@ -4897,9 +5058,15 @@ class TestDescriptiveStartFlow:
         return app
 
     def test_start_selects_and_persists_descriptive(self, client, mock_supabase):
-        """descriptive_question_count > 0 → IDs persisted + returned count."""
+        """descriptive_count > 0 → IDs persisted + returned count."""
         _route_table(mock_supabase, "assessment_attempts")
-        _configure_start_mocks(mock_supabase, descriptive_count=1)
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=self.ORG_PROGRAM,
+            domains=[self.ORG_DOMAIN],
+            module_configs=[self._org_config(1)],
+        )
         self._set_auth_override()
 
         response = client.post(
@@ -4919,9 +5086,15 @@ class TestDescriptiveStartFlow:
         assert payload["total_descriptive_questions"] == 1
 
     def test_start_with_zero_descriptive_preserves_old_behavior(self, client, mock_supabase):
-        """descriptive_question_count = 0 → empty selection, no descriptive query."""
+        """descriptive_count = 0 → empty selection, no descriptive query."""
         _route_table(mock_supabase, "assessment_attempts")
-        _configure_start_mocks(mock_supabase, descriptive_count=0)
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=self.ORG_PROGRAM,
+            domains=[self.ORG_DOMAIN],
+            module_configs=[self._org_config(0)],
+        )
         self._set_auth_override()
 
         response = client.post(
@@ -4947,7 +5120,10 @@ class TestDescriptiveStartFlow:
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
             mock_supabase,
-            descriptive_count=2,
+            semester=1,
+            program=self.ORG_PROGRAM,
+            domains=[self.ORG_DOMAIN],
+            module_configs=[self._org_config(2)],
             descriptive_available=[{"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]}],
         )
         self._set_auth_override()
@@ -6023,53 +6199,21 @@ class TestAdminResultsDescriptive:
 # =====================================================================
 
 
-class TestHandsOnSelection:
-    """_select_hands_on_questions: active + domain-overlap filtering."""
-
-    @patch("routers.assessment.supabase_client")
-    def test_zero_count_selects_nothing_without_query(self, mock_sb):
-        from routers.assessment import _select_hands_on_questions
-        result = _select_hands_on_questions(0, [MOCK_DOMAIN_1_ID])
-        assert result == []
-        mock_sb.table.assert_not_called()
-
-    @patch("routers.assessment.supabase_client")
-    def test_selects_requested_challenge(self, mock_sb):
-        from routers.assessment import _select_hands_on_questions
-        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
-            _make_mock_response([{"id": MOCK_HANDS_ID}])
-        )
-        result = _select_hands_on_questions(1, [MOCK_DOMAIN_1_ID])
-        assert result == [MOCK_HANDS_ID]
-
-    @patch("routers.assessment.supabase_client")
-    def test_raises_400_when_insufficient(self, mock_sb):
-        """Fewer eligible challenges than requested → loud 400."""
-        from routers.assessment import _select_hands_on_questions
-        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
-            _make_mock_response([])
-        )
-        with pytest.raises(HTTPException) as exc_info:
-            _select_hands_on_questions(1, [MOCK_DOMAIN_1_ID])
-        assert exc_info.value.status_code == 400
-        assert "hands-on" in exc_info.value.detail.lower()
-
-    @patch("routers.assessment.supabase_client")
-    def test_filters_active_and_domain(self, mock_sb):
-        """Query must filter is_active=True and overlap domain_ids."""
-        from routers.assessment import _select_hands_on_questions
-        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.return_value.execute.return_value = (
-            _make_mock_response([{"id": MOCK_HANDS_ID}])
-        )
-        _select_hands_on_questions(1, [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID])
-        mock_sb.table.return_value.select.return_value.eq.assert_called_with("is_active", True)
-        mock_sb.table.return_value.select.return_value.eq.return_value.overlaps.assert_called_with(
-            "domain_ids", [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
-        )
-
-
 class TestHandsOnStartFlow:
-    """POST /assessment/start with hands_on_question_count."""
+    """POST /assessment/start with the hands-on module enabled.
+
+    Hands-on is switched on through assessment_module_config (a SENIOR technical
+    module), not through the legacy global assessment_config count, which is no
+    longer consulted by the start path.
+    """
+
+    def _hands_on_config(self, count):
+        return _make_module_config(
+            domain_id=MOCK_DOMAIN_1_ID,
+            applies_to="senior",
+            hands_on_enabled=count > 0,
+            hands_on_count=count,
+        )
 
     def _set_auth_override(self):
         from core.auth import get_current_user
@@ -6081,7 +6225,9 @@ class TestHandsOnStartFlow:
 
     def test_start_with_count_1_selects_and_persists(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
-        _configure_start_mocks(mock_supabase, descriptive_count=0, hands_on_count=1)
+        _configure_start_mocks(
+            mock_supabase, module_configs=[self._hands_on_config(1)]
+        )
         self._set_auth_override()
         try:
             response = client.post("/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]})
@@ -6099,7 +6245,9 @@ class TestHandsOnStartFlow:
 
     def test_start_with_count_0_preserves_old_behavior(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
-        _configure_start_mocks(mock_supabase, descriptive_count=0, hands_on_count=0)
+        _configure_start_mocks(
+            mock_supabase, module_configs=[self._hands_on_config(0)]
+        )
         self._set_auth_override()
         try:
             response = client.post("/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]})
@@ -6114,7 +6262,9 @@ class TestHandsOnStartFlow:
     def test_start_rejects_when_hands_on_insufficient(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
-            mock_supabase, descriptive_count=0, hands_on_count=1, hands_on_available=[]
+            mock_supabase,
+            module_configs=[self._hands_on_config(1)],
+            hands_on_available=[],
         )
         self._set_auth_override()
         try:

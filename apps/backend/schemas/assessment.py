@@ -76,13 +76,33 @@ class AnswerSaveRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 class AssessmentConfigUpdate(BaseModel):
-    """Schema for admin updating assessment configuration."""
+    """Schema for admin updating assessment configuration.
+
+    Only the settings that still drive the runtime are exposed here:
+
+      * ``duration_minutes``    — the base attempt duration the planner adds
+                                  enabled hands-on time to
+      * ``coding_problem_count`` — the GLOBAL DSA/coding pool size (coding is
+                                  domain-independent)
+      * ``name`` / ``is_active`` — config row management
+
+    The pre-modular knobs are deliberately NOT accepted any more. None of them
+    is read when a new attempt is planned:
+
+      total_questions            -> assessment_program.mcq_total splits the
+                                    technical MCQ total across selected domains
+      max_domains                -> assessment_program.max_domains
+      descriptive_question_count -> organizational only, now
+                                    assessment_module_config.descriptive_count
+      hands_on_question_count    -> assessment_module_config (hands_on_count /
+                                    hands_on_additional_minutes)
+
+    The columns still exist in the database for historical compatibility; the
+    admin API simply no longer offers them.
+    """
     name: Optional[str] = Field(None, min_length=1, max_length=200)
-    total_questions: Optional[int] = Field(None, gt=0)
     coding_problem_count: Optional[int] = Field(None, ge=0)
-    descriptive_question_count: Optional[int] = Field(None, ge=0)
     duration_minutes: Optional[int] = Field(None, gt=0)
-    max_domains: Optional[int] = Field(None, ge=1, le=2)
     is_active: Optional[bool] = None
 
 
@@ -169,11 +189,6 @@ class HandsOnSubmitRequest(BaseModel):
     submitted_flag: str = Field(default="", max_length=500)
 
 
-class HandsOnConfigCountUpdate(BaseModel):
-    """Assessment configuration hands-on count (ge=0 — 0 preserves old behavior)."""
-    hands_on_question_count: int = Field(..., ge=0)
-
-
 # ---------------------------------------------------------------------------
 # Admin remark (private note on an assessment submission)
 # ---------------------------------------------------------------------------
@@ -187,10 +202,57 @@ class AdminRemarkUpdate(BaseModel):
     admin_remark: Optional[str] = Field(None, max_length=10_000)
 
 
-class AssessmentConfigUpdateHandsOn(AssessmentConfigUpdate):
-    """Config update schema extended with the Hands-On count.
+# NOTE: ``AssessmentConfigUpdateHandsOn`` used to subclass
+# ``AssessmentConfigUpdate`` to add ``hands_on_question_count``. That knob is
+# retired (hands-on quantity and additional minutes now live in
+# ``assessment_module_config``, per domain and tier), so the subclass had no
+# fields left and was deleted. The endpoint uses ``AssessmentConfigUpdate``.
 
-    Subclassed (rather than editing the base) so the existing config update
-    endpoint keeps its exact behavior while gaining the new optional field.
+
+# ---------------------------------------------------------------------------
+# Assessment module configuration (domain x tier module counts)
+# ---------------------------------------------------------------------------
+
+VALID_APPLIES_TO = ["junior", "senior", "organizational"]
+
+# Which applies_to values are allowed for each assessment_scope.
+SCOPE_ALLOWED_APPLIES_TO = {
+    "technical": ["junior", "senior"],
+    "organizational": ["organizational"],
+}
+
+# Maps tier/applies_to to the semester used for MCQ pool validation.
+APPLIES_TO_VALIDATION_SEMESTER = {
+    "junior": 3,
+    "senior": 5,
+    "organizational": 1,
+}
+
+
+class ModuleConfigUpdate(BaseModel):
+    """Create or update a module configuration for a domain + tier.
+
+    Upsert semantics: if a row already exists for (domain_id, applies_to),
+    it is updated. Otherwise a new row is created.
     """
-    hands_on_question_count: Optional[int] = Field(None, ge=0)
+    applies_to: str = Field(..., description="junior | senior | organizational")
+    mcq_count: int = Field(..., ge=0)
+    descriptive_count: int = Field(..., ge=0)
+    hands_on_enabled: bool = False
+    hands_on_count: int = Field(..., ge=0)
+    hands_on_additional_minutes: int = Field(0, ge=0)
+    notes: Optional[str] = Field(None, max_length=2000)
+
+    def model_post_init(self, __context):
+        if self.applies_to not in VALID_APPLIES_TO:
+            raise ValueError(f"applies_to must be one of {VALID_APPLIES_TO}")
+        if not self.hands_on_enabled:
+            if self.hands_on_count != 0:
+                raise ValueError(
+                    "hands_on_count must be 0 when hands_on_enabled is false"
+                )
+            if self.hands_on_additional_minutes != 0:
+                raise ValueError(
+                    "hands_on_additional_minutes must be 0 when "
+                    "hands_on_enabled is false"
+                )

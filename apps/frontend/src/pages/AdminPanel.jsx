@@ -150,39 +150,22 @@ const AdminPanel = () => {
     setMessage('');
     setConfigError('');
 
-    // Client-side validation before sending to backend
-    const tq = configForm.total_questions;
+    // Client-side validation before sending to backend.
+    //
+    // Only the settings that still drive planning are editable here: the base
+    // duration and the GLOBAL coding problem count. The pre-modular knobs
+    // (MCQ total, domain cap, descriptive and hands-on counts) are no longer
+    // part of this form — technical MCQ totals and the domain limit come from
+    // the assessment programme, and per-domain module counts come from
+    // Assessment Modules.
     const cc = configForm.coding_problem_count;
-    const md = configForm.max_domains;
-
-    if (tq !== undefined && tq !== null && tq < 1) {
-      setConfigError('MCQ questions must be at least 1.');
-      return;
-    }
     if (cc !== undefined && cc !== null && cc < 0) {
       setConfigError('Coding problems cannot be negative.');
       return;
     }
-    if (md !== undefined && md !== null && (md < 1 || md > 2)) {
-      setConfigError('Maximum domains must be 1 or 2.');
-      return;
-    }
-    if (md === 2 && tq !== undefined && tq !== null && tq % 2 !== 0) {
-      setConfigError('MCQ questions must be even when using 2 domains.');
-      return;
-    }
-    if (md === 2 && cc !== undefined && cc !== null && cc > 0 && cc % 2 !== 0) {
-      setConfigError('Coding problems must be even when using 2 domains.');
-      return;
-    }
-    const dc = configForm.descriptive_question_count;
-    if (dc !== undefined && dc !== null && dc < 0) {
-      setConfigError('Descriptive questions cannot be negative.');
-      return;
-    }
-    const hc = configForm.hands_on_question_count;
-    if (hc !== undefined && hc !== null && hc < 0) {
-      setConfigError('Hands-On questions cannot be negative.');
+    const dm = configForm.duration_minutes;
+    if (dm !== undefined && dm !== null && dm < 1) {
+      setConfigError('Duration must be at least 1 minute.');
       return;
     }
 
@@ -583,6 +566,12 @@ const AdminPanel = () => {
             >
               💻 Coding Problems
             </button>
+            <button
+              onClick={() => navigate('/admin/modules')}
+              className="px-4 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-sm font-semibold transition-colors"
+            >
+              🧩 Assessment Modules
+            </button>
           </div>
         </div>
 
@@ -672,20 +661,6 @@ const AdminPanel = () => {
                       />
                       <div className="grid grid-cols-2 gap-3">
                         <div>
-                          <label className="text-xs text-theme-muted mb-1 block">MCQ Questions</label>
-                          <input
-                            type="number"
-                            min="1"
-                            value={configForm.total_questions ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
-                              setConfigForm({ ...configForm, total_questions: val });
-                            }}
-                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                            required
-                          />
-                        </div>
-                        <div>
                           <label className="text-xs text-theme-muted mb-1 block">Coding Problems</label>
                           <input
                             type="number"
@@ -713,50 +688,20 @@ const AdminPanel = () => {
                             required
                           />
                         </div>
-                        <div>
-                          <label className="text-xs text-theme-muted mb-1 block">Descriptive Questions</label>
-                          <input
-                            type="number"
-                            min="0"
-                            value={configForm.descriptive_question_count ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
-                              setConfigForm({ ...configForm, descriptive_question_count: val });
-                            }}
-                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="text-xs text-theme-muted mb-1 block">Hands-On Questions</label>
-                          <input
-                            type="number"
-                            min="0"
-                            value={configForm.hands_on_question_count ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
-                              setConfigForm({ ...configForm, hands_on_question_count: val });
-                            }}
-                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                            required
-                          />
-                        </div>
-                        <div>
-                          <label className="text-xs text-theme-muted mb-1 block">Max Domains (1 or 2)</label>
-                          <input
-                            type="number"
-                            min="1"
-                            max="2"
-                            value={configForm.max_domains ?? ''}
-                            onChange={(e) => {
-                              const val = e.target.value === '' ? '' : parseInt(e.target.value, 10);
-                              setConfigForm({ ...configForm, max_domains: val });
-                            }}
-                            className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                            required
-                          />
-                        </div>
                       </div>
+                      <p className="text-xs text-theme-muted">
+                        Question quantities are configured elsewhere: technical MCQ totals and the
+                        domain limit come from the assessment programme, and per-domain MCQ,
+                        descriptive and hands-on counts come from{' '}
+                        <button
+                          type="button"
+                          onClick={() => navigate('/admin/modules')}
+                          className="underline hover:text-theme-primary transition-colors"
+                        >
+                          Assessment Modules
+                        </button>
+                        .
+                      </p>
                       {configError && (
                         <p className="text-xs text-red-400 bg-red-900/20 border border-red-500/50 rounded px-3 py-2">
                           {configError}
@@ -777,22 +722,27 @@ const AdminPanel = () => {
                           </span>
                         </div>
                         <button
-                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, total_questions: cfg.total_questions, coding_problem_count: cfg.coding_problem_count ?? 0, descriptive_question_count: cfg.descriptive_question_count ?? 0, hands_on_question_count: cfg.hands_on_question_count ?? 0, duration_minutes: cfg.duration_minutes, max_domains: cfg.max_domains, is_active: cfg.is_active }); setConfigError(''); }}
+                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, coding_problem_count: cfg.coding_problem_count ?? 0, duration_minutes: cfg.duration_minutes, is_active: cfg.is_active }); setConfigError(''); }}
                           className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
                         >
                           Edit
                         </button>
                       </div>
                       <div className="grid grid-cols-2 gap-2 mt-3 text-xs text-theme-muted">
-                        <span>MCQ Questions: {cfg.total_questions}</span>
                         <span>Coding Problems: {cfg.coding_problem_count ?? 0}</span>
-                        <span>Descriptive: {cfg.descriptive_question_count ?? 0}</span>
-                        <span>Hands-On: {cfg.hands_on_question_count ?? 0}</span>
                         <span>Duration: {cfg.duration_minutes}m</span>
-                        <span>Max Domains: {cfg.max_domains}</span>
                       </div>
                       <p className="text-xs text-theme-muted mt-1">
-                        2 domains → 50/50 split (total must be even)
+                        Technical MCQ totals and the domain limit come from the assessment
+                        programme; per-domain question counts come from{' '}
+                        <button
+                          type="button"
+                          onClick={() => navigate('/admin/modules')}
+                          className="underline hover:text-theme-primary transition-colors"
+                        >
+                          Assessment Modules
+                        </button>
+                        .
                       </p>
                     </>
                   )}
