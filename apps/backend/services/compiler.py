@@ -20,6 +20,7 @@ Language IDs (Judge0 CE 1.13.1):
   - 71: Python 3 (CPython 3.8.1)
   - 54: C++ (GCC 9.2.0)
   - 62: Java (OpenJDK 13.0.1)
+  - 50: C (GCC 9.2.0)
 """
 
 import os
@@ -114,6 +115,7 @@ JUDGE0_LANGUAGE_IDS = {
     "python3": 71,   # Python 3.8.1
     "cpp": 54,       # C++ (GCC 9.2.0)
     "java": 62,      # Java (OpenJDK 13.0.1)
+    "c": 50,         # C (GCC 9.2.0)
 }
 
 # Judge0 status IDs

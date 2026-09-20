@@ -7,6 +7,13 @@ vi.mock('../hooks/useAuth', () => ({
   useAuth: () => ({ getAuthHeaders: () => ({ 'Content-Type': 'application/json' }) }),
 }));
 
+// Monaco is browser-only (it touches DOM APIs at import time) and cannot run in
+// jsdom, so the editor is stubbed — same convention as MCQTest.test.jsx. These
+// tests cover the descriptive section, never the editor itself.
+vi.mock('../components/CodeEditor', () => ({
+  default: ({ value }) => <textarea data-testid="code-editor" readOnly value={value} />,
+}));
+
 const FUTURE = new Date(Date.now() + 3600_000).toISOString();
 
 const DESCRIPTIVE_QUESTIONS = [

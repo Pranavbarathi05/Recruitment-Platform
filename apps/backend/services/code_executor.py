@@ -35,6 +35,7 @@ LANGUAGE_CONFIGS = {
     "python3": {"compiler_lang": "python"},
     "cpp": {"compiler_lang": "cpp"},
     "java": {"compiler_lang": "java"},
+    "c": {"compiler_lang": "c"},
 }
 
 DEFAULT_TIME_LIMIT_MS = 2000

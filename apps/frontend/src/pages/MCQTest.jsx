@@ -33,6 +33,7 @@ const CODING_LANGUAGES = [
   { value: 'python3', label: 'Python 3' },
   { value: 'cpp', label: 'C++' },
   { value: 'java', label: 'Java' },
+  { value: 'c', label: 'C' },
 ];
 
 const INT32_MIN = -2147483648;
@@ -189,6 +190,25 @@ const getDefaultStarter = (lang, problem) => {
       );
     }
     return `${retType} ${functionName}(${paramsText}) {\n    ${body('')}\n}\n`;
+  }
+
+  // --- C (server-side only; the harness requires an explicit C function_signature) ---
+  if (lang === 'c') {
+    // Mirror the backend's C starter contract (services/harness.py:
+    // generate_c_starter_code): the candidate sees ONLY the verbatim signature
+    // function — no main(), no I/O. The generated harness owns invocation.
+    const cSignature = (signature || '').trim().replace(/;\s*$/, '');
+    if (cSignature) {
+      const usesBool = /\b(_Bool|bool)\b/.test(cSignature);
+      return (
+        (usesBool ? '#include <stdbool.h>\n\n' : '') +
+        `${cSignature} {\n    // Write your solution here\n}\n`
+      );
+    }
+    return (
+      '// This problem needs a C function_signature (e.g. int add(int a, int b)).\n' +
+      `int ${functionName}(void) {\n    // Write your solution here\n}\n`
+    );
   }
 
   // --- Java (harness always invokes an instance method on class_name or "Solution") ---
@@ -1181,7 +1201,7 @@ function CodingSection({
         <div className="flex-1 min-h-0 relative">
           <CodeEditor
             key={problem.id}
-            language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : 'java'}
+            language={language === 'python3' ? 'python' : language === 'cpp' ? 'cpp' : language === 'c' ? 'c' : 'java'}
             value={sourceCode} onChange={(val) => setSourceCode(val || '')}
           />
         </div>

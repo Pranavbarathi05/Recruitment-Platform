@@ -2182,3 +2182,87 @@ class TestNoLeakage:
             assert leaked not in columns
         # Coding was not requested here, so its pool must not have been read.
         _chain(mock_supabase, "coding_problems").select.assert_not_called()
+
+
+class TestTechnicalStartNeverTouchesDescriptive:
+    """The critical invariant behind the September 2026 incident.
+
+    Production candidates saw "Descriptive questions not found, 0 of 1
+    found" because a stale runtime still validated a global descriptive
+    requirement on the technical start path. The current architecture makes
+    that impossible by construction: a TECHNICAL start must never even QUERY
+    the descriptive pool — no plan can then depend on it, and no preflight
+    can fail for it. A rich, generous descriptive pool is configured
+    deliberately: its presence must change nothing for technical candidates.
+    """
+
+    def test_junior_start_never_queries_descriptive_questions(
+        self, client, mock_supabase, spy
+    ):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            semester=3,
+            program=JUNIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+            module_configs=[],
+            coding_problem_count=2,
+            coding_available=[
+                {"id": MOCK_CODING_PROBLEM_ID},
+                {"id": "cp-2"},
+            ],
+            # A loaded descriptive pool sitting there — technical ignores it.
+            descriptive_available=[
+                {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+                {"id": "desc-2", "domain_ids": [MOCK_DOMAIN_1_ID]},
+            ],
+        )
+        _auth()
+        try:
+            response = _post(client)
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_descriptive_questions"] == 0
+        assert data["selected_descriptive_question_ids"] == []
+        # The descriptive pool query must NEVER run for a technical start.
+        desc_chain = mock_supabase._table_chains["descriptive_questions"]
+        desc_chain.select.assert_not_called()
+        # And the frozen plan carries zero descriptive content.
+        assert spy.plan.descriptive_total == 0
+        assert spy.plan.selected_descriptive_question_ids == []
+        payload = _payload(mock_supabase)
+        assert payload["total_descriptive_questions"] == 0
+        assert payload["selected_descriptive_question_ids"] == []
+
+    def test_senior_start_never_queries_descriptive_questions(
+        self, client, mock_supabase, spy
+    ):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+            module_configs=[],
+            coding_problem_count=2,
+            coding_available=[
+                {"id": MOCK_CODING_PROBLEM_ID},
+                {"id": "cp-2"},
+            ],
+            descriptive_available=[
+                {"id": MOCK_DESC_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+                {"id": "desc-2", "domain_ids": [MOCK_DOMAIN_1_ID]},
+            ],
+        )
+        _auth()
+        try:
+            response = _post(client)
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.json()["total_descriptive_questions"] == 0
+        mock_supabase._table_chains["descriptive_questions"].select.assert_not_called()
+        assert spy.plan.descriptive_total == 0

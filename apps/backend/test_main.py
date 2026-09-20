@@ -2475,142 +2475,154 @@ class TestAssessmentResumeAndReset:
 
 
 class TestCompilerServiceIntegration:
-    """Tests for the compiler.py service layer.
+    """Tests for the compiler.py service layer (Judge0 CE contract).
 
-    All HTTP calls to gateway-api are mocked. These verify the
-    request/response contract, language mapping, error handling,
-    and tracking context forwarding.
+    All HTTP calls to Judge0 are mocked. Judge0 CE 1.13.1 flow:
+        POST /submissions?base64_encoded=true&fields=...  -> {token}
+        GET  /submissions/{token}?base64_encoded=true&fields=... -> result
+    These verify the request/response contract, language mapping, error
+    handling, and the tracking-id policy of the current architecture.
     """
 
+    @staticmethod
+    def _mock_judge0(MockClient, *, token="tok-123", poll=None):
+        """Fake a Judge0 node: submit returns a token, poll returns `poll`."""
+        submit_response = MagicMock()
+        submit_response.status_code = 200
+        submit_response.raise_for_status = MagicMock()
+        submit_response.json.return_value = {"token": token}
+        poll_response = MagicMock()
+        poll_response.status_code = 200
+        poll_response.raise_for_status = MagicMock()
+        poll_response.json.return_value = poll or {
+            "status_id": 3, "stdout": "", "stderr": "",
+            "compile_output": "", "time": "0.01", "memory": "1024",
+        }
+        MockClient.return_value.post.return_value = submit_response
+        MockClient.return_value.get.return_value = poll_response
+        return submit_response, poll_response
+
     def test_execute_code_sends_correct_payload(self):
-        """Verify the HTTP request payload structure."""
+        """Verify the Judge0 request/response contract end to end."""
         import services.compiler as compiler_mod
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "accepted",
-            "language": "python",
-            "execution_time_ms": 100,
-            "tests": [{"passed": True, "actual_output": "42"}],
-            "total_tests": 1,
-            "passed_tests": 1,
+        harness_stdout = json.dumps([{"passed": True, "actual": "42"}])
+        poll = {
+            "status_id": 3,
+            "stdout": compiler_mod._b64encode(harness_stdout),
+            "stderr": "", "compile_output": "", "time": "0.1", "memory": "4096",
         }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient, token="tok-abc", poll=poll)
 
             result = compiler_mod.execute_code_sync(
                 language="python3",
                 source_code="print(42)",
-                test_cases=[{"input": "", "expected_output": ""}],
+                test_cases=[{"input": "", "expected_output": "42"}],
                 attempt_id="att-1",
                 problem_id="prob-1",
             )
 
-            # Verify the POST was made to the correct URL
+            # Submit went to the Judge0 submissions endpoint, base64-encoded.
             call_args = MockClient.return_value.post.call_args
-            assert "/api/execute" in call_args[0][0]
+            assert "/submissions" in call_args[0][0]
+            assert "base64_encoded=true" in call_args[0][0]
 
             # Verify payload
             payload = call_args[1]["json"]
-            assert payload["language"] == "python"  # python3 mapped to python
-            assert payload["source_code"] == "print(42)"
-            assert len(payload["test_cases"]) == 1
-            assert payload["attempt_id"] == "att-1"
-            assert payload["question_id"] == "prob-1"  # problem_id mapped to question_id
-            assert "limits" in payload
+            assert payload["language_id"] == 71  # python3 -> Judge0 Python 3.8.1
+            assert payload["source_code"] == compiler_mod._b64encode("print(42)")
+            assert payload["cpu_time_limit"] == 2.0
+            assert payload["memory_limit"] == 256 * 1024
+            # Tracking ids are logging-only context; Judge0 never receives them.
+            assert "attempt_id" not in payload
+            assert "question_id" not in payload
 
-            # Verify result
+            # The result is polled from the SAME node that accepted the token.
+            poll_url = MockClient.return_value.get.call_args[0][0]
+            assert "tok-abc" in poll_url
+            assert "base64_encoded=true" in poll_url
+
+            # Verify result: harness output parsed into per-test results.
             assert result.status == "accepted"
-            assert result.language == "python"
+            assert result.language == "python3"
             assert result.execution_time_ms == 100
             assert len(result.tests) == 1
+            assert result.tests[0]["passed"] is True
 
     def test_language_mapping(self):
-        """Verify language names are mapped correctly."""
+        """Every supported language maps to its Judge0 CE 1.13.1 language_id."""
         import services.compiler as compiler_mod
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "accepted", "language": "cpp",
-            "execution_time_ms": 50, "tests": [], "total_tests": 0, "passed_tests": 0,
-        }
+        expected_ids = {"python3": 71, "cpp": 54, "java": 62, "c": 50}
+        for language, judge0_id in expected_ids.items():
+            with patch.object(compiler_mod.httpx, "Client") as MockClient:
+                MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+                MockClient.return_value.__exit__ = MagicMock(return_value=False)
+                self._mock_judge0(MockClient)
 
-        with patch.object(compiler_mod.httpx, "Client") as MockClient:
-            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
-            MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+                compiler_mod.execute_code_sync(
+                    language=language, source_code="int main() {}",
+                    test_cases=[],
+                )
 
-            compiler_mod.execute_code_sync(
-                language="cpp", source_code="int main() {}",
-                test_cases=[],
-            )
-
-            payload = MockClient.return_value.post.call_args[1]["json"]
-            assert payload["language"] == "cpp"
+                payload = MockClient.return_value.post.call_args[1]["json"]
+                assert payload["language_id"] == judge0_id, (
+                    f"{language} must submit to Judge0 as language_id {judge0_id}"
+                )
 
     def test_wrong_answer_response(self):
-        """Verify wrong_answer is correctly parsed."""
+        """A failing harness result on an accepted run is wrong_answer."""
         import services.compiler as compiler_mod
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "wrong_answer",
-            "language": "python",
-            "execution_time_ms": 80,
-            "tests": [
-                {"passed": True, "actual_output": "4"},
-                {"passed": False, "actual_output": "5", "expected_output": "9"},
-            ],
-            "failed_test": 2,
-            "total_tests": 2,
-            "passed_tests": 1,
+        harness_stdout = json.dumps([
+            {"passed": True, "actual": "4"},
+            {"passed": False, "actual": "5", "error": None},
+        ])
+        poll = {
+            "status_id": 3,
+            "stdout": compiler_mod._b64encode(harness_stdout),
+            "stderr": "", "compile_output": "", "time": "0.08", "memory": "4096",
         }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient, poll=poll)
 
             result = compiler_mod.execute_code_sync(
                 language="python3", source_code="print(42)",
-                test_cases=[{"input": "", "expected_output": "4"}],
+                test_cases=[
+                    {"input": "", "expected_output": "4"},
+                    {"input": "", "expected_output": "9"},
+                ],
             )
 
             assert result.status == "wrong_answer"
             assert result.passed_tests == 1
             assert result.total_tests == 2
-            assert result.failed_test == 2
+            assert result.failed_test == 1  # index of the first failing test
 
     def test_compilation_error_response(self):
-        """Verify compilation_error is correctly parsed."""
+        """Judge0 status 6 surfaces the compiler diagnostics verbatim."""
         import services.compiler as compiler_mod
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "compilation_error",
-            "language": "cpp",
-            "execution_time_ms": 30,
-            "tests": [],
-            "error": "error: expected ';' before '}' token",
-            "total_tests": 0,
-            "passed_tests": 0,
+        poll = {
+            "status_id": 6,
+            "stdout": "", "stderr": "",
+            "compile_output": compiler_mod._b64encode(
+                "error: expected ';' before '}' token"
+            ),
+            "time": "0.03", "memory": "0",
         }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient, poll=poll)
 
             result = compiler_mod.execute_code_sync(
                 language="cpp", source_code="int main() {}",
@@ -2621,25 +2633,19 @@ class TestCompilerServiceIntegration:
             assert result.error == "error: expected ';' before '}' token"
 
     def test_timeout_response(self):
-        """Verify time_limit_exceeded is correctly parsed."""
+        """Judge0 status 5 maps to time_limit_exceeded."""
         import services.compiler as compiler_mod
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "time_limit_exceeded",
-            "language": "python",
-            "execution_time_ms": 5000,
-            "tests": [{"passed": False, "execution_time_ms": 5000}],
-            "total_tests": 1,
-            "passed_tests": 0,
+        poll = {
+            "status_id": 5,
+            "stdout": "", "stderr": "", "compile_output": "",
+            "time": "5.0", "memory": "4096",
         }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient, poll=poll)
 
             result = compiler_mod.execute_code_sync(
                 language="python3", source_code="import time; time.sleep(60)",
@@ -2705,21 +2711,13 @@ class TestCompilerServiceIntegration:
             assert "500" in str(exc_info.value)
 
     def test_session_id_forwarded(self):
-        """session_id is forwarded when provided."""
+        """session_id is accepted (logging context) but never leaks to Judge0."""
         import services.compiler as compiler_mod
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "accepted", "language": "python",
-            "execution_time_ms": 10, "tests": [], "total_tests": 0, "passed_tests": 0,
-        }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient)
 
             compiler_mod.execute_code_sync(
                 language="python3", source_code="print(42)",
@@ -2727,24 +2725,17 @@ class TestCompilerServiceIntegration:
             )
 
             payload = MockClient.return_value.post.call_args[1]["json"]
-            assert payload["session_id"] == "sess-abc"
+            # Judge0 has no session concept — tracking context stays local.
+            assert "session_id" not in payload
 
     def test_no_tracking_ids_when_none(self):
-        """Tracking IDs are omitted when None."""
+        """No tracking fields are ever sent to Judge0."""
         import services.compiler as compiler_mod
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "accepted", "language": "python",
-            "execution_time_ms": 10, "tests": [], "total_tests": 0, "passed_tests": 0,
-        }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient)
 
             compiler_mod.execute_code_sync(
                 language="python3", source_code="print(42)",
@@ -2757,21 +2748,13 @@ class TestCompilerServiceIntegration:
             assert "session_id" not in payload
 
     def test_limits_forwarded(self):
-        """Execution limits are forwarded to compiler service."""
+        """Execution limits are forwarded as flat Judge0 payload fields."""
         import services.compiler as compiler_mod
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json.return_value = {
-            "status": "accepted", "language": "python",
-            "execution_time_ms": 10, "tests": [], "total_tests": 0, "passed_tests": 0,
-        }
 
         with patch.object(compiler_mod.httpx, "Client") as MockClient:
             MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
             MockClient.return_value.__exit__ = MagicMock(return_value=False)
-            MockClient.return_value.post.return_value = mock_response
+            self._mock_judge0(MockClient)
 
             compiler_mod.execute_code_sync(
                 language="python3", source_code="print(42)",
@@ -2782,18 +2765,22 @@ class TestCompilerServiceIntegration:
             )
 
             payload = MockClient.return_value.post.call_args[1]["json"]
-            assert payload["limits"]["time_limit_seconds"] == 5.0
-            assert payload["limits"]["memory_limit_mb"] == 512
-            assert payload["limits"]["max_output_bytes"] == 32768
+            assert payload["cpu_time_limit"] == 5.0
+            assert payload["wall_time_limit"] == 10.0  # +5s grace
+            assert payload["memory_limit"] == 512 * 1024  # KB on the wire
+            assert payload["max_file_size"] == compiler_mod.JUDGE0_MAX_FILE_SIZE_KB
+            # The legacy nested `limits` object is not part of the Judge0 contract.
+            assert "limits" not in payload
 
     def test_compiler_configurable_url(self):
-        """COMPILER_URL is read from environment."""
+        """Judge0 node pool configuration exists and is usable."""
         import services.compiler as compiler_mod
-        # Just verify the module-level config exists and defaults
-        assert hasattr(compiler_mod, "COMPILER_URL")
-        assert hasattr(compiler_mod, "COMPILER_TIMEOUT")
-        assert isinstance(compiler_mod.COMPILER_URL, str)
-        assert compiler_mod.COMPILER_TIMEOUT > 0
+        # The pool defaults to the single JUDGE0_BASE_URL node; per-node
+        # COMPILER_n_URL behaviour is covered by utils/test_compiler_pool.py.
+        assert isinstance(compiler_mod.JUDGE0_BASE_URL, str)
+        assert compiler_mod.JUDGE0_BASE_URL.startswith("http")
+        assert compiler_mod.compiler_pool_urls() == [compiler_mod.JUDGE0_BASE_URL.rstrip("/")]
+        assert compiler_mod.JUDGE0_MAX_POLL_TIME > 0
 
     def test_compiler_response_to_dict(self):
         """CompilerResponse.to_dict() returns correct structure."""
@@ -7251,6 +7238,57 @@ class TestCLanguageIdMapping:
         assert JUDGE0_LANGUAGE_IDS["python3"] == 71
         assert JUDGE0_LANGUAGE_IDS["cpp"] == 54
         assert JUDGE0_LANGUAGE_IDS["java"] == 62
+
+    def test_c_submission_reaches_judge0_with_language_id_50(self):
+        """End-to-end regression: a C submission POSTs Judge0 language_id 50.
+
+        Production shipped C selectable on the backend (schema + harness) but
+        JUDGE0_LANGUAGE_IDS had no "c" entry, so every C submission died with
+        CompilerError("Unsupported language for Judge0: c") before any HTTP
+        call. This pins the full execution path: schema -> harness -> Judge0
+        payload.
+        """
+        from services import compiler as compiler_mod
+        from services.harness import generate_harness
+
+        # A C problem, exactly as the admin creates it.
+        harness = generate_harness(
+            candidate_code="int add(int a, int b) { return a + b; }",
+            language="c",
+            function_name="add",
+            class_name=None,
+            test_arguments=[[2, 3]],
+            test_expected=[5],
+            function_signature="int add(int a, int b)",
+        )
+        assert "int add(int a, int b)" in harness  # candidate code embedded
+
+        harness_stdout = json.dumps([{"passed": True, "actual": "5"}])
+        poll = {
+            "status_id": 3,
+            "stdout": compiler_mod._b64encode(harness_stdout),
+            "stderr": "", "compile_output": "", "time": "0.01", "memory": "1024",
+        }
+        with patch.object(compiler_mod.httpx, "Client") as MockClient:
+            MockClient.return_value.__enter__ = MagicMock(return_value=MockClient.return_value)
+            MockClient.return_value.__exit__ = MagicMock(return_value=False)
+            TestCompilerServiceIntegration._mock_judge0(MockClient, poll=poll)
+
+            result = compiler_mod.execute_code_sync(
+                language="c",
+                source_code=harness,
+                test_cases=[{"input": "", "expected_output": "5"}],
+            )
+
+            payload = MockClient.return_value.post.call_args[1]["json"]
+            assert payload["language_id"] == 50  # C (GCC 9.2.0) on Judge0 CE 1.13.1
+            assert result.status == "accepted"
+            assert result.tests[0]["passed"] is True
+
+    def test_c_accepted_by_legacy_stdin_executor(self):
+        """The legacy stdin/stdout executor knows the c compiler_lang too."""
+        from services.code_executor import LANGUAGE_CONFIGS
+        assert LANGUAGE_CONFIGS["c"] == {"compiler_lang": "c"}
 
 
 class TestCCodingValidation:

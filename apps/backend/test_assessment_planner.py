@@ -1805,3 +1805,160 @@ class TestTechnicalDescriptiveNeverRequired:
         assert plan.mcq_total == 5
         assert plan.descriptive_total == 2
         assert plan.coding_total == 0
+
+
+# ---------------------------------------------------------------------------
+# Production-incident regression spec (September 2026)
+# ---------------------------------------------------------------------------
+
+
+def _program_with_mcq_total(program, total):
+    """The same programme with a different master technical MCQ total."""
+    return program.model_copy(update={"mcq_total": total})
+
+
+class TestProductionRegressionSemesterComposition:
+    """The ONE correct composition per semester, pinned against the incident.
+
+    In the September 2026 production test, different Sem 3 candidates received
+    different compositions (MCQ-only / coding-only / hands-on / mixed). These
+    tests pin the intended rules:
+
+        Sem 3 (junior technical): MCQs split evenly from the master technical
+        MCQ total, 2 global coding problems, NO descriptive, NO hands-on —
+        even if a mis-authored junior module row enables hands-on.
+
+        Sem 5 (senior technical): MCQs + 2 global coding problems, NO
+        descriptive, hands-on only per senior module configuration.
+
+        Sem 1 (organizational): MCQ + descriptive from the module row, never
+        coding.
+    """
+
+    # ---- Sem 3 / junior technical -----------------------------------------
+
+    def test_sem3_one_domain_master_total_of_4_gives_4_mcqs(self):
+        """The production example: total=4, one domain -> all 4 MCQs."""
+        junior_4 = _program_with_mcq_total(PROGRAM_3, 4)
+        plan = plan_assessment(
+            build(junior_4, [CYBER_ID], module_configs=[], coding=2)
+        )
+        assert plan.mcq_total == 4
+        assert [e.mcq_count for e in plan.domains] == [4]
+        assert plan.descriptive_total == 0
+        assert plan.hands_on_total == 0
+        assert plan.coding_total == 2
+
+    def test_sem3_two_domains_master_total_of_4_splits_two_and_two(self):
+        """Selecting a second domain must NOT increase the MCQ total."""
+        junior_4 = _program_with_mcq_total(PROGRAM_3, 4)
+        one_domain = plan_assessment(
+            build(junior_4, [CYBER_ID], module_configs=[], coding=2)
+        )
+        two_domains = plan_assessment(
+            build(junior_4, [CYBER_ID, WEB_ID], module_configs=[], coding=2)
+        )
+        assert two_domains.mcq_total == one_domain.mcq_total == 4
+        assert [e.mcq_count for e in two_domains.domains] == [2, 2]
+        assert two_domains.descriptive_total == 0
+        assert two_domains.hands_on_total == 0
+        assert two_domains.coding_total == 2
+
+    def test_sem3_master_total_of_20_gives_20_or_10_plus_10(self):
+        """The full-scale example: 20 -> one domain, 10+10 -> two domains."""
+        single = plan_assessment(
+            build(PROGRAM_3, [CYBER_ID], module_configs=[], coding=2)
+        )
+        pair = plan_assessment(
+            build(PROGRAM_3, [CYBER_ID, WEB_ID], module_configs=[], coding=2)
+        )
+        assert single.mcq_total == 20
+        assert pair.mcq_total == 20
+        assert [e.mcq_count for e in pair.domains] == [10, 10]
+        assert single.descriptive_total == pair.descriptive_total == 0
+        assert single.hands_on_total == pair.hands_on_total == 0
+        assert single.coding_total == pair.coding_total == 2
+
+    def test_sem3_odd_master_mcq_total_is_rejected(self):
+        """The master technical MCQ total must be even (0-20, even)."""
+        odd_program = _program_with_mcq_total(PROGRAM_3, 5)
+        err = expect_failure(
+            PlanningErrorKind.INVALID_PROGRAM,
+            program=odd_program,
+            domain_ids=[CYBER_ID],
+            module_configs=[],
+            coding=2,
+        )
+        assert "even" in err.detail
+
+    def test_sem3_misconfigured_junior_hands_on_row_cannot_leak_challenges(self):
+        """THE Sem-3 hands-on guard: a junior row enabling hands-on is inert.
+
+        Hands-on is a SENIOR-only module. Even if a junior assessment_module_config
+        row is mis-authored with hands_on_enabled=True and a nonzero count (and
+        challenges exist in the pool), a junior candidate's plan must contain
+        zero hands-on content and zero additional hands-on time.
+        """
+        bad_junior = cfg(
+            CYBER_ID, "junior", mcq=5, desc=1,
+            hands_on=True, hands_on_count=2, minutes=30,
+        )
+        req = build(PROGRAM_3, [CYBER_ID], [bad_junior], coding=2)
+        req.hands_on_pool = hands_items(["h1", "h2"], [CYBER_ID])
+        plan = plan_assessment(req)
+        assert plan.hands_on_total == 0
+        assert plan.selected_hands_on_question_ids == []
+        assert plan.practicals == []
+        assert plan.additional_minutes == 0
+        assert plan.duration_minutes == 90  # base only — no hands-on time
+        assert plan.domains[0].hands_on_enabled is False
+        assert plan.descriptive_total == 0
+        assert plan.coding_total == 2
+
+    # ---- Sem 5 / senior technical ------------------------------------------
+
+    def test_sem5_senior_no_descriptive_and_hands_on_follows_config(self):
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=2)
+        )
+        assert plan.descriptive_total == 0
+        assert plan.selected_descriptive_question_ids == []
+        assert plan.hands_on_total == 1  # senior module row enables it
+        assert plan.additional_minutes == 20
+        assert plan.coding_total == 2
+
+    def test_sem5_senior_without_hands_on_config_gets_none(self):
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID], module_configs=[], coding=2)
+        )
+        assert plan.descriptive_total == 0
+        assert plan.hands_on_total == 0
+        assert plan.practicals == []
+        assert plan.mcq_total == 20
+        assert plan.coding_total == 2
+
+    # ---- Sem 1 / organizational --------------------------------------------
+
+    def test_sem1_descriptive_follows_organizational_configuration(self):
+        plan = plan_assessment(
+            build(
+                PROGRAM_1,
+                [ORG_ID],
+                [cfg(ORG_ID, "organizational", mcq=10, desc=3)],
+            )
+        )
+        assert plan.descriptive_total == 3
+        assert plan.mcq_total == 10
+        assert plan.hands_on_total == 0
+        assert plan.coding_total == 0
+
+    def test_sem1_descriptive_configurable_to_zero(self):
+        plan = plan_assessment(
+            build(
+                PROGRAM_1,
+                [ORG_ID],
+                [cfg(ORG_ID, "organizational", mcq=10, desc=0)],
+            )
+        )
+        assert plan.descriptive_total == 0
+        assert plan.mcq_total == 10
