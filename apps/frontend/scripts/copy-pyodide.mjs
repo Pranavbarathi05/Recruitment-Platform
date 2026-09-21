@@ -17,6 +17,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC = resolve(ROOT, 'node_modules/pyodide');
 const DEFAULT_DEST = resolve(ROOT, 'public/pyodide');
 
+const WHEEL_SRC = resolve(ROOT, 'scripts/pyodide-packages');
+
 export function copyPyodideTo(dest = DEFAULT_DEST) {
   if (!existsSync(SRC)) {
     throw new Error(
@@ -35,6 +37,12 @@ export function copyPyodideTo(dest = DEFAULT_DEST) {
     recursive: true,
     filter: (src) => !src.endsWith('.map'),
   });
+
+  // Copy pre-downloaded wheel packages (pandas, numpy, etc.) so Pyodide's
+  // loadPackage resolves them locally without CDN access.
+  if (existsSync(WHEEL_SRC)) {
+    cpSync(WHEEL_SRC, dest, { recursive: true });
+  }
 
   return dest;
 }

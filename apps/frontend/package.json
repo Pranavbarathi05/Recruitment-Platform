@@ -9,13 +9,15 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "copy-pyodide": "node scripts/copy-pyodide.mjs",
-    "postinstall": "npm run copy-pyodide",
-    "predev": "npm run copy-pyodide",
-    "prebuild": "npm run copy-pyodide",
+    "copy-duckdb": "node scripts/copy-duckdb.mjs",
+    "postinstall": "npm run copy-pyodide && npm run copy-duckdb",
+    "predev": "npm run copy-pyodide && npm run copy-duckdb",
+    "prebuild": "npm run copy-pyodide && npm run copy-duckdb",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
     "@monaco-editor/react": "^4.7.0",
     "monaco-editor": "^0.55.1",
     "prop-types": "^15.8.1",

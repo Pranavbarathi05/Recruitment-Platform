@@ -693,7 +693,7 @@ def get_attempt_questions(
     if hands_ids:
         ho_resp = (
             supabase_client.table("hands_on_questions")
-            .select("id, title, description, difficulty, points, challenge_type, challenge_url")
+            .select("id, title, description, difficulty, points, challenge_type, challenge_url, schema_sql, dataset_json, starter_code, validation_spec")
             .in_("id", hands_ids)
             .execute()
         )
@@ -967,34 +967,53 @@ def submit_hands_on(
             status_code=409, detail="Challenge has already been submitted"
         )
 
-    # Load the challenge server-side. expected_flag is only ever read here.
+    # Load the challenge server-side.
     question_resp = (
         supabase_client.table("hands_on_questions")
-        .select("id, points, expected_flag")
+        .select("id, points, expected_flag, challenge_type")
         .eq("id", payload.question_id)
         .execute()
     )
     if not question_resp.data:
         raise HTTPException(status_code=404, detail="Challenge not found")
     question = question_resp.data[0]
-
-    submitted_flag = (payload.submitted_flag or "").strip()
-    expected_flag = (question.get("expected_flag") or "").strip()
-    verified = bool(expected_flag) and submitted_flag == expected_flag
+    challenge_type = question.get("challenge_type", "sql_injection_employee_portal")
     points = int(question.get("points", 0) or 0)
-    score = points if verified else 0
 
-    now = _utcnow().isoformat()
-    supabase_client.table("assessment_hands_on_results").insert({
-        "attempt_id": attempt_id,
-        "question_id": payload.question_id,
-        "submitted_input": payload.submitted_input or "",
-        "submitted_flag": submitted_flag,
-        "verified": verified,
-        "score": score,
-        "started_at": now,
-        "completed_at": now if verified else None,
-    }).execute()
+    if challenge_type in ("sql_wasm", "pandas_wasm"):
+        # WASM challenge: client-side validation has already run.
+        # The backend caps client_score at max points — it never re-executes.
+        client_score = payload.client_score or 0
+        score = min(client_score, points)
+        verified = score > 0
+        now = _utcnow().isoformat()
+        supabase_client.table("assessment_hands_on_results").insert({
+            "attempt_id": attempt_id,
+            "question_id": payload.question_id,
+            "submitted_input": payload.submitted_code or payload.submitted_input or "",
+            "submitted_flag": "",
+            "verified": verified,
+            "score": score,
+            "started_at": now,
+            "completed_at": now,
+        }).execute()
+    else:
+        # Traditional flag-based challenge
+        submitted_flag = (payload.submitted_flag or "").strip()
+        expected_flag = (question.get("expected_flag") or "").strip()
+        verified = bool(expected_flag) and submitted_flag == expected_flag
+        score = points if verified else 0
+        now = _utcnow().isoformat()
+        supabase_client.table("assessment_hands_on_results").insert({
+            "attempt_id": attempt_id,
+            "question_id": payload.question_id,
+            "submitted_input": payload.submitted_input or "",
+            "submitted_flag": submitted_flag,
+            "verified": verified,
+            "score": score,
+            "started_at": now,
+            "completed_at": now if verified else None,
+        }).execute()
 
     # Neutral ack only: no verified, no score, no points, no expected flag.
     return {"status": "submitted"}

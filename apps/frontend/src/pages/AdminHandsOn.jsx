@@ -5,28 +5,42 @@ import { useAuth } from '../hooks/useAuth';
 /**
  * Admin Hands-On Challenges Page
  *
- * Admin management for hands-on challenges (SQL injection micro-CTF).
+ * Admin management for hands-on challenges:
+ * - SQL Injection micro-CTF (existing)
+ * - SQL WASM (DuckDB-WASM, browser-local execution)
+ * - Pandas WASM (Pyodide, browser-local execution)
+ *
  * Features:
  * - Create/edit/delete challenges
- * - Fixed challenge type registry (no arbitrary execution config)
+ * - Fixed challenge type registry
  * - Difficulty + points configuration
- * - Expected flag configuration (admin-only secret)
+ * - Expected flag (CTF) or validation spec (WASM)
  * - Multi-domain assignment
  */
 
-const CHALLENGE_TYPES = [{ value: 'sql_injection_employee_portal', label: 'SQL Injection — Employee Portal' }];
+const CHALLENGE_TYPES = [
+  { value: 'sql_injection_employee_portal', label: 'SQL Injection — Employee Portal' },
+  { value: 'sql_wasm', label: 'SQL WASM (DuckDB, browser-local)' },
+  { value: 'pandas_wasm', label: 'Pandas WASM (Pyodide, browser-local)' },
+];
 const DIFFICULTIES = ['easy', 'medium', 'hard'];
 
 const EMPTY_FORM = {
   title: '',
   description: '',
   domain_ids: [],
-  challenge_type: 'sql_injection_employee_portal',
+  challenge_type: 'sql_wasm',
   difficulty: 'medium',
   points: 100,
   challenge_url: '',
   expected_flag: '',
   is_active: true,
+  // WASM fields
+  schema_sql: '',
+  dataset_json_text: '',
+  starter_code: '',
+  validation_spec_text: '',
+  expected_answer: '',
 };
 
 const AdminHandsOn = () => {
@@ -45,6 +59,8 @@ const AdminHandsOn = () => {
   const [message, setMessage] = useState('');
 
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+  const isWasmType = form.challenge_type === 'sql_wasm' || form.challenge_type === 'pandas_wasm';
 
   // Admin check
   useEffect(() => {
@@ -97,11 +113,7 @@ const AdminHandsOn = () => {
 
   useEffect(() => {
     if (isAdmin) {
-      // Async fetches — setState happens after await, never synchronously.
-      // Same pattern as AdminDescriptive.jsx.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchDomains();
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       fetchQuestions();
     }
   }, [isAdmin, fetchDomains, fetchQuestions]);
@@ -116,10 +128,39 @@ const AdminHandsOn = () => {
         challenge_type: form.challenge_type,
         difficulty: form.difficulty,
         points: parseInt(form.points, 10) || 100,
-        challenge_url: form.challenge_url,
-        expected_flag: form.expected_flag.trim(),
         is_active: form.is_active,
       };
+
+      if (isWasmType) {
+        // WASM challenges: dataset and validation_spec are required
+        let datasetJson = null;
+        let validationSpec = null;
+        try {
+          datasetJson = form.dataset_json_text.trim() ? JSON.parse(form.dataset_json_text) : null;
+        } catch {
+          setMessage('Error: Invalid JSON in Dataset JSON');
+          return;
+        }
+        try {
+          validationSpec = form.validation_spec_text.trim() ? JSON.parse(form.validation_spec_text) : null;
+        } catch {
+          setMessage('Error: Invalid JSON in Validation Spec');
+          return;
+        }
+
+        payload.schema_sql = form.schema_sql || null;
+        payload.dataset_json = datasetJson;
+        payload.starter_code = form.starter_code || null;
+        payload.validation_spec = validationSpec;
+        payload.expected_answer = form.expected_answer || null;
+        // WASM types don't use challenge_url or expected_flag
+        payload.challenge_url = '';
+        payload.expected_flag = '';
+      } else {
+        // CTF challenge: challenge_url and expected_flag are required
+        payload.challenge_url = form.challenge_url;
+        payload.expected_flag = form.expected_flag.trim();
+      }
 
       const isEditing = !!editingQuestion;
       const url = isEditing
@@ -181,6 +222,11 @@ const AdminHandsOn = () => {
       challenge_url: q.challenge_url || '',
       expected_flag: q.expected_flag || '',
       is_active: q.is_active,
+      schema_sql: q.schema_sql || '',
+      dataset_json_text: q.dataset_json ? JSON.stringify(q.dataset_json, null, 2) : '',
+      starter_code: q.starter_code || '',
+      validation_spec_text: q.validation_spec ? JSON.stringify(q.validation_spec, null, 2) : '',
+      expected_answer: q.expected_answer || '',
     });
     setShowForm(true);
   };
@@ -246,6 +292,7 @@ const AdminHandsOn = () => {
                   <div className="flex flex-wrap gap-1 mt-2">
                     <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
                     <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
+                    <span className="text-xs px-2 py-0.5 bg-orange-900/50 text-orange-300 rounded">{q.challenge_type}</span>
                     {(q.domain_names || []).map((name, i) => (
                       <span key={i} className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{name}</span>
                     ))}
@@ -273,7 +320,7 @@ const AdminHandsOn = () => {
                     onChange={(e) => setForm({ ...form, title: e.target.value })}
                     required
                     className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                    placeholder="e.g. SQL Injection — Employee Portal"
+                    placeholder="e.g. Employee Analytics — SQL"
                   />
                 </div>
 
@@ -285,7 +332,7 @@ const AdminHandsOn = () => {
                     required
                     rows={4}
                     className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                    placeholder="Describe the objective without revealing the payload..."
+                    placeholder="Describe the objective..."
                   />
                 </div>
 
@@ -316,43 +363,127 @@ const AdminHandsOn = () => {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Points</label>
-                    <input
-                      type="number"
-                      min="0"
-                      max="1000"
-                      value={form.points}
-                      onChange={(e) => setForm({ ...form, points: e.target.value })}
-                      className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-theme-primary mb-1">Challenge URL *</label>
-                    <input
-                      value={form.challenge_url}
-                      onChange={(e) => setForm({ ...form, challenge_url: e.target.value })}
-                      required
-                      className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
-                      placeholder="/challenge/ (served via the Gateway)"
-                    />
-                  </div>
+                <div>
+                  <label className="block text-sm font-medium text-theme-primary mb-1">Points</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="1000"
+                    value={form.points}
+                    onChange={(e) => setForm({ ...form, points: e.target.value })}
+                    className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                  />
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-theme-primary mb-1">Expected Flag * (admin-only secret)</label>
-                  <input
-                    value={form.expected_flag}
-                    onChange={(e) => setForm({ ...form, expected_flag: e.target.value })}
-                    required
-                    className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
-                    placeholder="FLAG{...}"
-                  />
-                  <p className="text-xs text-theme-muted mt-1">
-                    Stored server-side only. Never sent to candidates — their submission is compared against this value.
-                  </p>
-                </div>
+                {/* CTF-only fields */}
+                {!isWasmType && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-theme-primary mb-1">Challenge URL *</label>
+                      <input
+                        value={form.challenge_url}
+                        onChange={(e) => setForm({ ...form, challenge_url: e.target.value })}
+                        required
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm"
+                        placeholder="/challenge/ (served via the Gateway)"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-theme-primary mb-1">Expected Flag * (admin-only secret)</label>
+                      <input
+                        value={form.expected_flag}
+                        onChange={(e) => setForm({ ...form, expected_flag: e.target.value })}
+                        required
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
+                        placeholder="FLAG{...}"
+                      />
+                      <p className="text-xs text-theme-muted mt-1">
+                        Stored server-side only. Never sent to candidates.
+                      </p>
+                    </div>
+                  </>
+                )}
+
+                {/* WASM-only fields */}
+                {isWasmType && (
+                  <>
+                    <div className="bg-blue-900/20 border border-blue-500/30 rounded-lg p-3 text-xs text-blue-300">
+                      Browser-local execution: {form.challenge_type === 'sql_wasm' ? 'DuckDB-WASM' : 'Pyodide + Pandas'}. No server-side execution.
+                    </div>
+
+                    {form.challenge_type === 'sql_wasm' && (
+                      <div>
+                        <label className="block text-sm font-medium text-theme-primary mb-1">Schema SQL (CREATE TABLE statements)</label>
+                        <textarea
+                          value={form.schema_sql}
+                          onChange={(e) => setForm({ ...form, schema_sql: e.target.value })}
+                          rows={5}
+                          className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
+                          placeholder={'CREATE TABLE employees (\n  id INTEGER,\n  name VARCHAR,\n  department VARCHAR,\n  salary DOUBLE\n);'}
+                        />
+                      </div>
+                    )}
+
+                    <div>
+                      <label className="block text-sm font-medium text-theme-primary mb-1">Dataset JSON * ({form.challenge_type === 'sql_wasm' ? 'table, columns, rows' : 'name, columns, data'})</label>
+                      <textarea
+                        value={form.dataset_json_text}
+                        onChange={(e) => setForm({ ...form, dataset_json_text: e.target.value })}
+                        rows={8}
+                        required
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
+                        placeholder={form.challenge_type === 'sql_wasm'
+                          ? '[{"table": "employees", "columns": ["id", "name", "department", "salary"], "rows": [[1, "Alice", "Engineering", 80000]]}]'
+                          : '[{"name": "df", "columns": ["name", "department", "salary"], "data": [["Alice", "Engineering", 80000]]}]'
+                        }
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-theme-primary mb-1">Starter Code</label>
+                      <textarea
+                        value={form.starter_code}
+                        onChange={(e) => setForm({ ...form, starter_code: e.target.value })}
+                        rows={5}
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
+                        placeholder={form.challenge_type === 'sql_wasm'
+                          ? 'SELECT department, AVG(salary) as avg_salary\nFROM employees\nGROUP BY department;'
+                          : 'result = df.groupby("department")["salary"].mean().reset_index()'
+                        }
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-theme-primary mb-1">Validation Spec JSON *</label>
+                      <textarea
+                        value={form.validation_spec_text}
+                        onChange={(e) => setForm({ ...form, validation_spec_text: e.target.value })}
+                        rows={8}
+                        required
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
+                        placeholder={form.challenge_type === 'sql_wasm'
+                          ? '{"expected_columns": ["department", "avg_salary"], "expected_rows": [["Engineering", 75000.0]], "order_sensitive": false, "numeric_tolerance": 1.0}'
+                          : '{"expected_columns": ["department", "salary"], "expected_values": [["Engineering", 75000.0]], "order_sensitive": false, "numeric_tolerance": 1.0}'
+                        }
+                      />
+                      <p className="text-xs text-theme-muted mt-1">
+                        Determines client-side scoring. Fields: expected_columns, expected_rows/values, expected_shape, order_sensitive, numeric_tolerance, expect_error.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-theme-primary mb-1">Expected Answer (admin-only, never sent to candidate)</label>
+                      <textarea
+                        value={form.expected_answer}
+                        onChange={(e) => setForm({ ...form, expected_answer: e.target.value })}
+                        rows={3}
+                        className="w-full px-3 py-2 bg-theme-input border border-theme-secondary rounded text-theme-primary text-sm font-mono"
+                        placeholder="Reference answer for admin review"
+                      />
+                    </div>
+                  </>
+                )}
 
                 {/* Domain Selection */}
                 <div>
@@ -416,11 +547,27 @@ const AdminHandsOn = () => {
                   <span className="text-theme-primary capitalize">{selectedQuestion.difficulty}</span>
                   <span className="text-theme-muted">Points:</span>
                   <span className="text-theme-primary">{selectedQuestion.points}</span>
-                  <span className="text-theme-muted">Challenge URL:</span>
-                  <span className="text-theme-primary font-mono break-all">{selectedQuestion.challenge_url}</span>
-                  <span className="text-theme-muted">Expected flag:</span>
-                  <span className="text-theme-primary font-mono break-all">{selectedQuestion.expected_flag}</span>
+                  {selectedQuestion.challenge_url && (
+                    <>
+                      <span className="text-theme-muted">Challenge URL:</span>
+                      <span className="text-theme-primary font-mono break-all">{selectedQuestion.challenge_url}</span>
+                    </>
+                  )}
+                  {selectedQuestion.expected_flag && (
+                    <>
+                      <span className="text-theme-muted">Expected flag:</span>
+                      <span className="text-theme-primary font-mono break-all">{selectedQuestion.expected_flag}</span>
+                    </>
+                  )}
                 </div>
+                {selectedQuestion.dataset_json && (
+                  <div className="mb-2">
+                    <span className="text-theme-muted text-sm">Dataset:</span>
+                    <pre className="text-xs text-theme-primary bg-theme-primary p-2 rounded mt-1 overflow-auto max-h-40 font-mono">
+                      {JSON.stringify(selectedQuestion.dataset_json, null, 2)}
+                    </pre>
+                  </div>
+                )}
                 <div className="flex flex-wrap gap-1 mb-2">
                   {(selectedQuestion.domain_names || []).map((name, i) => (
                     <span key={i} className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{name}</span>

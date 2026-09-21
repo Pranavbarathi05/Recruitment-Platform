@@ -3,6 +3,8 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import CodeEditor from '../components/CodeEditor';
 import TestResultsPanel from '../components/TestResultsPanel';
+import SqlWasmChallenge from '../components/SqlWasmChallenge';
+import PandasWasmChallenge from '../components/PandasWasmChallenge';
 import { runCodeLocally, isClientRunnable } from '../execution/runner';
 import { generatePythonStarterCode } from '../utils/codingStarterCode';
 import { countWords, limitToWords } from '../utils/wordLimit';
@@ -435,10 +437,16 @@ const AssessmentWorkspace = () => {
   // One submission per challenge: the backend rejects a second PUT with 409
   // and returns a neutral ack (never verified/score), so the candidate is
   // not told whether their flag was correct.
-  const submitHandsOn = useCallback(async (questionId, submittedInput, submittedFlag) => {
+  const submitHandsOn = useCallback(async (questionId, submittedInput, submittedFlag, clientScore) => {
+    const body = { question_id: questionId, submitted_input: submittedInput, submitted_flag: submittedFlag };
+    // WASM challenges send client_score; the backend caps it at max points.
+    if (clientScore !== undefined && clientScore !== null) {
+      body.client_score = clientScore;
+      body.submitted_code = submittedInput;
+    }
     const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/hands-on`, {
       method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
-      body: JSON.stringify({ question_id: questionId, submitted_input: submittedInput, submitted_flag: submittedFlag }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.status === 409) {
@@ -935,6 +943,7 @@ function HandsOnSection({ questions, results, onSubmit }) {
   const q = questions[0];
   const result = q ? results[q.id] : undefined;
 
+  // For CTF challenges
   const [sqlInput, setSqlInput] = useState(result?.submitted_input || '');
   const [flagInput, setFlagInput] = useState(result?.submitted_flag || '');
   const [submitting, setSubmitting] = useState(false);
@@ -952,6 +961,69 @@ function HandsOnSection({ questions, results, onSubmit }) {
     );
   }
 
+  // WASM challenge types: delegate to specialized components
+  const challengeType = q.challenge_type;
+  if (challengeType === 'sql_wasm') {
+    return (
+      <div className="h-full flex flex-col">
+        {/* Challenge header */}
+        <div className="shrink-0 bg-theme-secondary px-6 py-3 border-b border-theme-border">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-bold text-theme-primary">{q.title}</h2>
+            <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
+            <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
+            <span className="text-xs px-2 py-0.5 bg-orange-900/50 text-orange-300 rounded">SQL WASM</span>
+            {submitted && <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>}
+          </div>
+          <p className="text-theme-muted text-sm mt-1 line-clamp-2">{q.description}</p>
+        </div>
+        {/* Editor + Runner */}
+        <div className="flex-1 min-h-0">
+          <SqlWasmChallenge
+            problem={q}
+            onSubmit={async ({ questionId, submittedCode, clientScore }) => {
+              await onSubmit(questionId, submittedCode, '', clientScore);
+              submittedRef.current = true;
+              setSubmitted(true);
+            }}
+            submitted={submitted}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (challengeType === 'pandas_wasm') {
+    return (
+      <div className="h-full flex flex-col">
+        {/* Challenge header */}
+        <div className="shrink-0 bg-theme-secondary px-6 py-3 border-b border-theme-border">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-bold text-theme-primary">{q.title}</h2>
+            <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
+            <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
+            <span className="text-xs px-2 py-0.5 bg-orange-900/50 text-orange-300 rounded">Pandas WASM</span>
+            {submitted && <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>}
+          </div>
+          <p className="text-theme-muted text-sm mt-1 line-clamp-2">{q.description}</p>
+        </div>
+        {/* Editor + Runner */}
+        <div className="flex-1 min-h-0">
+          <PandasWasmChallenge
+            problem={q}
+            onSubmit={async ({ questionId, submittedCode, clientScore }) => {
+              await onSubmit(questionId, submittedCode, '', clientScore);
+              submittedRef.current = true;
+              setSubmitted(true);
+            }}
+            submitted={submitted}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // Default: CTF challenge (sql_injection_employee_portal)
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (submitting || submittedRef.current) return;

@@ -132,12 +132,18 @@ class DescriptiveAnswerSaveRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Hands-On challenges (SQL injection micro-CTF)
+# Hands-On challenges (SQL injection micro-CTF + WASM browser-local)
 # ---------------------------------------------------------------------------
 
 # Fixed challenge-type registry — mirrors the DB CHECK constraint in
-# migration 012. There is deliberately no arbitrary-execution type.
-HANDS_ON_CHALLENGE_TYPES = ["sql_injection_employee_portal"]
+# migration 012/020.
+# DEV-ONLY additions: sql_wasm and pandas_wasm run entirely in the browser
+# (DuckDB-WASM / Pyodide) with NO Judge0 involvement.
+HANDS_ON_CHALLENGE_TYPES = [
+    "sql_injection_employee_portal",
+    "sql_wasm",
+    "pandas_wasm",
+]
 HANDS_ON_DIFFICULTIES = ["easy", "medium", "hard"]
 
 
@@ -148,15 +154,30 @@ class HandsOnCreate(BaseModel):
     challenge_type: str = Field(default="sql_injection_employee_portal")
     difficulty: str = Field(default="medium")
     points: int = Field(default=100, ge=0, le=1000)
-    challenge_url: str = Field(..., min_length=1)
-    expected_flag: str = Field(..., min_length=1, max_length=500)
+    challenge_url: str = Field(default="")
+    expected_flag: str = Field(default="")
     is_active: bool = True
+
+    # WASM challenge fields (sql_wasm / pandas_wasm only)
+    # Stored as JSONB in the database; candidates receive these to
+    # bootstrap the browser-local runtime.
+    schema_sql: Optional[str] = Field(None, description="SQL DDL to create tables")
+    dataset_json: Optional[dict] = Field(None, description="Dataset as {table, columns, rows}")
+    starter_code: Optional[str] = Field(None, description="Starter code for the candidate")
+    validation_spec: Optional[dict] = Field(None, description="Client-side validation spec")
+    expected_answer: Optional[str] = Field(None, description="Reference answer (admin-only, never sent to candidate)")
 
     def model_post_init(self, __context):
         if self.challenge_type not in HANDS_ON_CHALLENGE_TYPES:
             raise ValueError(f"challenge_type must be one of {HANDS_ON_CHALLENGE_TYPES}")
         if self.difficulty not in HANDS_ON_DIFFICULTIES:
             raise ValueError(f"difficulty must be one of {HANDS_ON_DIFFICULTIES}")
+        # WASM types require dataset and validation_spec
+        if self.challenge_type in ("sql_wasm", "pandas_wasm"):
+            if not self.dataset_json:
+                raise ValueError("dataset_json is required for WASM challenge types")
+            if not self.validation_spec:
+                raise ValueError("validation_spec is required for WASM challenge types")
 
 
 class HandsOnUpdate(BaseModel):
@@ -166,9 +187,16 @@ class HandsOnUpdate(BaseModel):
     challenge_type: Optional[str] = None
     difficulty: Optional[str] = None
     points: Optional[int] = Field(None, ge=0, le=1000)
-    challenge_url: Optional[str] = Field(None, min_length=1)
-    expected_flag: Optional[str] = Field(None, min_length=1, max_length=500)
+    challenge_url: Optional[str] = Field(None)
+    expected_flag: Optional[str] = Field(None, max_length=500)
     is_active: Optional[bool] = None
+
+    # WASM challenge fields
+    schema_sql: Optional[str] = None
+    dataset_json: Optional[dict] = None
+    starter_code: Optional[str] = None
+    validation_spec: Optional[dict] = None
+    expected_answer: Optional[str] = None
 
     def model_post_init(self, __context):
         if self.challenge_type is not None and self.challenge_type not in HANDS_ON_CHALLENGE_TYPES:
@@ -180,13 +208,23 @@ class HandsOnUpdate(BaseModel):
 class HandsOnSubmitRequest(BaseModel):
     """Candidate submission for a Hands-On challenge.
 
-    submitted_input (the SQL payload) is stored verbatim as evidence and is
-    never parsed, executed or verified. submitted_flag is the only field
-    checked server-side.
+    For sql_injection_employee_portal:
+      submitted_input (the SQL payload) is stored verbatim as evidence.
+      submitted_flag is the only field checked server-side.
+
+    For sql_wasm / pandas_wasm:
+      submitted_code is the candidate's code, stored for auditing.
+      client_score is the score computed by the browser-side validator.
+      The backend caps client_score at the question's maximum points
+      and never re-executes the code.
     """
     question_id: str
     submitted_input: str = Field(default="", max_length=20_000)
     submitted_flag: str = Field(default="", max_length=500)
+    submitted_code: Optional[str] = Field(None, max_length=50_000,
+        description="Candidate code for WASM challenges (sql_wasm/pandas_wasm)")
+    client_score: Optional[int] = Field(None, ge=0,
+        description="Score computed client-side by the WASM validator")
 
 
 # ---------------------------------------------------------------------------
