@@ -184,7 +184,7 @@ import io
             const isDf = this._pyodide.runPython(
               `isinstance(result, pd.DataFrame)`,
               { globals: this._globals }
-            ).toJs();
+            );
 
             if (isDf) {
               // Convert DataFrame to JSON

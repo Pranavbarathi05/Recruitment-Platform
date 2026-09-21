@@ -219,8 +219,9 @@ export class SqlWasmRunner {
             if (typeof v === 'number' && !Number.isFinite(v)) return null;
             return v;
           });
-          await stmt.bind(params);
-          await stmt.execute();
+          // duckdb-wasm's AsyncPreparedStatement exposes query()/send(), not
+          // bind()/execute(). query(...params) binds and executes in one step.
+          await stmt.query(...params);
         }
         await stmt.close();
       }
