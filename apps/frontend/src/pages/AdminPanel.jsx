@@ -403,19 +403,40 @@ const AdminPanel = () => {
     }
   };
 
+  // Read an error body defensively: FastAPI returns JSON {"detail": ...} for
+  // HTTPException, but a proxy/gateway or a crash can return plain text or an
+  // empty body. Never let parsing the error itself hide the failure.
+  const readErrorDetail = async (resp, fallback) => {
+    try {
+      const data = await resp.json();
+      if (typeof data?.detail === 'string') return data.detail;
+      if (Array.isArray(data?.detail)) return data.detail.map((d) => d.msg || d).join(', ');
+      if (typeof data?.message === 'string') return data.message;
+    } catch {
+      try {
+        const text = await resp.text();
+        if (text) return text;
+      } catch { /* ignore */ }
+    }
+    return fallback;
+  };
+
   const handleDeleteMcq = async (mcqId) => {
-    if (!confirm('Delete this MCQ? This cannot be undone if the question has been used in an attempt.')) return;
+    if (!confirm('Delete this MCQ? Questions already used in an assessment cannot be deleted — deactivate them instead.')) return;
     try {
       const resp = await fetch(`${apiUrl}/admin/mcqs/${mcqId}`, { method: 'DELETE', headers: getAuthHeaders(), credentials: 'include' });
       if (!resp.ok) {
-        const err = await resp.json();
-        setMessage(`Error: ${err.detail}`);
+        const detail = await readErrorDetail(resp, `Could not delete the question (${resp.status}).`);
+        // Surface the backend's explanation (e.g. the 409 "already used in an
+        // assessment" conflict) instead of failing silently.
+        setMessage(`Error: ${detail}`);
       } else {
         setMessage('MCQ deleted');
+        // Only refresh on success so the deleted question actually disappears.
+        fetchMcqs(selectedDomain.id, semesterFilter);
       }
-      fetchMcqs(selectedDomain.id, semesterFilter);
     } catch (err) {
-      console.error(err);
+      setMessage(`Error: ${err.message || 'Could not delete the question. Please try again.'}`);
     }
   };
 

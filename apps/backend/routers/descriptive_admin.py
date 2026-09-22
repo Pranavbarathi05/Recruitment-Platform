@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from core.auth import require_admin, AuthUser
-from core.supabase import supabase_client
+from core.supabase import is_foreign_key_violation, supabase_client
 from schemas.assessment import DescriptiveCreate, DescriptiveUpdate
+import json
 import uuid
 import os
 
@@ -9,6 +10,32 @@ router = APIRouter(prefix="/admin/descriptive-questions", tags=["Admin Descripti
 
 ALLOWED_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+# Shared message for both the pre-check and the foreign-key fallback so the
+# admin always gets the same, actionable explanation.
+_DESCRIPTIVE_IN_USE_DETAIL = (
+    "Cannot delete: question is referenced by existing attempts. "
+    "Use deactivation instead."
+)
+
+
+def _descriptive_referenced_by_attempt(question_id: str) -> bool:
+    """Return True if any assessment attempt froze this question in its selection.
+
+    ``selected_descriptive_question_ids`` is a JSONB array of UUID strings.
+    ``.contains`` with a Python list serialises to PostgreSQL array syntax
+    (``cs.{uuid}``), which PostgREST cannot parse as JSON for a JSONB column —
+    the filter either errors or silently matches nothing. Passing an explicit
+    JSON string keeps the containment operator unambiguous (``cs.["uuid"]``).
+    """
+    attempts = (
+        supabase_client.table("assessment_attempts")
+        .select("id")
+        .filter("selected_descriptive_question_ids", "cs", json.dumps([question_id]))
+        .limit(1)
+        .execute()
+    )
+    return bool(attempts.data)
 
 
 def _enrich_domain_names(questions: list) -> list:
@@ -155,7 +182,12 @@ def delete_descriptive_question(
     question_id: str,
     admin: AuthUser = Depends(require_admin),
 ):
-    """Delete a descriptive question. Admin only."""
+    """Delete a descriptive question. Admin only.
+
+    An unused question is removed. A question referenced by any existing
+    (frozen or in-progress) assessment attempt is protected and rejected with a
+    409 so historical attempt data is never broken; deactivate it instead.
+    """
     try:
         existing = (
             supabase_client.table("descriptive_questions")
@@ -167,20 +199,24 @@ def delete_descriptive_question(
             raise HTTPException(status_code=404, detail="Descriptive question not found")
 
         # Check if referenced by any assessment attempt
-        attempts = (
-            supabase_client.table("assessment_attempts")
-            .select("id")
-            .contains("selected_descriptive_question_ids", [question_id])
-            .limit(1)
-            .execute()
-        )
-        if attempts.data:
-            raise HTTPException(
-                status_code=409,
-                detail="Cannot delete: question is referenced by existing attempts. Use deactivation instead.",
-            )
+        if _descriptive_referenced_by_attempt(question_id):
+            raise HTTPException(status_code=409, detail=_DESCRIPTIVE_IN_USE_DETAIL)
 
-        supabase_client.table("descriptive_questions").delete().eq("id", question_id).execute()
+        try:
+            (
+                supabase_client.table("descriptive_questions")
+                .delete()
+                .eq("id", question_id)
+                .execute()
+            )
+        except Exception as delete_exc:
+            # The assessment_descriptive_answers FK (ON DELETE RESTRICT) is the
+            # ultimate data-integrity guard. If the pre-check missed a reference
+            # (e.g. an answer row left behind without a matching selection),
+            # surface the same friendly conflict instead of a raw 500.
+            if is_foreign_key_violation(delete_exc):
+                raise HTTPException(status_code=409, detail=_DESCRIPTIVE_IN_USE_DETAIL)
+            raise
         return {"status": "deleted"}
     except HTTPException:
         raise

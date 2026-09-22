@@ -32,12 +32,32 @@ function loadMonacoSetup() {
   return monacoSetupPromise;
 }
 
+/**
+ * Monaco defaults. Callers may override any of them through `options` — the
+ * WASM challenges, for example, pass `{ readOnly: submitted }` so a submitted
+ * challenge cannot be edited. A `height` prop is accepted for symmetry with
+ * the wrapper div; the editor always fills its container.
+ */
+const DEFAULT_EDITOR_OPTIONS = {
+  minimap: { enabled: false },
+  fontSize: 14,
+  fontFamily: "'Fira Code', 'Courier New', monospace",
+  lineNumbers: 'on',
+  scrollBeyondLastLine: false,
+  automaticLayout: true,
+  tabSize: 4,
+  insertSpaces: true,
+  wordWrap: 'on',
+};
+
 function CodeEditor({
   language = 'python',
   theme = 'vs-dark',
   value = '',
   onChange,
   className = '',
+  height = '100%',
+  options = null,
 }) {
   const [monacoReady, setMonacoReady] = useState(false);
 
@@ -67,22 +87,12 @@ function CodeEditor({
   return (
     <div className={`code-editor-container h-full ${className}`}>
       <Editor
-        height="100%"
+        height={height}
         language={language}
         theme={theme}
         value={value}
         onChange={handleChange}
-        options={{
-          minimap: { enabled: false },
-          fontSize: 14,
-          fontFamily: "'Fira Code', 'Courier New', monospace",
-          lineNumbers: 'on',
-          scrollBeyondLastLine: false,
-          automaticLayout: true,
-          tabSize: 4,
-          insertSpaces: true,
-          wordWrap: 'on',
-        }}
+        options={{ ...DEFAULT_EDITOR_OPTIONS, ...(options || {}) }}
       />
     </div>
   );
@@ -94,6 +104,8 @@ CodeEditor.propTypes = {
   value: PropTypes.string,
   onChange: PropTypes.func,
   className: PropTypes.string,
+  height: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+  options: PropTypes.object,
 };
 
 export default CodeEditor;

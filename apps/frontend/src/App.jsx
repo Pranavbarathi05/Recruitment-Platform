@@ -1,9 +1,39 @@
 import { useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, useLocation } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import { Navbar } from './components';
 import ProtectedRoute from './components/ProtectedRoute';
 import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, SubmissionConfirmed, AdminPanel, AdminResults, AdminCoding, AdminDescriptive, AdminHandsOn, AdminModules, Instructions } from './pages';
+
+/**
+ * The live assessment workspace (/assessment/:attemptId) is a viewport-locked
+ * IDE: it owns its scrolling and sizes Monaco with `h-full`.
+ *
+ * Percentage heights only resolve against a *definite* containing block. With
+ * the usual `min-h-screen` shell (height: auto, min-height: 100vh) every
+ * `height: 100%` inside it computes to `auto`, so the editor containers
+ * collapsed — the WASM/Pandas editor rendered ~5px tall (looked blank) and the
+ * coding editor grew to its content height and blew the page up. Locking the
+ * shell to the viewport for this route only restores the definite chain;
+ * every other route keeps the document-scrolling `min-h-screen` shell.
+ */
+const ASSESSMENT_WORKSPACE_PATH = /^\/assessment\/[^/]+\/?$/;
+
+function AppShell({ children }) {
+  const { pathname } = useLocation();
+  const viewportLocked = ASSESSMENT_WORKSPACE_PATH.test(pathname);
+
+  return (
+    <div
+      className={`flex flex-col bg-theme-primary text-theme-primary ${
+        viewportLocked ? 'h-screen overflow-hidden' : 'min-h-screen'
+      }`}
+    >
+      <Navbar />
+      <main className="flex-1 min-h-0 flex flex-col">{children}</main>
+    </div>
+  );
+}
 
 /**
  * Main App Component
@@ -31,10 +61,8 @@ function App() {
   return (
     <AuthProvider>
       <Router>
-        <div className="flex flex-col min-h-screen bg-theme-primary text-theme-primary">
-          <Navbar />
-          <main className="flex-1 min-h-0 flex flex-col">
-            <Routes>
+        <AppShell>
+          <Routes>
               <Route path="/" element={<Landing />} />
               <Route path="/login" element={<Login />} />
               <Route path="/signup" element={<Signup />} />
@@ -128,9 +156,8 @@ function App() {
                 }
               />
               <Route path="/instructions" element={<Instructions />} />
-            </Routes>
-          </main>
-        </div>
+          </Routes>
+        </AppShell>
       </Router>
     </AuthProvider>
   );

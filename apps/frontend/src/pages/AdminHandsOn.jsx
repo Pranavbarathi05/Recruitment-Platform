@@ -62,6 +62,39 @@ const AdminHandsOn = () => {
 
   const isWasmType = form.challenge_type === 'sql_wasm' || form.challenge_type === 'pandas_wasm';
 
+  // Read an error body defensively. FastAPI returns {"detail": "..."} for a
+  // raised HTTPException but {"detail": [{loc, msg, ...}]} for a 422 body
+  // validation error. Interpolating that array printed "[object Object]" and
+  // hid the real reason the save was rejected, so flatten it into a readable
+  // message. A proxy/gateway or a crash can also return plain text or an empty
+  // body — never let parsing the error itself hide the failure.
+  const readErrorDetail = async (resp, fallback) => {
+    try {
+      const data = await resp.json();
+      if (typeof data?.detail === 'string') return data.detail;
+      if (Array.isArray(data?.detail)) {
+        const parts = data.detail.map((d) => {
+          const field = Array.isArray(d?.loc)
+            ? d.loc.filter((p) => p !== 'body').join('.')
+            : '';
+          const msg = d?.msg || String(d);
+          return field ? `${field}: ${msg}` : msg;
+        });
+        if (parts.length) return parts.join('; ');
+      }
+      if (typeof data?.message === 'string') return data.message;
+      if (typeof data?.detail === 'object' && data.detail !== null) {
+        return JSON.stringify(data.detail);
+      }
+    } catch {
+      try {
+        const text = await resp.text();
+        if (text) return text;
+      } catch { /* ignore */ }
+    }
+    return fallback;
+  };
+
   // Admin check
   useEffect(() => {
     let cancelled = false;
@@ -179,13 +212,17 @@ const AdminHandsOn = () => {
         setShowForm(false);
         setEditingQuestion(null);
         setForm(EMPTY_FORM);
+        // Only refresh on success so the saved domain assignment is reflected.
         fetchQuestions();
       } else {
-        const err = await resp.json();
-        setMessage(`Error: ${err.detail || 'Failed to save challenge'}`);
+        const detail = await readErrorDetail(
+          resp,
+          `Failed to save challenge (${resp.status}).`,
+        );
+        setMessage(`Error: ${detail}`);
       }
     } catch (err) {
-      setMessage(`Error: ${err.message}`);
+      setMessage(`Error: ${err.message || 'Failed to save challenge. Please try again.'}`);
     }
   };
 
@@ -202,11 +239,11 @@ const AdminHandsOn = () => {
         setSelectedQuestion(null);
         fetchQuestions();
       } else {
-        const err = await resp.json();
-        setMessage(`Error: ${err.detail || 'Failed to delete'}`);
+        const detail = await readErrorDetail(resp, `Failed to delete (${resp.status}).`);
+        setMessage(`Error: ${detail}`);
       }
     } catch (err) {
-      setMessage(`Error: ${err.message}`);
+      setMessage(`Error: ${err.message || 'Failed to delete. Please try again.'}`);
     }
   };
 

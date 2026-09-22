@@ -274,6 +274,37 @@ const AssessmentWorkspace = () => {
   const autosaveTimerRef = useRef(null);
   const lastSavedRef = useRef({}); // { [problemId]: lastSavedCode }
 
+  // ========== FULLSCREEN PROCTORING ==========
+  // While the attempt is active the candidate must stay in fullscreen. Leaving
+  // it shows a blocking overlay with a 15-second countdown; hitting zero
+  // submits the attempt through the SAME authoritative submit path as the
+  // "Finish Assessment" button.
+  const [fullscreenExited, setFullscreenExited] = useState(false);
+  const [fullscreenSeconds, setFullscreenSeconds] = useState(15);
+  const [fullscreenError, setFullscreenError] = useState('');
+  const [restoringFullscreen, setRestoringFullscreen] = useState(false);
+
+  // Entry gate. Fullscreen is normally entered from the "Start Assessment"
+  // click (the only user activation available before this page renders). If
+  // the workspace could not inherit an active fullscreen session — deep link,
+  // page refresh, or a rejected start-time request — the candidate is asked
+  // for the gesture here instead of silently losing proctoring. The exit
+  // penalty below is only ever armed after fullscreen was genuinely entered.
+  const [fullscreenEntryRequired, setFullscreenEntryRequired] = useState(false);
+  const [fullscreenEntryError, setFullscreenEntryError] = useState('');
+  const [enteringFullscreen, setEnteringFullscreen] = useState(false);
+
+  // Single submission guard shared by the manual button, the existing duration
+  // timer and the fullscreen-timeout auto-submit.
+  const hasSubmittedRef = useRef(false);
+  const isSubmittingRef = useRef(false);
+  // Fullscreen bookkeeping (refs so event listeners and timers never go stale).
+  const fsEnteredRef = useRef(false);
+  const fsExitTimerRef = useRef(null);
+  const fsTimerRunningRef = useRef(false);
+  const assessmentActiveRef = useRef(false);
+  const submitRef = useRef(null);
+
   const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
   // ========== FETCH ATTEMPT DATA ==========
@@ -547,8 +578,12 @@ const AssessmentWorkspace = () => {
   };
 
   // ========== FINAL SUBMISSION ==========
+  // One guard for every submit trigger (manual, duration timer, fullscreen
+  // timeout). Refs — not state — so two triggers in the same tick can never
+  // both fire before a re-render.
   const handleSubmitAll = async () => {
-    if (submitting) return;
+    if (hasSubmittedRef.current || isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     setSubmitting(true);
     setSubmitError(null);
     try {
@@ -562,14 +597,176 @@ const AssessmentWorkspace = () => {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `Submission failed (${resp.status})`);
       }
+      // Finalized: stop proctoring and never submit again.
+      hasSubmittedRef.current = true;
+      assessmentActiveRef.current = false;
+      clearFullscreenTimer();
+      setFullscreenExited(false);
       navigate(`/assessment/${attemptId}/submitted`);
     } catch (err) {
       // NEVER navigate to the confirmation screen on a failed submit — the
       // attempt is NOT finalized and must stay resumable. Surface the error
       // and let the candidate retry; their answers are all still saved.
       setSubmitError(err.message || 'Submission failed. Please try again.');
+    } finally {
+      isSubmittingRef.current = false;
       setSubmitting(false);
     }
+  };
+
+  // Keep a ref to the latest submit function for listeners/timers declared
+  // before it (they run after render, so this is always current).
+  submitRef.current = handleSubmitAll;
+
+  // ========== FULLSCREEN LIFECYCLE ==========
+  const clearFullscreenTimer = useCallback(() => {
+    if (fsExitTimerRef.current !== null) {
+      clearInterval(fsExitTimerRef.current);
+      fsExitTimerRef.current = null;
+    }
+    fsTimerRunningRef.current = false;
+  }, []);
+
+  const requestFullscreen = useCallback(async () => {
+    const el = typeof document !== 'undefined' ? document.documentElement : null;
+    if (!el || typeof el.requestFullscreen !== 'function') return false;
+    // Mark the intent synchronously: a fullscreenchange for a genuine loss can
+    // arrive before the request promise settles. Cleared again on rejection.
+    fsEnteredRef.current = true;
+    try {
+      await el.requestFullscreen();
+      return true;
+    } catch {
+      // Browser policy (no user gesture), permission, or unsupported — treat
+      // as "could not enter" and never lock the candidate out.
+      fsEnteredRef.current = false;
+      return false;
+    }
+  }, []);
+
+  const startFullscreenTimer = useCallback((skipIfRunning = false) => {
+    if (skipIfRunning && fsTimerRunningRef.current) return;
+    // Prevent duplicate intervals across rerenders.
+    clearFullscreenTimer();
+    fsTimerRunningRef.current = true;
+    setFullscreenSeconds(15);
+    fsExitTimerRef.current = setInterval(() => {
+      setFullscreenSeconds((prev) => {
+        if (prev <= 1) {
+          if (fsExitTimerRef.current !== null) {
+            clearInterval(fsExitTimerRef.current);
+            fsExitTimerRef.current = null;
+          }
+          fsTimerRunningRef.current = false;
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [clearFullscreenTimer]);
+
+  const showFullscreenOverlay = useCallback(() => {
+    if (hasSubmittedRef.current) return;
+    setFullscreenError('');
+    setFullscreenExited(true);
+    startFullscreenTimer(true);
+  }, [startFullscreenTimer]);
+
+  // Watch fullscreen only while the attempt is genuinely active (in progress
+  // and not yet submitted/scored). A submitted attempt never fetches attempt
+  // data, so `assessmentActive` stays false and proctoring stays off.
+  const assessmentActive = !loading && !error && !!attemptData && !hasSubmittedRef.current;
+
+  useEffect(() => {
+    assessmentActiveRef.current = assessmentActive;
+    if (!assessmentActive || typeof document === 'undefined') return undefined;
+
+    // Do NOT call requestFullscreen() here: a mount-time request has no user
+    // activation and every browser rejects it. Fullscreen is requested from
+    // the "Start Assessment" click instead (pages/Domains.jsx) — this effect
+    // only adopts an already-active session or asks for a fresh gesture.
+    const el = document.documentElement;
+    const supported =
+      !!el && typeof el.requestFullscreen === 'function' && document.fullscreenEnabled !== false;
+
+    if (document.fullscreenElement) {
+      // Pre-existing protection from before the workspace mounted, e.g. the
+      // candidate refreshed the page while still in fullscreen.
+      fsEnteredRef.current = true;
+      setFullscreenEntryRequired(false);
+    } else if (supported && !fsEnteredRef.current) {
+      // No active session and no gesture yet: recovery (never a penalty).
+      setFullscreenEntryRequired(true);
+    }
+
+    const onFullscreenChange = () => {
+      if (!assessmentActiveRef.current || hasSubmittedRef.current) return;
+      if (document.fullscreenElement) {
+        fsEnteredRef.current = true;
+        clearFullscreenTimer();
+        setFullscreenExited(false);
+        setFullscreenError('');
+        setFullscreenEntryRequired(false);
+        setFullscreenEntryError('');
+      } else if (fsEnteredRef.current) {
+        showFullscreenOverlay();
+      }
+    };
+
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, [assessmentActive, requestFullscreen, clearFullscreenTimer, showFullscreenOverlay]);
+
+  // The countdown only runs while the overlay is up.
+  useEffect(() => {
+    if (!fullscreenExited) clearFullscreenTimer();
+  }, [fullscreenExited, clearFullscreenTimer]);
+
+  // Countdown reached zero: submit through the guarded path exactly once.
+  useEffect(() => {
+    if (fullscreenExited && fullscreenSeconds === 0) {
+      submitRef.current?.();
+    }
+  }, [fullscreenExited, fullscreenSeconds]);
+
+  // Unmount: drop listeners and timers, and release any fullscreen we hold.
+  useEffect(() => () => {
+    clearFullscreenTimer();
+    if (typeof document !== 'undefined' && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      try { document.exitFullscreen(); } catch { /* ignore */ }
+    }
+  }, [clearFullscreenTimer]);
+
+  const handleReturnToFullscreen = async () => {
+    if (restoringFullscreen) return;
+    setRestoringFullscreen(true);
+    setFullscreenError('');
+    const ok = await requestFullscreen();
+    if (ok) {
+      clearFullscreenTimer();
+      setFullscreenExited(false);
+      setFullscreenError('');
+    } else {
+      // Keep the overlay and the running countdown — do NOT reset the timer.
+      setFullscreenError('Fullscreen could not be restored. Please try again.');
+    }
+    setRestoringFullscreen(false);
+  };
+
+  // Entry gate action: this is a real user gesture, so requestFullscreen() is
+  // allowed. A rejection never starts the exit countdown — the candidate is
+  // simply asked again.
+  const handleEnterFullscreen = async () => {
+    if (enteringFullscreen) return;
+    setEnteringFullscreen(true);
+    setFullscreenEntryError('');
+    const ok = await requestFullscreen();
+    if (ok) {
+      setFullscreenEntryRequired(false);
+    } else {
+      setFullscreenEntryError('Fullscreen could not be enabled. Please try again.');
+    }
+    setEnteringFullscreen(false);
   };
 
   // ========== HELPERS ==========
@@ -603,10 +800,21 @@ const AssessmentWorkspace = () => {
   }
 
   const isWarning = timeRemaining <= 300 && timeRemaining > 0;
+  // The assessment is non-interactive while either fullscreen prompt is up.
+  const interactionLocked = fullscreenExited || fullscreenEntryRequired;
 
   return (
     /* ROOT: flex-1 fills remaining viewport after Navbar. No overflow on body. */
     <div className="flex-1 flex flex-col min-h-0 bg-theme-primary overflow-hidden">
+
+      {/* Everything below the overlay is made inert while the candidate is out
+          of fullscreen so pointer and keyboard interaction cannot reach the
+          test. `inert` also removes the subtree from the tab order. */}
+      <div
+        className={interactionLocked ? 'flex-1 flex flex-col min-h-0 pointer-events-none select-none' : 'flex-1 flex flex-col min-h-0'}
+        inert={interactionLocked ? true : undefined}
+        aria-hidden={interactionLocked ? true : undefined}
+      >
 
       {/* ===== ASSESSMENT HEADER — always visible, never scrolls ===== */}
       <div className="shrink-0 bg-theme-secondary border-b border-theme-border px-6 py-3 flex items-center justify-between z-10">
@@ -760,6 +968,25 @@ const AssessmentWorkspace = () => {
           />
         )}
       </div>
+      </div>
+
+      {fullscreenExited ? (
+        <FullscreenExitOverlay
+          seconds={fullscreenSeconds}
+          error={fullscreenError}
+          busy={restoringFullscreen}
+          submitError={submitError}
+          onReturn={handleReturnToFullscreen}
+        />
+      ) : fullscreenEntryRequired && (
+        <FullscreenEntryGate
+          error={fullscreenEntryError}
+          busy={enteringFullscreen}
+          showSkip={!!fullscreenEntryError}
+          onEnter={handleEnterFullscreen}
+          onSkip={() => setFullscreenEntryRequired(false)}
+        />
+      )}
     </div>
   );
 };
@@ -1292,6 +1519,110 @@ function CodingSection({
 
         {/* Test Results Panel — bottom of right pane, scrollable */}
         <TestResultsPanel runResults={runResults} />
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// FULLSCREEN-EXIT OVERLAY
+// A fixed, maximum z-index layer covering the whole viewport. It is
+// intentionally NOT dismissable by Escape, a backdrop click or any other
+// action — the only control is "Return to Fullscreen".
+// ============================================================
+
+function FullscreenEntryGate({ error, busy, showSkip, onEnter, onSkip }) {
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="Fullscreen Required"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/90 backdrop-blur-sm px-4"
+    >
+      <div className="w-full max-w-md bg-theme-secondary border border-theme-border rounded-2xl p-8 text-center shadow-2xl">
+        <h2 className="text-2xl font-bold text-theme-primary mb-3">Fullscreen Required</h2>
+        <p className="text-theme-secondary text-sm mb-6">
+          This assessment runs in fullscreen. Enter fullscreen to begin — the
+          assessment is paused until then.
+        </p>
+
+        <button
+          type="button"
+          onClick={onEnter}
+          disabled={busy}
+          className="w-full bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold disabled:opacity-50"
+        >
+          {busy ? 'Entering…' : 'Enter Fullscreen'}
+        </button>
+
+        {error && (
+          <p className="text-sm text-red-300 bg-red-900/30 border border-red-500/50 rounded px-3 py-2 mt-4">
+            {error}
+          </p>
+        )}
+
+        {/* Only offered after a request actually failed, so a browser that can
+            enter fullscreen never shows an escape hatch. */}
+        {showSkip && (
+          <button
+            type="button"
+            onClick={onSkip}
+            className="mt-4 text-xs text-theme-muted underline hover:text-theme-secondary"
+          >
+            Continue without fullscreen
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function FullscreenExitOverlay({ seconds, error, busy, submitError, onReturn }) {
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="Fullscreen Required"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/90 backdrop-blur-sm px-4"
+    >
+      <div className="w-full max-w-md bg-theme-secondary border border-theme-border rounded-2xl p-8 text-center shadow-2xl">
+        <h2 className="text-2xl font-bold text-theme-primary mb-3">Fullscreen Required</h2>
+        <p className="text-theme-secondary text-sm mb-6">
+          Please return to fullscreen mode to continue your assessment. The
+          assessment is paused until fullscreen is restored.
+        </p>
+
+        <p className="text-theme-muted text-xs uppercase tracking-wider mb-1">Time remaining</p>
+        <p
+          data-testid="fullscreen-countdown"
+          aria-live="polite"
+          className="text-5xl font-mono font-bold text-red-400 mb-6"
+        >
+          {seconds}
+        </p>
+
+        <button
+          type="button"
+          onClick={onReturn}
+          disabled={busy}
+          className="w-full bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold disabled:opacity-50"
+        >
+          {busy ? 'Returning…' : 'Return to Fullscreen'}
+        </button>
+
+        {error && (
+          <p className="text-sm text-red-300 bg-red-900/30 border border-red-500/50 rounded px-3 py-2 mt-4">
+            {error}
+          </p>
+        )}
+        {submitError && (
+          <p role="alert" className="text-sm text-red-300 bg-red-900/30 border border-red-500/50 rounded px-3 py-2 mt-4">
+            Submission failed: {submitError} — your attempt has NOT been finalized.
+            Return to fullscreen to retry.
+          </p>
+        )}
       </div>
     </div>
   );

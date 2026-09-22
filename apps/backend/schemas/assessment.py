@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Union
 
 # Valid semesters — matches the DB constraint CHECK (semester IN (1, 3, 5, 7))
 VALID_SEMESTERS = [1, 3, 5, 7]
@@ -146,6 +146,22 @@ HANDS_ON_CHALLENGE_TYPES = [
 ]
 HANDS_ON_DIFFICULTIES = ["easy", "medium", "hard"]
 
+# ``dataset_json`` is a JSONB column. The canonical shape is an ARRAY of table
+# specs, which is exactly what the browser-side DuckDB / Pyodide runners
+# consume:
+#   sql_wasm    -> [{"table": ..., "columns": [...], "rows": [[...]]}]
+#   pandas_wasm -> [{"name": ..., "columns": [...], "data": [[...]]}]
+# A raw SQL / Python bootstrap string is accepted too (the runners execute it
+# verbatim), as is a single table object. Declaring this as ``dict`` (the
+# original annotation) rejected the array form with a 422, so existing WASM
+# challenges could not be saved or assigned to a domain.
+HANDS_ON_DATASET_DESCRIPTION = (
+    "Dataset as an array of table specs: "
+    '[{"table": ..., "columns": [...], "rows": [[...]]}] '
+    '(sql_wasm) or [{"name": ..., "columns": [...], "data": [[...]]}] '
+    "(pandas_wasm). A raw SQL/Python bootstrap string is also accepted."
+)
+
 
 class HandsOnCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
@@ -162,7 +178,9 @@ class HandsOnCreate(BaseModel):
     # Stored as JSONB in the database; candidates receive these to
     # bootstrap the browser-local runtime.
     schema_sql: Optional[str] = Field(None, description="SQL DDL to create tables")
-    dataset_json: Optional[dict] = Field(None, description="Dataset as {table, columns, rows}")
+    dataset_json: Optional[Union[list, dict, str]] = Field(
+        None, description=HANDS_ON_DATASET_DESCRIPTION
+    )
     starter_code: Optional[str] = Field(None, description="Starter code for the candidate")
     validation_spec: Optional[dict] = Field(None, description="Client-side validation spec")
     expected_answer: Optional[str] = Field(None, description="Reference answer (admin-only, never sent to candidate)")
@@ -193,7 +211,9 @@ class HandsOnUpdate(BaseModel):
 
     # WASM challenge fields
     schema_sql: Optional[str] = None
-    dataset_json: Optional[dict] = None
+    dataset_json: Optional[Union[list, dict, str]] = Field(
+        None, description=HANDS_ON_DATASET_DESCRIPTION
+    )
     starter_code: Optional[str] = None
     validation_spec: Optional[dict] = None
     expected_answer: Optional[str] = None

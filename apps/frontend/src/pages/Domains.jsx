@@ -3,6 +3,32 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 
 /**
+ * Enter fullscreen from the "Start Assessment" click.
+ *
+ * The Fullscreen API only honours a request made from a transient user
+ * activation, so the assessment cannot enter fullscreen from a `useEffect`
+ * once /assessment/:attemptId has mounted — Chrome rejects that with
+ * "API can only be initiated by a user gesture". This click is the last
+ * gesture we get before the workspace takes over, so the request is fired
+ * synchronously here (never awaited: a rejection must not block the start
+ * flow) and the assessment workspace arms its exit penalty only once
+ * fullscreen has actually been entered.
+ */
+function requestAssessmentFullscreen() {
+  if (typeof document === 'undefined') return;
+  const el = document.documentElement;
+  if (!el || typeof el.requestFullscreen !== 'function' || document.fullscreenElement) return;
+  try {
+    const pending = el.requestFullscreen();
+    if (pending && typeof pending.catch === 'function') {
+      pending.catch(() => { /* browser policy/permission — handled gracefully downstream */ });
+    }
+  } catch {
+    /* unsupported — handled gracefully downstream */
+  }
+}
+
+/**
  * Domains Page
  *
  * Fetches active domains from the backend.
@@ -63,6 +89,9 @@ const Domains = () => {
 
     setStarting(true);
     setError(null);
+
+    // Must happen from this click (user activation), before the first await.
+    requestAssessmentFullscreen();
 
     try {
       const response = await fetch(`${apiUrl}/assessment/start`, {

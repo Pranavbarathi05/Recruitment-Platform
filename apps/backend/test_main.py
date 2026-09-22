@@ -4676,7 +4676,7 @@ class TestDescriptiveAdminCRUD:
         existing = _make_descriptive()
         mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = _make_mock_response([existing])
         # No attempts referencing this question
-        mock_sb.table.return_value.select.return_value.contains.return_value.limit.return_value.execute.return_value = _make_mock_response([])
+        mock_sb.table.return_value.select.return_value.filter.return_value.limit.return_value.execute.return_value = _make_mock_response([])
         mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = _make_mock_response([])
         from routers.descriptive_admin import delete_descriptive_question
         from core.auth import AuthUser
@@ -4691,7 +4691,7 @@ class TestDescriptiveAdminCRUD:
         existing = _make_descriptive()
         mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = _make_mock_response([existing])
         # Attempt references this question
-        mock_sb.table.return_value.select.return_value.contains.return_value.limit.return_value.execute.return_value = _make_mock_response([{"id": MOCK_ATTEMPT_ID}])
+        mock_sb.table.return_value.select.return_value.filter.return_value.limit.return_value.execute.return_value = _make_mock_response([{"id": MOCK_ATTEMPT_ID}])
         from routers.descriptive_admin import delete_descriptive_question
         from core.auth import AuthUser
         with pytest.raises(HTTPException) as exc_info:
@@ -4712,6 +4712,369 @@ class TestDescriptiveAdminCRUD:
         from core.auth import AuthUser
         result = list_descriptive_questions(admin=AuthUser(id=MOCK_PROFILE_ID))
         assert result[0]["domain_names"] == ["Web Dev"]
+
+
+class TestAdminDescriptiveDelete:
+    """DELETE /admin/descriptive-questions/{question_id} — safe deletion.
+
+    An unused descriptive question must be removable. A question frozen into
+    any assessment attempt is protected with a clear 409 (the
+    assessment_descriptive_answers FK is ON DELETE RESTRICT), and the JSONB
+    containment pre-check must use valid JSON so the protection actually fires
+    instead of letting the delete fall through to a raw Postgres 500.
+    """
+
+    IN_USE_MESSAGE = (
+        "Cannot delete: question is referenced by existing attempts. "
+        "Use deactivation instead."
+    )
+    ATTEMPTS_COLUMN = "selected_descriptive_question_ids"
+
+    def _existing(self, mock_sb, rows):
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(rows)
+        )
+
+    def _attempts(self, mock_sb, rows):
+        mock_sb.table.return_value.select.return_value.filter.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response(rows)
+        )
+
+    def _call(self):
+        from routers.descriptive_admin import delete_descriptive_question
+        return delete_descriptive_question(
+            question_id=MOCK_DESC_ID,
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_delete_unused_question_succeeds(self, mock_sb):
+        self._existing(mock_sb, [{"id": MOCK_DESC_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        result = self._call()
+
+        assert result["status"] == "deleted"
+        # The row was actually removed.
+        mock_sb.table.return_value.delete.return_value.eq.assert_called_once_with(
+            "id", MOCK_DESC_ID
+        )
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_reference_check_uses_valid_jsonb_containment(self, mock_sb):
+        """Regression: the JSONB filter must send JSON, not PG array syntax.
+
+        ``.contains([...])`` serialises to ``cs.{uuid}`` which is not valid
+        JSON for the ``selected_descriptive_question_ids`` JSONB column; the
+        check must send ``cs.["uuid"]`` instead.
+        """
+        self._existing(mock_sb, [{"id": MOCK_DESC_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        self._call()
+
+        assert mock_sb.table.return_value.select.return_value.contains.call_count == 0
+        mock_sb.table.return_value.select.return_value.filter.assert_called_once_with(
+            self.ATTEMPTS_COLUMN, "cs", json.dumps([MOCK_DESC_ID])
+        )
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_delete_referenced_question_is_rejected(self, mock_sb):
+        self._existing(mock_sb, [{"id": MOCK_DESC_ID}])
+        self._attempts(mock_sb, [{"id": MOCK_ATTEMPT_ID}])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call()
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == self.IN_USE_MESSAGE
+        # Nothing was deleted.
+        mock_sb.table.return_value.delete.assert_not_called()
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_delete_translates_fk_violation_to_conflict(self, mock_sb):
+        """If the pre-check misses an answer row, the FK RESTRICT still blocks
+        the delete and is surfaced as the same friendly 409 (never a raw 500)."""
+
+        class _FkError(Exception):
+            code = "23503"
+
+        self._existing(mock_sb, [{"id": MOCK_DESC_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.side_effect = (
+            _FkError("update or delete on table violates foreign key constraint")
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call()
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == self.IN_USE_MESSAGE
+
+    @patch("routers.descriptive_admin.supabase_client")
+    def test_delete_missing_question_is_404(self, mock_sb):
+        self._existing(mock_sb, [])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call()
+
+        assert exc_info.value.status_code == 404
+        mock_sb.table.return_value.delete.assert_not_called()
+
+    def test_delete_requires_admin_via_http(self, client):
+        """The route is protected: unauthenticated callers are rejected."""
+        resp = client.delete(f"/admin/descriptive-questions/{MOCK_DESC_ID}")
+        assert resp.status_code in (401, 403)
+
+
+class TestAdminMCQDelete:
+    """DELETE /admin/mcqs/{mcq_id} — safe deletion of question-bank entries.
+
+    An unused MCQ must be removable. A question frozen into any assessment
+    attempt is protected with a clear 409 (the assessment_answers FK is
+    ON DELETE RESTRICT), and the JSONB containment pre-check must use valid
+    JSON so the protection actually fires.
+    """
+
+    IN_USE_MESSAGE = (
+        "This question is already used in an assessment and cannot be deleted. "
+        "Deactivate it instead."
+    )
+
+    def _existing(self, mock_sb, rows):
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(rows)
+        )
+
+    def _attempts(self, mock_sb, rows):
+        mock_sb.table.return_value.select.return_value.filter.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response(rows)
+        )
+
+    @patch("routers.admin.supabase_client")
+    def test_delete_unused_mcq_succeeds(self, mock_sb):
+        from routers.admin import delete_mcq
+        from core.auth import AuthUser
+
+        self._existing(mock_sb, [{"id": MOCK_MCQ_1_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        result = delete_mcq(mcq_id=MOCK_MCQ_1_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+
+        assert result["status"] == "deleted"
+        # The row was actually removed.
+        mock_sb.table.return_value.delete.return_value.eq.assert_called_once_with(
+            "id", MOCK_MCQ_1_ID
+        )
+
+    @patch("routers.admin.supabase_client")
+    def test_reference_check_uses_valid_jsonb_containment(self, mock_sb):
+        """Regression: the JSONB filter must send JSON, not PG array syntax.
+
+        ``.contains([...])`` serialises to ``cs.{uuid}`` which is not valid
+        JSON for a JSONB column; the check must send ``cs.["uuid"]`` instead.
+        """
+        import json as _json
+        from routers.admin import delete_mcq
+        from core.auth import AuthUser
+
+        self._existing(mock_sb, [{"id": MOCK_MCQ_1_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        delete_mcq(mcq_id=MOCK_MCQ_1_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+
+        mock_sb.table.return_value.select.return_value.filter.assert_called_once_with(
+            "selected_question_ids", "cs", _json.dumps([MOCK_MCQ_1_ID])
+        )
+
+    @patch("routers.admin.supabase_client")
+    def test_delete_referenced_mcq_is_rejected(self, mock_sb):
+        from routers.admin import delete_mcq
+        from core.auth import AuthUser
+        from fastapi import HTTPException
+
+        self._existing(mock_sb, [{"id": MOCK_MCQ_1_ID}])
+        self._attempts(mock_sb, [{"id": MOCK_ATTEMPT_ID}])
+
+        with pytest.raises(HTTPException) as exc_info:
+            delete_mcq(mcq_id=MOCK_MCQ_1_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == self.IN_USE_MESSAGE
+        # Nothing was deleted.
+        mock_sb.table.return_value.delete.assert_not_called()
+
+    @patch("routers.admin.supabase_client")
+    def test_delete_translates_fk_violation_to_conflict(self, mock_sb):
+        """If the pre-check misses an answer row, the FK RESTRICT still blocks
+        the delete and is surfaced as the same friendly 409 (never a raw 500)."""
+        from routers.admin import delete_mcq
+        from core.auth import AuthUser
+        from fastapi import HTTPException
+
+        class _FkError(Exception):
+            code = "23503"
+
+        self._existing(mock_sb, [{"id": MOCK_MCQ_1_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.side_effect = (
+            _FkError("update or delete on table violates foreign key constraint")
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            delete_mcq(mcq_id=MOCK_MCQ_1_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == self.IN_USE_MESSAGE
+
+    @patch("routers.admin.supabase_client")
+    def test_delete_missing_mcq_is_404(self, mock_sb):
+        from routers.admin import delete_mcq
+        from core.auth import AuthUser
+        from fastapi import HTTPException
+
+        self._existing(mock_sb, [])
+
+        with pytest.raises(HTTPException) as exc_info:
+            delete_mcq(mcq_id=MOCK_MCQ_1_ID, admin=AuthUser(id=MOCK_PROFILE_ID))
+
+        assert exc_info.value.status_code == 404
+
+    def test_delete_requires_admin_via_http(self, client):
+        """The route is protected: unauthenticated callers are rejected."""
+        resp = client.delete(f"/admin/mcqs/{MOCK_MCQ_1_ID}")
+        assert resp.status_code in (401, 403)
+
+
+class TestAdminHandsOnDelete:
+    """DELETE /admin/hands-on-questions/{question_id} — safe deletion.
+
+    An unused challenge must be removable. A challenge frozen into any
+    assessment attempt is protected with a clear 409 (the
+    assessment_hands_on_results FK is ON DELETE RESTRICT), and the JSONB
+    containment pre-check must use valid JSON so the protection actually fires
+    instead of letting the delete fall through to a raw Postgres 500.
+    """
+
+    IN_USE_MESSAGE = (
+        "Cannot delete: challenge is referenced by existing attempts. "
+        "Use deactivation instead."
+    )
+    ATTEMPTS_COLUMN = "selected_hands_on_question_ids"
+
+    def _existing(self, mock_sb, rows):
+        mock_sb.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(rows)
+        )
+
+    def _attempts(self, mock_sb, rows):
+        mock_sb.table.return_value.select.return_value.filter.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response(rows)
+        )
+
+    def _call(self):
+        from routers.hands_on_admin import delete_hands_on_question
+        return delete_hands_on_question(
+            question_id=MOCK_HANDS_ID,
+            admin=AuthUser(id=MOCK_PROFILE_ID),
+        )
+
+    @patch("routers.hands_on_admin.supabase_client")
+    def test_delete_unused_question_succeeds(self, mock_sb):
+        self._existing(mock_sb, [{"id": MOCK_HANDS_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        result = self._call()
+
+        assert result["status"] == "deleted"
+        # The row was actually removed.
+        mock_sb.table.return_value.delete.return_value.eq.assert_called_once_with(
+            "id", MOCK_HANDS_ID
+        )
+
+    @patch("routers.hands_on_admin.supabase_client")
+    def test_reference_check_uses_valid_jsonb_containment(self, mock_sb):
+        """Regression: the JSONB filter must send JSON, not PG array syntax.
+
+        ``.contains([...])`` serialises to ``cs.{uuid}`` which is not valid
+        JSON for the ``selected_hands_on_question_ids`` JSONB column; the
+        check must send ``cs.["uuid"]`` instead.
+        """
+        self._existing(mock_sb, [{"id": MOCK_HANDS_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+
+        self._call()
+
+        assert mock_sb.table.return_value.select.return_value.contains.call_count == 0
+        mock_sb.table.return_value.select.return_value.filter.assert_called_once_with(
+            self.ATTEMPTS_COLUMN, "cs", json.dumps([MOCK_HANDS_ID])
+        )
+
+    @patch("routers.hands_on_admin.supabase_client")
+    def test_delete_referenced_question_is_rejected(self, mock_sb):
+        self._existing(mock_sb, [{"id": MOCK_HANDS_ID}])
+        self._attempts(mock_sb, [{"id": MOCK_ATTEMPT_ID}])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call()
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == self.IN_USE_MESSAGE
+        # Nothing was deleted.
+        mock_sb.table.return_value.delete.assert_not_called()
+
+    @patch("routers.hands_on_admin.supabase_client")
+    def test_delete_translates_fk_violation_to_conflict(self, mock_sb):
+        """If the pre-check misses an answer row, the FK RESTRICT still blocks
+        the delete and is surfaced as the same friendly 409 (never a raw 500)."""
+
+        class _FkError(Exception):
+            code = "23503"
+
+        self._existing(mock_sb, [{"id": MOCK_HANDS_ID}])
+        self._attempts(mock_sb, [])
+        mock_sb.table.return_value.delete.return_value.eq.return_value.execute.side_effect = (
+            _FkError("update or delete on table violates foreign key constraint")
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call()
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == self.IN_USE_MESSAGE
+
+    @patch("routers.hands_on_admin.supabase_client")
+    def test_delete_missing_question_is_404(self, mock_sb):
+        self._existing(mock_sb, [])
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call()
+
+        assert exc_info.value.status_code == 404
+        mock_sb.table.return_value.delete.assert_not_called()
+
+    def test_delete_requires_admin_via_http(self, client):
+        """The route is protected: unauthenticated callers are rejected."""
+        resp = client.delete(f"/admin/hands-on-questions/{MOCK_HANDS_ID}")
+        assert resp.status_code in (401, 403)
 
 
 class TestActiveConfigNoLongerDefaultsLegacyCounts:
@@ -6814,7 +7177,7 @@ class TestHandsOnAdminAPI:
         chains["hands_on_questions"].select.return_value.eq.return_value.execute.return_value = (
             _make_mock_response([{"id": MOCK_HANDS_ID}])
         )
-        chains["assessment_attempts"].select.return_value.contains.return_value.limit.return_value.execute.return_value = (
+        chains["assessment_attempts"].select.return_value.filter.return_value.limit.return_value.execute.return_value = (
             _make_mock_response([])
         )
         chains["hands_on_questions"].delete.return_value.eq.return_value.execute.return_value = (
@@ -6833,7 +7196,7 @@ class TestHandsOnAdminAPI:
         chains["hands_on_questions"].select.return_value.eq.return_value.execute.return_value = (
             _make_mock_response([{"id": MOCK_HANDS_ID}])
         )
-        chains["assessment_attempts"].select.return_value.contains.return_value.limit.return_value.execute.return_value = (
+        chains["assessment_attempts"].select.return_value.filter.return_value.limit.return_value.execute.return_value = (
             _make_mock_response([{"id": MOCK_ATTEMPT_ID}])
         )
         try:
@@ -8469,3 +8832,228 @@ class TestSharedExpiryHelper:
 
         assert is_expired({"expires_at": now - timedelta(minutes=1)}) is True
         assert is_expired({"expires_at": now + timedelta(minutes=1)}) is False
+
+
+# A WASM challenge's dataset, exactly as it is stored in the JSONB column and as
+# the browser-side DuckDB runner consumes it (an ARRAY of table specs).
+WASM_DATASET = [{
+    "table": "employees",
+    "columns": ["id", "name", "department", "salary"],
+    "rows": [[1, "Alice", "Engineering", 95000]],
+}]
+
+WASM_VALIDATION_SPEC = {
+    "expected_columns": ["department", "avg_salary"],
+    "expected_rows": [["Engineering", 95000.0]],
+    "order_sensitive": False,
+    "numeric_tolerance": 1.0,
+}
+
+
+def _wasm_payload(**overrides):
+    """The body the Admin Hands-On form sends for a WASM challenge."""
+    payload = {
+        "title": "Employee Analytics — SQL",
+        "description": "Average salary per department.",
+        "domain_ids": [],
+        "challenge_type": "sql_wasm",
+        "difficulty": "easy",
+        "points": 100,
+        "is_active": True,
+        "schema_sql": "CREATE TABLE employees (id INTEGER);",
+        "dataset_json": WASM_DATASET,
+        "starter_code": "SELECT * FROM employees;",
+        "validation_spec": WASM_VALIDATION_SPEC,
+        "expected_answer": "reference",
+        "challenge_url": "",
+        "expected_flag": "",
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestHandsOnWasmConfig:
+    """Domain assignment / configuration for WASM hands-on challenges.
+
+    Regression: ``dataset_json`` was annotated as ``dict`` while the real JSONB
+    contract (and the DuckDB/Pyodide runners) use an ARRAY of table specs, so
+    saving an existing WASM challenge rejected the body with a 422
+    (``Input should be a valid dictionary``) and no domain assignment was ever
+    persisted. The admin UI printed that validation error as ``[object Object]``.
+    """
+
+    def _set_admin_override(self):
+        from core.auth import require_admin
+        from main import app
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id="admin-user-id", email="admin@test.com"
+        )
+
+    def _configure_admin_mocks(self, mock_sb):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        hq = _table("hands_on_questions")
+        hq.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        hq.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        hq.insert.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_HANDS_ID}])
+        )
+        _table("domains").select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID}])
+        )
+        return chains
+
+    def test_update_wasm_challenge_with_array_dataset_succeeds(
+        self, client, mock_supabase
+    ):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(),
+            )
+            assert r.status_code == 200
+            stored = chains["hands_on_questions"].update.call_args.args[0]
+            assert stored["dataset_json"] == WASM_DATASET
+            assert stored["validation_spec"] == WASM_VALIDATION_SPEC
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_update_wasm_challenge_assigns_domain(self, client, mock_supabase):
+        """The reported failure: a WASM challenge could not be domain-assigned."""
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(domain_ids=[MOCK_DOMAIN_1_ID]),
+            )
+            assert r.status_code == 200
+            stored = chains["hands_on_questions"].update.call_args.args[0]
+            assert stored["domain_ids"] == [MOCK_DOMAIN_1_ID]
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_update_wasm_challenge_assigns_multiple_domains(
+        self, client, mock_supabase
+    ):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        chains["domains"].select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_DOMAIN_1_ID}, {"id": MOCK_DOMAIN_2_ID}])
+        )
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]),
+            )
+            assert r.status_code == 200
+            stored = chains["hands_on_questions"].update.call_args.args[0]
+            assert stored["domain_ids"] == [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_create_wasm_challenge_with_array_dataset_succeeds(
+        self, client, mock_supabase
+    ):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        try:
+            r = client.post("/admin/hands-on-questions", json=_wasm_payload())
+            assert r.status_code == 201
+            stored = chains["hands_on_questions"].insert.call_args.args[0]
+            assert stored["dataset_json"] == WASM_DATASET
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_pandas_wasm_dataset_named_table_form_accepted(
+        self, client, mock_supabase
+    ):
+        self._set_admin_override()
+        self._configure_admin_mocks(mock_supabase)
+        pandas_dataset = [{
+            "name": "df",
+            "columns": ["name", "salary"],
+            "data": [["Alice", 95000]],
+        }]
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(
+                    challenge_type="pandas_wasm", dataset_json=pandas_dataset
+                ),
+            )
+            assert r.status_code == 200
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_unknown_domain_id_returns_400_not_500(self, client, mock_supabase):
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        chains["domains"].select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(domain_ids=[MOCK_DOMAIN_1_ID]),
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"] == "One or more domain IDs not found"
+            assert chains["hands_on_questions"].update.call_count == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_malformed_domain_id_returns_400_not_500(self, client, mock_supabase):
+        """A non-UUID ID makes PostgREST reject the filter with 22P02."""
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        chains["domains"].select.return_value.in_.return_value.execute.side_effect = (
+            Exception('invalid input syntax for type uuid: "not-a-domain"')
+        )
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(domain_ids=["not-a-domain"]),
+            )
+            assert r.status_code == 400
+            assert r.json()["detail"] == "One or more domain IDs not found"
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_malformed_dataset_still_rejected_with_field_message(
+        self, client, mock_supabase
+    ):
+        """A genuinely wrong dataset type is still a 422 — with a usable detail."""
+        self._set_admin_override()
+        self._configure_admin_mocks(mock_supabase)
+        try:
+            r = client.put(
+                f"/admin/hands-on-questions/{MOCK_HANDS_ID}",
+                json=_wasm_payload(dataset_json=42),
+            )
+            assert r.status_code == 422
+            errors = r.json()["detail"]
+            assert isinstance(errors, list) and errors
+            assert any("dataset_json" in err["loc"] for err in errors)
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_unauthenticated_update_is_rejected(self, client):
+        r = client.put(
+            f"/admin/hands-on-questions/{MOCK_HANDS_ID}", json=_wasm_payload()
+        )
+        assert r.status_code == 401

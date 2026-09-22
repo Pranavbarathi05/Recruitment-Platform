@@ -1,7 +1,9 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from core.auth import require_admin, AuthUser
-from core.supabase import supabase_client
+from core.supabase import is_foreign_key_violation, supabase_client
 from schemas.assessment import (
     DomainCreate, DomainUpdate, MCQCreate, MCQUpdate,
     AssessmentConfigUpdate,
@@ -287,11 +289,41 @@ def deactivate_mcq(mcq_id: str, admin: AuthUser = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Shared message for both the pre-check and the foreign-key fallback so the
+# admin always gets the same, actionable explanation.
+_MCQ_IN_USE_DETAIL = (
+    "This question is already used in an assessment and cannot be deleted. "
+    "Deactivate it instead."
+)
+
+
+def _mcq_referenced_by_attempt(mcq_id: str) -> bool:
+    """Return True if any assessment attempt froze this MCQ in its selection.
+
+    ``selected_question_ids`` is a JSONB array of UUID strings. ``.contains``
+    with a Python list serialises to PostgreSQL array syntax (``cs.{uuid}``),
+    which PostgREST cannot parse as JSON for a JSONB column — the filter either
+    errors or silently matches nothing. Passing an explicit JSON string keeps
+    the containment operator unambiguous (``cs.["uuid"]``).
+    """
+    attempts = (
+        supabase_client.table("assessment_attempts")
+        .select("id")
+        .filter("selected_question_ids", "cs", json.dumps([mcq_id]))
+        .limit(1)
+        .execute()
+    )
+    return bool(attempts.data)
+
+
 @router.delete("/mcqs/{mcq_id}")
 def delete_mcq(mcq_id: str, admin: AuthUser = Depends(require_admin)):
     """Delete an MCQ question. Admin only.
 
-    Use deactivation instead when historical attempt data exists.
+    An unused question is removed. A question referenced by any existing
+    (frozen or in-progress) assessment attempt is protected and rejected
+    with a 409 so historical attempt data is never broken; deactivate it
+    instead.
     """
     try:
         existing = supabase_client.table("mcq_questions").select("id").eq("id", mcq_id).execute()
@@ -299,20 +331,19 @@ def delete_mcq(mcq_id: str, admin: AuthUser = Depends(require_admin)):
             raise HTTPException(status_code=404, detail="MCQ not found")
 
         # Check if this question is referenced by any assessment attempt
-        attempts = (
-            supabase_client.table("assessment_attempts")
-            .select("id")
-            .contains("selected_question_ids", [mcq_id])
-            .limit(1)
-            .execute()
-        )
-        if attempts.data:
-            raise HTTPException(
-                status_code=409,
-                detail="Cannot delete: question is referenced by existing attempts. Use deactivation instead.",
-            )
+        if _mcq_referenced_by_attempt(mcq_id):
+            raise HTTPException(status_code=409, detail=_MCQ_IN_USE_DETAIL)
 
-        supabase_client.table("mcq_questions").delete().eq("id", mcq_id).execute()
+        try:
+            supabase_client.table("mcq_questions").delete().eq("id", mcq_id).execute()
+        except Exception as delete_exc:
+            # The assessment_answers FK (ON DELETE RESTRICT) is the ultimate
+            # data-integrity guard. If the pre-check missed a reference (e.g.
+            # an answer row left behind without a matching selection), surface
+            # the same friendly conflict instead of a raw 500.
+            if is_foreign_key_violation(delete_exc):
+                raise HTTPException(status_code=409, detail=_MCQ_IN_USE_DETAIL)
+            raise
         return {"status": "deleted"}
     except HTTPException:
         raise
