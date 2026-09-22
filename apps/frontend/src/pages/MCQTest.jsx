@@ -17,6 +17,33 @@ import { countWords, limitToWords } from '../utils/wordLimit';
 // candidate rendering always uses this Gateway-relative path.
 const CHALLENGE_IFRAME_URL = '/challenge/';
 
+// How long to wait for requestFullscreen() to settle before treating it as
+// failed. Chrome answers in milliseconds; the bound only exists so a browser
+// that never settles the promise cannot strand the candidate on a disabled
+// "Entering…" button.
+const FULLSCREEN_SETTLE_TIMEOUT_MS = 3000;
+
+/**
+ * Resolve to 'resolved' | 'rejected' | 'timeout'. The timer is always cleared
+ * once the request settles, so no stray timeouts are left behind.
+ */
+function promiseWithTimeout(promise, ms) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish('timeout'), ms);
+    Promise.resolve(promise).then(
+      () => finish('resolved'),
+      () => finish('rejected'),
+    );
+  });
+}
+
 /**
  * Combined Assessment Workspace
  *
@@ -631,17 +658,28 @@ const AssessmentWorkspace = () => {
     const el = typeof document !== 'undefined' ? document.documentElement : null;
     if (!el || typeof el.requestFullscreen !== 'function') return false;
     // Mark the intent synchronously: a fullscreenchange for a genuine loss can
-    // arrive before the request promise settles. Cleared again on rejection.
+    // arrive before the request promise settles. Cleared again on failure.
     fsEnteredRef.current = true;
+
+    let outcome = 'pending';
     try {
-      await el.requestFullscreen();
-      return true;
+      // Some embedded/hosted browsers accept the request but never settle the
+      // promise, which would leave the button stuck on "Entering…" forever.
+      // Bound the wait; the fullscreenchange listener stays authoritative, so
+      // a late success still clears the prompt.
+      outcome = await promiseWithTimeout(el.requestFullscreen(), FULLSCREEN_SETTLE_TIMEOUT_MS);
     } catch {
       // Browser policy (no user gesture), permission, or unsupported — treat
       // as "could not enter" and never lock the candidate out.
-      fsEnteredRef.current = false;
-      return false;
+      outcome = 'rejected';
     }
+
+    if (outcome === 'resolved') return true;
+    if (outcome === 'timeout' && typeof document !== 'undefined' && document.fullscreenElement) {
+      return true;
+    }
+    fsEnteredRef.current = false;
+    return false;
   }, []);
 
   const startFullscreenTimer = useCallback((skipIfRunning = false) => {

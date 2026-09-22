@@ -27,6 +27,33 @@ const BUNDLES = {
 let _dbInstance = null;
 let _initPromise = null;
 
+// Problem loading is serialised. The DB is a singleton and its tables are
+// created by name, so two loads running at once (React StrictMode mounts every
+// effect twice, and a resumed attempt mounts the challenge again) would race:
+// one CREATE TABLE would fail with "Table with name X already exists!" and the
+// challenge would render no editor at all, while interleaved INSERTs could
+// duplicate the dataset. Chaining the loads keeps the drop/create/insert
+// sequence of one problem atomic with respect to every other.
+let _loadChain = Promise.resolve();
+
+function withLoadLock(task) {
+  const run = _loadChain.then(task, task);
+  // The chain itself must never reject: a failed load must not poison the next.
+  _loadChain = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+/**
+ * DuckDB reports a duplicate object as a catalog error. Such a statement is
+ * always safe to skip: the object it tried to create is already present.
+ */
+function isAlreadyExistsError(err) {
+  return /already exists/i.test(err?.message || String(err));
+}
+
 /**
  * Get or create the shared AsyncDuckDB instance.
  */
@@ -73,16 +100,23 @@ export class SqlWasmRunner {
     this._db = await getDb();
     this._conn = await this._db.connect();
 
-    // Configure for local-only execution
-    await this._conn.query(`
-      SET enable_progress_bar = false;
-    `);
+    await withLoadLock(async () => {
+      // Configure for local-only execution
+      await this._conn.query(`
+        SET enable_progress_bar = false;
+      `);
 
-    // Create schema
-    await this._loadSchema(problem.schema);
+      // Start from a clean slate for the tables this challenge owns, so a
+      // second initialisation (remount, StrictMode, resumed attempt) rebuilds
+      // instead of colliding with the previous run.
+      await this._dropDatasetTables(problem.dataset);
 
-    // Load dataset
-    await this._loadDataset(problem.dataset);
+      // Create schema
+      await this._loadSchema(problem.schema);
+
+      // Load dataset
+      await this._loadDataset(problem.dataset);
+    });
 
     this._initialized = true;
   }
@@ -145,9 +179,11 @@ export class SqlWasmRunner {
       await this._conn.query(`DROP TABLE IF EXISTS "${row.table_name}"`);
     }
 
-    // Reload
-    await this._loadSchema(this._problem.schema);
-    await this._loadDataset(this._problem.dataset);
+    // Reload (serialised for the same reason as initialize())
+    await withLoadLock(async () => {
+      await this._loadSchema(this._problem.schema);
+      await this._loadDataset(this._problem.dataset);
+    });
   }
 
   /**
@@ -171,20 +207,42 @@ export class SqlWasmRunner {
   async _loadSchema(schema) {
     if (!schema) return;
 
+    const run = async (stmt) => {
+      try {
+        await this._conn.query(stmt);
+      } catch (err) {
+        // The object already exists (e.g. a schema statement covering a table
+        // the dataset owns). Skipping keeps initialisation idempotent.
+        if (!isAlreadyExistsError(err)) throw err;
+      }
+    };
+
     if (typeof schema === 'string') {
       // Single SQL CREATE statement or multiple statements
       const stmts = schema.split(';').map((s) => s.trim()).filter(Boolean);
       for (const stmt of stmts) {
-        await this._conn.query(stmt);
+        await run(stmt);
       }
     } else if (Array.isArray(schema)) {
       for (const stmt of schema) {
         if (typeof stmt === 'string') {
-          await this._conn.query(stmt);
+          await run(stmt);
         } else if (stmt.sql) {
-          await this._conn.query(stmt.sql);
+          await run(stmt.sql);
         }
       }
+    }
+  }
+
+  /**
+   * Drop every table declared by the dataset so the following CREATE/INSERT
+   * sequence always starts from a known state.
+   */
+  async _dropDatasetTables(dataset) {
+    if (!Array.isArray(dataset)) return;
+    for (const entry of dataset) {
+      if (!entry || typeof entry !== 'object' || !entry.table) continue;
+      await this._conn.query(`DROP TABLE IF EXISTS "${entry.table}"`);
     }
   }
 

@@ -19,7 +19,7 @@ import { Landing, Login, Domains, Dashboard, Signup, MCQTest, Results, Submissio
  */
 const ASSESSMENT_WORKSPACE_PATH = /^\/assessment\/[^/]+\/?$/;
 
-function AppShell({ children }) {
+export function AppShell({ children }) {
   const { pathname } = useLocation();
   const viewportLocked = ASSESSMENT_WORKSPACE_PATH.test(pathname);
 
