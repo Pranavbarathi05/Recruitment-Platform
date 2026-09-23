@@ -908,18 +908,24 @@ def submit_hands_on(
     payload: HandsOnSubmitRequest,
     current_user: AuthUser = Depends(get_current_user),
 ):
-    """Submit a Hands-On challenge result (SQL evidence + flag).
+    """Submit a Hands-On challenge result.
 
-    Only the flag is verified. The SQL input is stored verbatim as evidence
-    and is never parsed, executed or validated.
+    Two challenge categories, decided by the stored challenge_type:
 
-    Verification is backend-authoritative:
-      - the challenge must belong to this attempt (frozen selection),
-      - the expected flag never leaves the backend and is compared exactly
-        after trimming surrounding whitespace,
-      - score is full question points when correct, 0 otherwise — a
-        candidate-provided score is never trusted (the schema has no such
-        field in the request at all).
+    FLAG challenges (e.g. sql_injection_employee_portal)
+      Only the flag is verified. The submitted input is stored verbatim as
+      evidence and is never parsed, executed or validated. The expected flag
+      never leaves the backend and is compared exactly after trimming
+      surrounding whitespace.
+
+    WASM challenges (sql_wasm / pandas_wasm)
+      No flag exists or is checked. The candidate's code executed locally and
+      the browser validator returned a binary verdict; the backend turns that
+      verdict into points (full question points when it passed, 0 otherwise).
+      A client-supplied point value is never trusted.
+
+    In both categories the score is authored here: full question points when
+    verified, 0 otherwise.
 
     Each challenge may be submitted exactly ONCE per (attempt, question):
     a second submission — via refresh, another tab, or a direct API call —
@@ -981,11 +987,22 @@ def submit_hands_on(
     points = int(question.get("points", 0) or 0)
 
     if challenge_type in ("sql_wasm", "pandas_wasm"):
-        # WASM challenge: client-side validation has already run.
-        # The backend caps client_score at max points — it never re-executes.
-        client_score = payload.client_score or 0
-        score = min(client_score, points)
-        verified = score > 0
+        # WASM challenge — NOT a flag challenge.
+        #
+        # The candidate's code ran locally and the browser-side validator
+        # produced a binary verdict. The verdict decides correctness; the
+        # BACKEND decides the score: a passed validation earns the challenge's
+        # full points, exactly like a correct flag earns its points. The
+        # browser never supplies the awarded points.
+        #
+        # `client_score` is the older 0/1 form of the same verdict and is kept
+        # so submissions from an already-loaded page keep working.
+        if payload.validation_passed is not None:
+            passed = bool(payload.validation_passed)
+        else:
+            passed = (payload.client_score or 0) > 0
+        verified = passed
+        score = points if verified else 0
         now = _utcnow().isoformat()
         supabase_client.table("assessment_hands_on_results").insert({
             "attempt_id": attempt_id,
@@ -995,7 +1012,7 @@ def submit_hands_on(
             "verified": verified,
             "score": score,
             "started_at": now,
-            "completed_at": now,
+            "completed_at": now if verified else None,
         }).execute()
     else:
         # Traditional flag-based challenge

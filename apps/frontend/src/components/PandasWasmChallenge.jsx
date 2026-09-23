@@ -87,11 +87,14 @@ const PandasWasmChallenge = ({ problem, onSubmit, submitted }) => {
     if (!result || submitting || submitted) return;
     setSubmitting(true);
     try {
+      // The validator's verdict (binary) — never a point value. The backend
+      // awards the challenge's points when this passes. WASM challenges have
+      // no flag: nothing flag-shaped is sent.
       const v = validatePandas(result, problem.validation_spec);
       await onSubmit({
         questionId: problem.id,
         submittedCode: sourceCode,
-        clientScore: v.passed ? 1 : 0,
+        validationPassed: v.passed,
       });
     } catch (err) {
       setError(err.message);

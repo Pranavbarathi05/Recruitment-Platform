@@ -495,12 +495,15 @@ const AssessmentWorkspace = () => {
   // One submission per challenge: the backend rejects a second PUT with 409
   // and returns a neutral ack (never verified/score), so the candidate is
   // not told whether their flag was correct.
-  const submitHandsOn = useCallback(async (questionId, submittedInput, submittedFlag, clientScore) => {
+  const submitHandsOn = useCallback(async (questionId, submittedInput, submittedFlag, validationPassed) => {
     const body = { question_id: questionId, submitted_input: submittedInput, submitted_flag: submittedFlag };
-    // WASM challenges send client_score; the backend caps it at max points.
-    if (clientScore !== undefined && clientScore !== null) {
-      body.client_score = clientScore;
+    // WASM challenges (sql_wasm/pandas_wasm) are not flag challenges: they
+    // send the browser validator's binary verdict plus the code, and the
+    // backend awards the challenge's points when it passed.
+    if (validationPassed !== undefined && validationPassed !== null) {
+      body.validation_passed = validationPassed;
       body.submitted_code = submittedInput;
+      body.submitted_flag = '';
     }
     const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/hands-on`, {
       method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
@@ -1246,8 +1249,8 @@ function HandsOnSection({ questions, results, onSubmit }) {
         <div className="flex-1 min-h-0">
           <SqlWasmChallenge
             problem={q}
-            onSubmit={async ({ questionId, submittedCode, clientScore }) => {
-              await onSubmit(questionId, submittedCode, '', clientScore);
+            onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
+              await onSubmit(questionId, submittedCode, '', validationPassed);
               submittedRef.current = true;
               setSubmitted(true);
             }}
@@ -1276,8 +1279,8 @@ function HandsOnSection({ questions, results, onSubmit }) {
         <div className="flex-1 min-h-0">
           <PandasWasmChallenge
             problem={q}
-            onSubmit={async ({ questionId, submittedCode, clientScore }) => {
-              await onSubmit(questionId, submittedCode, '', clientScore);
+            onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
+              await onSubmit(questionId, submittedCode, '', validationPassed);
               submittedRef.current = true;
               setSubmitted(true);
             }}

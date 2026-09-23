@@ -716,7 +716,11 @@ def get_assessment_results(
             for qid in hands_ids:
                 hq = hq_map.get(qid, {})
                 hr = hr_map.get(qid, {})
-                attempted = bool(hr) and (hr.get("submitted_input") or hr.get("submitted_flag"))
+                # Explicit bool: `and`/`or` would leak the evidence string here,
+                # and this field is consumed as a boolean by the admin UI.
+                attempted = bool(hr) and bool(
+                    hr.get("submitted_input") or hr.get("submitted_flag")
+                )
                 hands_on_results.append({
                     "question_id": qid,
                     "title": hq.get("title", ""),

@@ -234,17 +234,27 @@ class HandsOnSubmitRequest(BaseModel):
 
     For sql_wasm / pandas_wasm:
       submitted_code is the candidate's code, stored for auditing.
-      client_score is the score computed by the browser-side validator.
-      The backend caps client_score at the question's maximum points
-      and never re-executes the code.
+      validation_passed is the browser-side validator's verdict for that
+      execution. WASM challenges are NOT flag challenges: no flag is sent and
+      none is checked. The validator's own result is binary (pass/fail), so
+      the BACKEND owns the score: a passed validation earns the challenge's
+      full points, exactly like a verified flag. The backend never re-executes
+      the code.
     """
     question_id: str
     submitted_input: str = Field(default="", max_length=20_000)
     submitted_flag: str = Field(default="", max_length=500)
     submitted_code: Optional[str] = Field(None, max_length=50_000,
         description="Candidate code for WASM challenges (sql_wasm/pandas_wasm)")
+    validation_passed: Optional[bool] = Field(
+        None,
+        description=(
+            "Browser validator verdict for a WASM challenge "
+            "(sql_wasm/pandas_wasm); no flag is involved"
+        ),
+    )
     client_score: Optional[int] = Field(None, ge=0,
-        description="Score computed client-side by the WASM validator")
+        description="Legacy 0/1 validator verdict; superseded by validation_passed")
 
 
 # ---------------------------------------------------------------------------

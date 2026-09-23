@@ -598,6 +598,196 @@ class TestDomainEligibility:
         assert "exactly one" in response.json()["detail"].lower()
 
 
+class TestOrganizationalExclusivityEndpoint:
+    """The Organizational domain is mutually exclusive with every other domain.
+
+    Endpoint level: POST /assessment/start must refuse a mixed selection with a
+    clear 400 BEFORE any module configuration or question pool is touched, and
+    must never create an attempt from one.
+    """
+
+    MESSAGE = "cannot be combined with other domains"
+
+    def _second_technical_domain(self):
+        return dict(
+            TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Web Dev", slug="webDevelopment"
+        )
+
+    def test_organizational_plus_technical_rejected(
+        self, client, mock_supabase, spy
+    ):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN, self._second_technical_domain()],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID, applies_to="organizational", mcq_count=2
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 400
+        assert self.MESSAGE in response.json()["detail"]
+        assert "Organizational" in response.json()["detail"]
+
+    def test_technical_plus_organizational_rejected(
+        self, client, mock_supabase, spy
+    ):
+        """Reversed order: the rule is symmetric."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN, self._second_technical_domain()],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID, applies_to="organizational", mcq_count=2
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_2_ID, MOCK_DOMAIN_1_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 400
+        assert self.MESSAGE in response.json()["detail"]
+
+    def test_selection_is_capped_at_two_domains_by_the_request_schema(
+        self, client, mock_supabase
+    ):
+        """A pair is the largest mixed selection the endpoint can receive.
+
+        ``AssessmentStartRequest.domain_ids`` is capped at 2, so "Organizational
+        plus several others" can only ever be expressed through the service
+        layer — covered by the planner's own exclusivity test.
+        """
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID, "dom-3"]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 422
+
+    def test_mixed_selection_is_refused_before_planning(
+        self, client, mock_supabase, spy
+    ):
+        """No plan, no attempt, and no module-config/pool query is reached."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN, self._second_technical_domain()],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID, applies_to="organizational", mcq_count=2
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 400
+        # The planner was never asked to resolve anything…
+        assert spy.called is False
+        # …no attempt was written…
+        mock_supabase._table_chains["assessment_attempts"].insert.assert_not_called()
+        # …and no content pool was queried, so nothing was partially selected.
+        for table in (
+            "assessment_module_config",
+            "mcq_questions",
+            "descriptive_questions",
+            "hands_on_questions",
+            "coding_problems",
+        ):
+            _chain(mock_supabase, table).select.assert_not_called()
+
+    def test_organizational_alone_still_starts(self, client, mock_supabase):
+        """The standalone Organizational assessment is untouched."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID, applies_to="organizational", mcq_count=2
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(client, domain_ids=[MOCK_DOMAIN_1_ID])
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert _payload(mock_supabase)["domain_ids"] == [MOCK_DOMAIN_1_ID]
+
+    def test_multiple_technical_domains_still_allowed(self, client, mock_supabase):
+        """Ordinary multi-domain technical selection is unchanged."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN, self._second_technical_domain()],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID, applies_to="senior", mcq_count=1
+                ),
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_2_ID, applies_to="senior", mcq_count=1
+                ),
+            ],
+            mcq_available=[
+                {"id": MOCK_MCQ_1_ID, "domain_id": MOCK_DOMAIN_1_ID},
+                {"id": MOCK_MCQ_2_ID, "domain_id": MOCK_DOMAIN_2_ID},
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert sorted(_payload(mock_supabase)["domain_ids"]) == sorted(
+            [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+        )
+
+
 # ===========================================================================
 # C. MODULE CONFIG
 # ===========================================================================

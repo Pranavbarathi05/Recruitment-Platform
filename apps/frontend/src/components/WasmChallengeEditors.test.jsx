@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, act } from '@testing-library/react';
 import SqlWasmChallenge from './SqlWasmChallenge';
 import PandasWasmChallenge from './PandasWasmChallenge';
+import { validateSql, validatePandas } from '../execution/validators';
 
 // Monaco is browser-only, so the editor is captured with its props instead.
 vi.mock('./CodeEditor', () => ({
@@ -48,8 +49,8 @@ vi.mock('../execution/pandasWasmRunner', () => ({
 }));
 
 vi.mock('../execution/validators', () => ({
-  validateSql: () => ({ passed: true, details: '' }),
-  validatePandas: () => ({ passed: true, details: '' }),
+  validateSql: vi.fn(() => ({ passed: true, details: 'All checks passed.' })),
+  validatePandas: vi.fn(() => ({ passed: true, details: 'All checks passed.' })),
 }));
 
 // The canonical shapes stored in hands_on_questions.dataset_json — arrays of
@@ -101,7 +102,22 @@ beforeEach(() => {
   initialize.mockReset();
   initialize.mockResolvedValue(undefined);
   dispose.mockClear();
+  validateSql.mockClear();
+  validatePandas.mockClear();
+  validateSql.mockReturnValue({ passed: true, details: 'All checks passed.' });
+  validatePandas.mockReturnValue({ passed: true, details: 'All checks passed.' });
 });
+
+/**
+ * Run then Submit, as a candidate would, and return what the challenge
+ * reported to the workspace (the payload that reaches the backend).
+ */
+async function runAndSubmit() {
+  const submitRun = screen.getByRole('button', { name: /run/i });
+  await act(async () => { fireEvent.click(submitRun); });
+  const submit = await screen.findByRole('button', { name: /submit/i });
+  await act(async () => { fireEvent.click(submit); });
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -154,6 +170,40 @@ describe('SqlWasmChallenge', () => {
     render(<SqlWasmChallenge problem={SQL_PROBLEM} onSubmit={vi.fn()} submitted />);
     expect(await screen.findByTestId('code-editor')).toHaveAttribute('data-readonly', 'true');
   });
+
+  it('reports the validator verdict — never a score and never a flag', async () => {
+    const onSubmit = vi.fn();
+    render(<SqlWasmChallenge problem={SQL_PROBLEM} onSubmit={onSubmit} submitted={false} />);
+    await screen.findByTestId('code-editor');
+
+    await runAndSubmit();
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith({
+      questionId: SQL_PROBLEM.id,
+      submittedCode: SQL_STARTER,
+      validationPassed: true,
+    });
+    const payload = onSubmit.mock.calls[0][0];
+    expect(payload).not.toHaveProperty('clientScore');
+    expect(payload).not.toHaveProperty('score');
+    expect(payload).not.toHaveProperty('submittedFlag');
+  });
+
+  it('reports a failing validation as validationPassed: false (backend scores it)', async () => {
+    validateSql.mockReturnValue({ passed: false, details: 'Missing columns: avg_salary' });
+    const onSubmit = vi.fn();
+    render(<SqlWasmChallenge problem={SQL_PROBLEM} onSubmit={onSubmit} submitted={false} />);
+    await screen.findByTestId('code-editor');
+
+    await runAndSubmit();
+
+    expect(onSubmit).toHaveBeenCalledWith({
+      questionId: SQL_PROBLEM.id,
+      submittedCode: SQL_STARTER,
+      validationPassed: false,
+    });
+  });
 });
 
 describe('PandasWasmChallenge', () => {
@@ -182,5 +232,38 @@ describe('PandasWasmChallenge', () => {
   it('makes the editor read-only once the challenge is submitted', async () => {
     render(<PandasWasmChallenge problem={PANDAS_PROBLEM} onSubmit={vi.fn()} submitted />);
     expect(await screen.findByTestId('code-editor')).toHaveAttribute('data-readonly', 'true');
+  });
+
+  it('reports the validator verdict — never a score and never a flag', async () => {
+    const onSubmit = vi.fn();
+    render(<PandasWasmChallenge problem={PANDAS_PROBLEM} onSubmit={onSubmit} submitted={false} />);
+    await screen.findByTestId('code-editor');
+
+    await runAndSubmit();
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith({
+      questionId: PANDAS_PROBLEM.id,
+      submittedCode: PANDAS_STARTER,
+      validationPassed: true,
+    });
+    const payload = onSubmit.mock.calls[0][0];
+    expect(payload).not.toHaveProperty('clientScore');
+    expect(payload).not.toHaveProperty('score');
+  });
+
+  it('reports a failing validation as validationPassed: false (backend scores it)', async () => {
+    validatePandas.mockReturnValue({ passed: false, details: 'Expected 3 rows but got 1.' });
+    const onSubmit = vi.fn();
+    render(<PandasWasmChallenge problem={PANDAS_PROBLEM} onSubmit={onSubmit} submitted={false} />);
+    await screen.findByTestId('code-editor');
+
+    await runAndSubmit();
+
+    expect(onSubmit).toHaveBeenCalledWith({
+      questionId: PANDAS_PROBLEM.id,
+      submittedCode: PANDAS_STARTER,
+      validationPassed: false,
+    });
   });
 });

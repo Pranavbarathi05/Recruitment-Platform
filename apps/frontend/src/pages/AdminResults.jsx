@@ -312,7 +312,15 @@ const AdminResults = () => {
           <div className="bg-theme-secondary rounded-lg p-6 mb-6">
             <h2 className="text-xl font-bold text-theme-primary mb-6">Hands-On Challenge Responses</h2>
             <div className="space-y-4">
-              {handsOn.map((hr, idx) => (
+              {handsOn.map((hr, idx) => {
+                // Flag challenges are verified by comparing a submitted flag;
+                // WASM challenges are verified by the browser-side validator
+                // and never involve a flag at all.
+                const isWasm = hr.challenge_type === 'sql_wasm' || hr.challenge_type === 'pandas_wasm';
+                const typeLabel = hr.challenge_type === 'sql_wasm' ? 'SQL WASM'
+                  : hr.challenge_type === 'pandas_wasm' ? 'Pandas WASM'
+                  : 'Flag challenge';
+                return (
                 <div key={hr.question_id || idx} className={`bg-theme-primary rounded-lg p-4 border-l-4 ${hr.verified ? 'border-green-500' : 'border-yellow-500'}`}>
                   <div className="flex items-start justify-between mb-2">
                     <h3 className="font-semibold text-theme-primary">
@@ -327,23 +335,33 @@ const AdminResults = () => {
 
                   <div className="flex flex-wrap gap-4 text-xs text-theme-muted mb-3">
                     <span className="capitalize">Difficulty: {hr.difficulty}</span>
+                    <span>Type: {typeLabel}</span>
                     <span>Score: {hr.score ?? 0} / {hr.points}</span>
                     {!hr.attempted && <span className="text-yellow-400">Not attempted</span>}
                   </div>
 
-                  <p className="text-xs text-theme-muted mb-1">SQL Input Used:</p>
+                  <p className="text-xs text-theme-muted mb-1">
+                    {isWasm ? 'Submitted Code:' : 'SQL Input Used:'}
+                  </p>
                   {hr.submitted_input ? (
                     <pre className="bg-theme-secondary rounded p-3 text-xs text-theme-primary whitespace-pre-wrap font-mono overflow-x-auto max-h-48 overflow-y-auto">{hr.submitted_input}</pre>
                   ) : (
                     <p className="text-sm text-theme-muted italic">Not attempted</p>
                   )}
 
-                  <p className="text-xs text-theme-muted mb-1 mt-3">Flag Submitted:</p>
-                  <pre className="bg-theme-secondary rounded p-3 text-xs text-theme-primary font-mono">{hr.submitted_flag || '—'}</pre>
+                  {/* Flag evidence only exists for flag challenges. */}
+                  {!isWasm && (
+                    <>
+                      <p className="text-xs text-theme-muted mb-1 mt-3">Flag Submitted:</p>
+                      <pre className="bg-theme-secondary rounded p-3 text-xs text-theme-primary font-mono">{hr.submitted_flag || '—'}</pre>
+                    </>
+                  )}
 
                   <div className="flex gap-4 mt-2 text-xs text-theme-muted">
                     <span>
-                      Verification: {hr.verified ? '✓ Correct' : '✗ Incorrect'}
+                      {isWasm
+                        ? `Validation: ${hr.verified ? '✓ Passed' : '✗ Failed'}`
+                        : `Verification: ${hr.verified ? '✓ Correct' : '✗ Incorrect'}`}
                     </span>
                     {hr.started_at && (
                       <span>Started: {new Date(hr.started_at).toLocaleString('en-US', {
@@ -357,7 +375,8 @@ const AdminResults = () => {
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

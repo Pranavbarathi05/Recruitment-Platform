@@ -389,6 +389,86 @@ class TestDomainSelection:
         assert "technical" in err.detail
 
 
+class TestOrganizationalExclusivity:
+    """The Organizational domain is mutually exclusive with every other domain.
+
+    Identity comes from ``domains.assessment_scope`` — the same field used
+    everywhere else in the planner — so nothing here depends on a domain name,
+    a slug or a hardcoded UUID.
+    """
+
+    MESSAGE = "cannot be combined with other domains"
+
+    def test_organizational_alone_is_allowed(self):
+        """The standalone Organizational assessment keeps working untouched."""
+        plan = plan_assessment(build(PROGRAM_1, [ORG_ID], [ORG_COMMON]))
+        assert plan.scope is Scope.ORGANIZATIONAL
+        assert plan.domain_ids == [ORG_ID]
+
+    def test_multiple_non_organizational_domains_are_unaffected(self):
+        """Ordinary multi-domain technical selection is untouched."""
+        plan = plan_assessment(
+            build(PROGRAM_5, [CYBER_ID, WEB_ID], [CYBER_SENIOR, WEB_SENIOR])
+        )
+        assert plan.scope is Scope.TECHNICAL
+        assert sorted(plan.domain_ids) == sorted([CYBER_ID, WEB_ID])
+
+    def test_organizational_then_technical_rejected(self):
+        err = expect_failure(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            program=PROGRAM_1,
+            domain_ids=[ORG_ID, CYBER_ID],
+        )
+        assert self.MESSAGE in err.detail
+        assert "Organizational" in err.detail
+
+    def test_technical_then_organizational_rejected(self):
+        """Order must not matter."""
+        err = expect_failure(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            program=PROGRAM_1,
+            domain_ids=[CYBER_ID, ORG_ID],
+        )
+        assert self.MESSAGE in err.detail
+
+    def test_mixed_selection_rejected_for_a_technical_program_too(self):
+        """The rule is program-independent, not just the semester-1 one-domain cap."""
+        err = expect_failure(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            program=PROGRAM_5,
+            domain_ids=[CYBER_ID, ORG_ID],
+        )
+        assert self.MESSAGE in err.detail
+
+    def test_organizational_plus_multiple_technical_domains_rejected(self):
+        """Organizational alongside SEVERAL technical domains is refused too."""
+        err = expect_failure(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            program=PROGRAM_5,
+            domain_ids=[CYBER_ID, WEB_ID, ORG_ID],
+        )
+        assert self.MESSAGE in err.detail
+
+    def test_mixed_selection_is_reported_before_the_domain_count_rules(self):
+        """A mixed pair is a COMBINATION error, not "exactly one domain"."""
+        err = expect_failure(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            program=PROGRAM_1,
+            domain_ids=[ORG_ID, CYBER_ID],
+        )
+        assert "exactly one" not in err.detail
+
+    def test_unknown_id_next_to_organizational_is_still_not_found(self):
+        """An unresolvable id must not be misreported as a combination error."""
+        err = expect_failure(
+            PlanningErrorKind.DOMAIN_NOT_FOUND,
+            program=PROGRAM_5,
+            domain_ids=["d-missing", ORG_ID],
+        )
+        assert "does not exist" in err.detail
+        assert self.MESSAGE not in err.detail
+
+
 # ---------------------------------------------------------------------------
 # 9-10, 29. Module configuration (the only content source)
 # ---------------------------------------------------------------------------

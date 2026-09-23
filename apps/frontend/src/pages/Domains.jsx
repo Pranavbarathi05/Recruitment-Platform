@@ -29,16 +29,99 @@ function requestAssessmentFullscreen() {
 }
 
 /**
+ * Domains are classified by `assessmentScope`, which mirrors
+ * `domains.assessment_scope` — the same field the backend planner validates
+ * against. The Organizational domain describes a whole assessment rather than
+ * a technical track, so it is mutually exclusive with every other domain.
+ *
+ * Identity resolution is deliberately tolerant of the API contract, because
+ * treating Organizational as an ordinary technical domain is exactly the bug
+ * this rule exists to prevent:
+ *   1. `assessmentScope` (canonical) or `assessment_scope` (raw column name);
+ *   2. otherwise the catalogue's stable `slug` — `domains.slug` is UNIQUE and
+ *      is the key migrations 015/019 target — because an older/stale API
+ *      returns neither scope field and must not silently degrade into a mixed
+ *      selection;
+ *   3. otherwise the catalogue name.
+ * No UUID is hardcoded anywhere.
+ */
+const ORGANIZATIONAL_SLUGS = new Set(['organizationalroles']);
+const ORGANIZATIONAL_NAMES = new Set(['organizational roles', 'organizational']);
+
+const isOrganizational = (domain) => {
+  if (!domain) return false;
+  const scope = domain.assessmentScope ?? domain.assessment_scope;
+  if (scope != null) return scope === 'organizational';
+  const slug = String(domain.slug || '')
+    .replace(/[\s_-]/g, '')
+    .toLowerCase();
+  if (slug) return ORGANIZATIONAL_SLUGS.has(slug);
+  return ORGANIZATIONAL_NAMES.has(
+    String(domain.name || '').trim().toLowerCase()
+  );
+};
+
+const organizationalIn = (ids, domains) =>
+  domains.some((domain) => isOrganizational(domain) && ids.includes(domain.id));
+
+const ORGANIZATIONAL_EXCLUSIVE_MESSAGE =
+  'Organizational cannot be combined with other domains.';
+
+/**
+ * Pure selection transition: the current selection plus the clicked domain
+ * produce the next selection. Written as one reducer over the previous state
+ * (rather than reading `selectedDomains` from the render closure) so two clicks
+ * in the same tick cannot interleave, and so every path that could produce a
+ * mixed Organizational + technical selection is provably closed:
+ *
+ *   [Cyber] + click Organizational -> [Organizational]
+ *   [Organizational] + click Cyber -> [Organizational] (click refused)
+ *
+ * Neither order can ever reach [Organizational, Cyber].
+ */
+function reconcileSelection(selection, clicked, domains) {
+  const ids = selection.ids;
+
+  // Deselecting is always allowed — the only way out of the Organizational lock.
+  if (ids.includes(clicked.id)) {
+    return { ids: ids.filter((id) => id !== clicked.id), notice: null };
+  }
+
+  // Organizational is already selected: nothing else may join it.
+  if (organizationalIn(ids, domains)) {
+    return { ids, notice: ORGANIZATIONAL_EXCLUSIVE_MESSAGE };
+  }
+
+  // Selecting Organizational replaces every other selection outright.
+  if (isOrganizational(clicked)) {
+    return {
+      ids: [clicked.id],
+      notice:
+        ids.length > 0
+          ? `${ORGANIZATIONAL_EXCLUSIVE_MESSAGE} Your other selections were cleared.`
+          : null,
+    };
+  }
+
+  if (ids.length >= 2) {
+    return selection; // unchanged: the ordinary cap stays 2
+  }
+  return { ids: [...ids, clicked.id], notice: null };
+}
+
+/**
  * Domains Page
  *
  * Fetches active domains from the backend.
  * Candidate selects 1 or 2 domains, then starts assessment.
+ * The Organizational domain may only ever be selected on its own.
  */
 const Domains = () => {
   const [domains, setDomains] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [selectedDomains, setSelectedDomains] = useState([]);
+  // Selection and its exclusivity notice move together, atomically.
+  const [selection, setSelection] = useState({ ids: [], notice: null });
   const [starting, setStarting] = useState(false);
   const { getAuthHeaders } = useAuth();
   const navigate = useNavigate();
@@ -69,21 +152,30 @@ const Domains = () => {
     fetchDomains();
   }, [apiUrl]);
 
-  const toggleDomain = (domainId) => {
-    setSelectedDomains((prev) => {
-      if (prev.includes(domainId)) {
-        return prev.filter((id) => id !== domainId);
-      }
-      if (prev.length >= 2) {
-        return prev; // Max 2
-      }
-      return [...prev, domainId];
-    });
-  };
+  // Derived from the same state the cards render, so the UI can never show a
+  // selection the exclusivity logic disagrees with.
+  const selectedDomains = selection.ids;
+  const notice = selection.notice;
+  const organizationalSelected = organizationalIn(selectedDomains, domains);
+
+  const toggleDomain = (domain) =>
+    setSelection((prev) => reconcileSelection(prev, domain, domains));
 
   const handleStartAssessment = async () => {
     if (selectedDomains.length === 0) {
       setError('Please select at least one domain.');
+      return;
+    }
+
+    // Defence in depth: the selection state can never hold a mixed
+    // combination, and an invalid one must never reach the API either (the
+    // backend rejects it independently).
+    if (organizationalSelected && selectedDomains.length > 1) {
+      setSelection((prev) => ({
+        ...prev,
+        notice: ORGANIZATIONAL_EXCLUSIVE_MESSAGE,
+      }));
+      setError(ORGANIZATIONAL_EXCLUSIVE_MESSAGE);
       return;
     }
 
@@ -135,7 +227,9 @@ const Domains = () => {
         <div className="text-center mb-12">
           <h1 className="text-4xl font-bold text-theme-primary mb-4">Choose Your Domain</h1>
           <p className="text-theme-secondary text-lg max-w-2xl mx-auto">
-            Select up to 2 domains for your assessment.
+            Select up to 2 domains for your assessment. The Organizational
+            domain is a standalone assessment and cannot be combined with other
+            domains.
           </p>
 
         </div>
@@ -155,6 +249,17 @@ const Domains = () => {
           </div>
         )}
 
+        {/* Organizational exclusivity notice */}
+        {notice && (
+          <div
+            role="status"
+            className="bg-yellow-900/30 border border-yellow-500 text-yellow-200 px-6 py-4 rounded-lg max-w-2xl mx-auto mb-6"
+          >
+            <p className="font-semibold">Organizational</p>
+            <p>{notice}</p>
+          </div>
+        )}
+
         {/* Selection info */}
         {!loading && !error && domains.length > 0 && (
           <div className="text-center mb-8">
@@ -163,6 +268,11 @@ const Domains = () => {
                 ? 'Select 1 or 2 domains to begin'
                 : `${selectedDomains.length} domain${selectedDomains.length > 1 ? 's' : ''} selected`}
             </p>
+            {organizationalSelected && (
+              <p className="text-theme-muted text-sm mt-1">
+                Organizational is a standalone assessment.
+              </p>
+            )}
           </div>
         )}
 
@@ -171,16 +281,25 @@ const Domains = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 mb-8">
             {domains.map((domain, index) => {
               const isSelected = selectedDomains.includes(domain.id);
+              // While Organizational is selected every other card is locked:
+              // clicking one only explains why it cannot be added.
+              const locked = organizationalSelected && !isSelected;
               const gradientColor = domainColors[index % domainColors.length];
 
               return (
                 <div
                   key={domain.id}
-                  onClick={() => toggleDomain(domain.id)}
-                  className={`bg-theme-secondary rounded-lg overflow-hidden cursor-pointer transition-all duration-300 shadow-lg hover:shadow-2xl ${
+                  onClick={() => toggleDomain(domain)}
+                  aria-disabled={locked || undefined}
+                  title={locked ? ORGANIZATIONAL_EXCLUSIVE_MESSAGE : undefined}
+                  className={`bg-theme-secondary rounded-lg overflow-hidden transition-all duration-300 shadow-lg ${
+                    locked ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:shadow-2xl'
+                  } ${
                     isSelected
                       ? 'ring-2 ring-blue-500 scale-[1.02]'
-                      : 'hover:transform hover:scale-105'
+                      : locked
+                        ? ''
+                        : 'hover:transform hover:scale-105'
                   }`}
                 >
                   <div className={`h-2 bg-gradient-to-r ${gradientColor}`} />

@@ -61,6 +61,7 @@ from services.assessment_planner import (
     ModuleConfigInput,
     ProgramInput,
     Scope,
+    assert_organizational_exclusive,
     plan_assessment,
 )
 
@@ -301,6 +302,24 @@ def _pool_required(modular_counts) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _planning_refusal(
+    exc: AssessmentPlanningError, semester: int, domain_ids
+) -> HTTPException:
+    """Map a planner refusal onto the candidate-facing 400.
+
+    Planner details are safe candidate-facing text (domain names, counts,
+    reasons) — they never contain answers, flags, scores or remarks.
+    """
+    logger.warning(
+        "Assessment planning refused [%s] semester=%s domains=%s: %s",
+        exc.kind.value,
+        semester,
+        domain_ids,
+        exc.detail,
+    )
+    return HTTPException(status_code=400, detail=exc.detail)
+
+
 def plan_new_attempt(
     *, config: dict, semester: int, requested_domain_ids
 ) -> AssessmentPlan:
@@ -324,7 +343,20 @@ def plan_new_attempt(
             ),
         )
 
-    # 2. Per-domain module configuration for this programme's family.
+    # 2. Domain catalogue, then the selection rule.
+    #
+    # The Organizational domain is mutually exclusive with every other domain,
+    # so a mixed selection is refused BEFORE any module configuration or content
+    # pool is loaded: an invalid combination must never reach question selection,
+    # and must not cost pool queries either. The planner re-asserts the same rule
+    # (see assert_organizational_exclusive), so no caller can bypass it.
+    domains = load_domain_catalogue(domain_ids)
+    try:
+        assert_organizational_exclusive(domains)
+    except AssessmentPlanningError as exc:
+        raise _planning_refusal(exc, semester, domain_ids) from exc
+
+    # 3. Per-domain module configuration for this programme's family.
     #
     # For a technical scope these rows only switch on OPTIONAL modules, so the
     # result may legitimately be empty or partial. For the organizational scope
@@ -333,7 +365,7 @@ def plan_new_attempt(
     family = config_family_for(program)
     module_configs = load_module_configs(domain_ids, family)
 
-    # 3. Global, module-independent values.
+    # 4. Global, module-independent values.
     coding_problem_count = int(config.get("coding_problem_count", 0) or 0)
     coding_enabled = bool(program.coding_enabled) and program.scope is Scope.TECHNICAL
 
@@ -341,7 +373,7 @@ def plan_new_attempt(
     request = AssessmentPlanRequest(
         program=program,
         requested_domain_ids=domain_ids,
-        domains=load_domain_catalogue(domain_ids),
+        domains=domains,
         module_configs=module_configs,
         base_duration_minutes=int(config["duration_minutes"]),
         global_coding_problem_count=coding_problem_count,
@@ -375,13 +407,4 @@ def plan_new_attempt(
     try:
         return plan_assessment(request)
     except AssessmentPlanningError as exc:
-        # Planner details are safe candidate-facing text (domain names, counts,
-        # reasons) — they never contain answers, flags, scores or remarks.
-        logger.warning(
-            "Assessment planning refused [%s] semester=%s domains=%s: %s",
-            exc.kind.value,
-            semester,
-            domain_ids,
-            exc.detail,
-        )
-        raise HTTPException(status_code=400, detail=exc.detail) from exc
+        raise _planning_refusal(exc, semester, domain_ids) from exc

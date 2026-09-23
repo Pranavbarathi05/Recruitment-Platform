@@ -226,4 +226,125 @@ describe('AdminResults — Hands-On Challenge Responses section', () => {
     expect(await screen.findByText('Question Review')).toBeInTheDocument();
     expect(screen.queryByText('Hands-On Challenge Responses')).not.toBeInTheDocument();
   });
+
+  it('presents a solved SQL WASM challenge as a validation pass, not a flag check', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [{
+        question_id: 'h-sql',
+        title: 'Employee Analytics — SQL',
+        challenge_type: 'sql_wasm',
+        difficulty: 'easy',
+        points: 100,
+        submitted_input: 'SELECT department, AVG(salary) FROM employees GROUP BY department;',
+        submitted_flag: '',
+        verified: true,
+        score: 100,
+        started_at: '2026-09-14T10:00:00Z',
+        completed_at: '2026-09-14T10:05:00Z',
+        attempted: true,
+      }],
+    })));
+
+    expect(await screen.findByText('Hands-On Challenge Responses')).toBeInTheDocument();
+    expect(screen.getByText('Type: SQL WASM')).toBeInTheDocument();
+    expect(screen.getByText('Score: 100 / 100')).toBeInTheDocument();
+    expect(screen.getByText(/Validation: ✓ Passed/)).toBeInTheDocument();
+    // A WASM challenge is not flag-scored, so no flag field is implied.
+    expect(screen.queryByText(/Flag Submitted/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Verification:/)).not.toBeInTheDocument();
+    expect(screen.getByText('Submitted Code:')).toBeInTheDocument();
+    expect(screen.getByText(/AVG\(salary\)/)).toBeInTheDocument();
+  });
+
+  it('presents a solved Pandas WASM challenge with its code and no flag evidence', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [{
+        question_id: 'h-pd',
+        title: 'Employee Analytics — Pandas',
+        challenge_type: 'pandas_wasm',
+        difficulty: 'easy',
+        points: 100,
+        submitted_input: 'result = df.groupby("department").size()',
+        submitted_flag: null,
+        verified: true,
+        score: 100,
+        started_at: '2026-09-14T10:00:00Z',
+        completed_at: '2026-09-14T10:05:00Z',
+        attempted: true,
+      }],
+    })));
+
+    expect(await screen.findByText('Type: Pandas WASM')).toBeInTheDocument();
+    expect(screen.getByText(/Validation: ✓ Passed/)).toBeInTheDocument();
+    expect(screen.queryByText(/Flag Submitted/)).not.toBeInTheDocument();
+    expect(screen.queryByText('—')).not.toBeInTheDocument();
+  });
+
+  it('shows a failed WASM validation with zero points', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [{
+        question_id: 'h-sql',
+        title: 'Employee Analytics — SQL',
+        challenge_type: 'sql_wasm',
+        difficulty: 'easy',
+        points: 100,
+        submitted_input: 'SELECT 1;',
+        submitted_flag: '',
+        verified: false,
+        score: 0,
+        started_at: '2026-09-14T10:00:00Z',
+        completed_at: null,
+        attempted: true,
+      }],
+      handsOnScore: 0,
+    })));
+
+    expect(await screen.findByText(/Validation: ✗ Failed/)).toBeInTheDocument();
+    expect(screen.getByText('Score: 0 / 100')).toBeInTheDocument();
+    expect(screen.getByText('✗ Not Completed')).toBeInTheDocument();
+  });
+
+  it('renders WASM and flag challenges side by side without confusing them', async () => {
+    renderPage(mockFetch(buildHandsOnResults({
+      handsOn: [
+        {
+          question_id: 'h-sql',
+          title: 'Employee Analytics — SQL',
+          challenge_type: 'sql_wasm',
+          difficulty: 'easy',
+          points: 100,
+          submitted_input: 'SELECT 1;',
+          submitted_flag: '',
+          verified: true,
+          score: 100,
+          started_at: '2026-09-14T10:00:00Z',
+          completed_at: '2026-09-14T10:05:00Z',
+          attempted: true,
+        },
+        {
+          question_id: 'h-flag',
+          title: 'SQL Injection — Employee Portal',
+          challenge_type: 'sql_injection_employee_portal',
+          difficulty: 'medium',
+          points: 10,
+          submitted_input: "' OR 1=1 --",
+          submitted_flag: 'FLAG{sql1}',
+          verified: true,
+          score: 10,
+          started_at: '2026-09-14T10:06:00Z',
+          completed_at: '2026-09-14T10:07:00Z',
+          attempted: true,
+        },
+      ],
+      handsOnScore: 110,
+      handsOnMax: 110,
+    })));
+
+    expect(await screen.findByText('Type: SQL WASM')).toBeInTheDocument();
+    expect(screen.getByText('Type: Flag challenge')).toBeInTheDocument();
+    // Only the flag challenge exposes flag material and flag-verification wording.
+    expect(screen.getByText('FLAG{sql1}')).toBeInTheDocument();
+    expect(screen.getByText(/Verification: ✓ Correct/)).toBeInTheDocument();
+    expect(screen.getByText(/Validation: ✓ Passed/)).toBeInTheDocument();
+  });
 });

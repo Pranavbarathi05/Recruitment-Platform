@@ -10,7 +10,7 @@ def get_active_domains():
     try:
         response = (
             supabase_client.table("domains")
-            .select("id, name, slug, description")
+            .select("id, name, slug, description, assessment_scope")
             .eq("is_active", True)
             .order("name")
             .execute()
@@ -46,6 +46,11 @@ def get_active_domains():
                 "slug": domain["slug"],
                 "name": domain["name"],
                 "description": domain.get("description", ""),
+                # domains.assessment_scope ('technical' | 'organizational'). The
+                # selection UI needs it to enforce that the Organizational
+                # domain is mutually exclusive with every other domain, without
+                # matching on a name or hardcoding a UUID.
+                "assessmentScope": domain.get("assessment_scope"),
                 "questionCount": len(q_count_resp.data) if q_count_resp.data else 0,
                 "durationMinutes": assessment_duration,
             })

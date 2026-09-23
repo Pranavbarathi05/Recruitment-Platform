@@ -206,6 +206,43 @@ class AssessmentPlanningError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Domain selection rules
+# ---------------------------------------------------------------------------
+
+# Candidate-facing text for a selection that mixes the Organizational domain
+# with any other domain.
+ORGANIZATIONAL_EXCLUSIVE_DETAIL = (
+    "The Organizational domain cannot be combined with other domains. "
+    "Select it on its own, or choose technical domains only."
+)
+
+
+def assert_organizational_exclusive(domains) -> None:
+    """Reject a selection that mixes the Organizational domain with any other.
+
+    The Organizational domain (``domains.assessment_scope = 'organizational'``)
+    describes a whole assessment rather than a technical track, so it is
+    mutually exclusive with every other domain — in either order. Identity comes
+    from ``assessment_scope``, the field the rest of the planner already uses to
+    classify a domain, so nothing here relies on a domain name, a slug or a
+    hardcoded UUID.
+
+    ``domains`` may be a partial catalogue: ids that do not resolve are ignored
+    here so that DOMAIN_NOT_FOUND keeps reporting unknown domains instead of a
+    missing row being misreported as a scope problem.
+
+    Shared by the pure planner and by the orchestration layer so the fail-fast
+    check and the authoritative check can never drift apart.
+    """
+    scopes = {domain.assessment_scope for domain in domains}
+    if DomainScope.ORGANIZATIONAL in scopes and len(scopes) > 1:
+        raise AssessmentPlanningError(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            ORGANIZATIONAL_EXCLUSIVE_DETAIL,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
 # All input models ignore unknown fields. This is a deliberate safety property:
@@ -629,6 +666,16 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             PlanningErrorKind.INVALID_DOMAIN_SELECTION,
             "At least one domain must be selected",
         )
+    # Organizational is mutually exclusive with EVERY other domain, so a mixed
+    # selection is refused here — before the count limits and before any
+    # question is selected. It is checked first so a mixed selection is
+    # reported as the combination it is, rather than as "exactly one domain"
+    # or a scope mismatch.
+    catalogue = {domain.id: domain for domain in request.domains}
+    assert_organizational_exclusive(
+        [catalogue[domain_id] for domain_id in requested if domain_id in catalogue]
+    )
+
     # The organizational assessment is exactly-one-domain by definition. This
     # is asserted explicitly rather than left to max_domains, so the rule holds
     # even if a program row is misconfigured.
@@ -650,7 +697,6 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             f"Duplicate domain ids in selection: {requested}",
         )
 
-    catalogue = {domain.id: domain for domain in request.domains}
     selected = []
     for domain_id in requested:
         domain = catalogue.get(domain_id)

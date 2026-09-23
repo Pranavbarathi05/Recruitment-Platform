@@ -9057,3 +9057,532 @@ class TestHandsOnWasmConfig:
             f"/admin/hands-on-questions/{MOCK_HANDS_ID}", json=_wasm_payload()
         )
         assert r.status_code == 401
+
+
+class TestHandsOnWasmSubmitScoring:
+    """PUT /assessment/attempt/{id}/hands-on — WASM challenges are NOT flags.
+
+    Regression for the reported bug: sql_wasm / pandas_wasm submissions were
+    scored by reading the browser's 0/1 validation verdict as a *point* value
+    and capping it (min(1, 100) = 1), so a correctly solved 100-point WASM
+    challenge stored score=1 and admins saw "Score: 1 / 100" next to
+    "Verification: ✓ Correct".
+
+    Semantics under test:
+      - WASM challenges have no flag: none is sent, none is checked.
+      - The browser validator produces a binary verdict (pass/fail).
+      - The backend owns the score: passed -> the challenge's full points,
+        failed -> 0. A client-supplied point value is never trusted.
+    """
+
+    WASM_POINTS = 100
+    SQL_CODE = (
+        "SELECT department, AVG(salary) AS avg_salary\n"
+        "FROM employees\nGROUP BY department;"
+    )
+    PANDAS_CODE = (
+        'import pandas as pd\n'
+        'result = df.groupby("department").size().reset_index(name="headcount")'
+    )
+
+    def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
+        from core.auth import get_current_user
+        from main import app
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=profile_id, email="candidate@test.com"
+        )
+
+    def _attempt(self, challenge_id=MOCK_HANDS_ID):
+        attempt = _make_attempt()
+        attempt["selected_hands_on_question_ids"] = [challenge_id]
+        attempt["total_hands_on_questions"] = 1
+        return attempt
+
+    def _configure_mocks(self, mock_sb, challenge_type, points=WASM_POINTS,
+                         existing_result=None, expected_flag=None):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        a = chains.setdefault("assessment_attempts", MagicMock())
+        a.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([self._attempt()])
+        )
+
+        hq = chains.setdefault("hands_on_questions", MagicMock())
+        hq.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{
+                "id": MOCK_HANDS_ID,
+                "points": points,
+                "expected_flag": expected_flag,
+                "challenge_type": challenge_type,
+            }])
+        )
+
+        hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hr.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([existing_result] if existing_result else [])
+        )
+        hr.insert.return_value.execute.return_value = _make_mock_response([])
+        return chains
+
+    def _submit(self, client, **body):
+        payload = {"question_id": MOCK_HANDS_ID, "submitted_input": "", "submitted_flag": ""}
+        payload.update(body)
+        return client.put(
+            f"/assessment/attempt/{MOCK_ATTEMPT_ID}/hands-on", json=payload
+        )
+
+    def _inserted(self, chains):
+        return chains["assessment_hands_on_results"].insert.call_args.args[0]
+
+    # ---- SQL WASM ------------------------------------------------------
+
+    def test_sql_wasm_passing_validation_awards_full_points(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm", expected_flag=None)
+        try:
+            r = self._submit(
+                client,
+                submitted_input=self.SQL_CODE,
+                submitted_code=self.SQL_CODE,
+                validation_passed=True,
+            )
+            assert r.status_code == 200
+            # Neutral ack: no verdict, score or points leak to the candidate.
+            assert r.json() == {"status": "submitted"}
+
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            # The reported bug: this used to be 1 (the 0/1 verdict read as points)
+            assert row["score"] == self.WASM_POINTS
+            assert row["submitted_input"] == self.SQL_CODE
+            assert row["submitted_flag"] == ""
+            assert row["completed_at"] is not None
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_sql_wasm_failing_validation_scores_zero(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm")
+        try:
+            r = self._submit(
+                client,
+                submitted_input="SELECT 1;",
+                submitted_code="SELECT 1;",
+                validation_passed=False,
+            )
+            assert r.status_code == 200
+            assert r.json() == {"status": "submitted"}
+
+            row = self._inserted(chains)
+            assert row["verified"] is False
+            assert row["score"] == 0
+            assert row["completed_at"] is None
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_sql_wasm_requires_no_flag(self, client, mock_supabase):
+        """An empty (indeed absent) flag must not affect a WASM submission."""
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm", expected_flag=None)
+        try:
+            r = self._submit(
+                client,
+                submitted_code=self.SQL_CODE,
+                validation_passed=True,
+                # no submitted_flag at all -> schema default ""
+            )
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            assert row["score"] == self.WASM_POINTS
+            assert row["submitted_flag"] == ""
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_sql_wasm_never_checks_expected_flag(self, client, mock_supabase):
+        """Even if a challenge has an expected_flag, WASM ignores it."""
+        self._set_auth_override()
+        chains = self._configure_mocks(
+            mock_supabase, "sql_wasm", expected_flag="FLAG{should-not-be-used}"
+        )
+        try:
+            r = self._submit(
+                client,
+                submitted_code=self.SQL_CODE,
+                submitted_flag="FLAG{wrong}",
+                validation_passed=True,
+            )
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            assert row["score"] == self.WASM_POINTS
+            assert row["submitted_flag"] == ""
+        finally:
+            client.app.dependency_overrides.clear()
+
+    # ---- Pandas WASM ---------------------------------------------------
+
+    def test_pandas_wasm_passing_validation_awards_full_points(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "pandas_wasm")
+        try:
+            r = self._submit(
+                client,
+                submitted_input=self.PANDAS_CODE,
+                submitted_code=self.PANDAS_CODE,
+                validation_passed=True,
+            )
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            assert row["score"] == self.WASM_POINTS
+            assert row["submitted_flag"] == ""
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_pandas_wasm_failing_validation_scores_zero(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "pandas_wasm")
+        try:
+            r = self._submit(
+                client,
+                submitted_code="result = df",
+                validation_passed=False,
+            )
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is False
+            assert row["score"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    # ---- Verdict semantics ---------------------------------------------
+
+    def test_client_score_is_not_trusted_as_points(self, client, mock_supabase):
+        """A client cannot inflate a failed WASM validation into points."""
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm")
+        try:
+            r = self._submit(
+                client,
+                submitted_code="SELECT 1;",
+                validation_passed=False,
+                client_score=999,
+            )
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is False
+            assert row["score"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_legacy_client_score_of_one_still_scores_full_points(self, client, mock_supabase):
+        """Older clients send the 0/1 verdict as `client_score` — not points."""
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm")
+        try:
+            r = self._submit(client, submitted_code=self.SQL_CODE, client_score=1)
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            assert row["score"] == self.WASM_POINTS
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_legacy_client_score_of_zero_scores_zero(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm")
+        try:
+            r = self._submit(client, submitted_code="SELECT 1;", client_score=0)
+            assert r.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is False
+            assert row["score"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_validation_verdict_wins_over_legacy_client_score(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(mock_supabase, "sql_wasm")
+        try:
+            self._submit(client, submitted_code=self.SQL_CODE,
+                         validation_passed=True, client_score=0)
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            assert row["score"] == self.WASM_POINTS
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_one_submission_per_wasm_challenge_still_enforced(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(
+            mock_supabase, "sql_wasm", existing_result={"id": "existing"}
+        )
+        try:
+            r = self._submit(client, submitted_code=self.SQL_CODE, validation_passed=True)
+            assert r.status_code == 409
+            assert chains["assessment_hands_on_results"].insert.call_count == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    # ---- Flag regression -----------------------------------------------
+
+    def test_flag_challenge_behaviour_is_unchanged(self, client, mock_supabase):
+        self._set_auth_override()
+        chains = self._configure_mocks(
+            mock_supabase, "sql_injection_employee_portal",
+            expected_flag="FLAG{sql1_1nj3ct10n_p0rt4l}",
+        )
+        try:
+            ok = self._submit(
+                client,
+                submitted_input="' OR 1=1 --",
+                submitted_flag="FLAG{sql1_1nj3ct10n_p0rt4l}",
+            )
+            assert ok.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is True
+            assert row["score"] == self.WASM_POINTS
+            assert row["submitted_flag"] == "FLAG{sql1_1nj3ct10n_p0rt4l}"
+
+            chains["assessment_hands_on_results"].insert.reset_mock()
+            bad = self._submit(client, submitted_flag="FLAG{wrong}")
+            assert bad.status_code == 200
+            row = self._inserted(chains)
+            assert row["verified"] is False
+            assert row["score"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+
+class TestMixedAssessmentHandsOnScoring:
+    """_score_attempt across WASM, flag and non-hands-on content."""
+
+    def _mock_chains(self, mock_sb, hands_results, hands_ids, points):
+        chains = {}
+
+        def _table(name):
+            if name not in chains:
+                chains[name] = MagicMock()
+            return chains[name]
+
+        mock_sb.table.side_effect = _table
+        mock_sb._table_chains = chains
+
+        ans = chains.setdefault("assessment_answers", MagicMock())
+        ans.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": "a1", "question_id": MOCK_MCQ_1_ID,
+                                  "selected_option": "A"}])
+        )
+        mcq = chains.setdefault("mcq_questions", MagicMock())
+        mcq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_MCQ_1_ID, "correct_option": "A"}])
+        )
+
+        att = chains.setdefault("assessment_attempts", MagicMock())
+        att.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{
+                "selected_question_ids": [MOCK_MCQ_1_ID],
+                "selected_coding_problem_ids": [],
+                "selected_hands_on_question_ids": hands_ids,
+            }])
+        )
+
+        hq = chains.setdefault("hands_on_questions", MagicMock())
+        hq.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([{"id": qid, "points": points[qid]} for qid in hands_ids])
+        )
+        hr = chains.setdefault("assessment_hands_on_results", MagicMock())
+        hr.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response(hands_results)
+        )
+        return chains
+
+    @patch("routers.assessment.supabase_client")
+    def test_wasm_and_flag_challenges_add_up_without_flags_for_wasm(self, mock_sb):
+        from routers.assessment import _score_attempt
+
+        wasm_sql = "eeee0001-0000-0000-0000-000000000001"
+        wasm_pandas = "eeee0002-0000-0000-0000-000000000002"
+        flag = "eeee0003-0000-0000-0000-000000000003"
+        hands_ids = [wasm_sql, wasm_pandas, flag]
+        points = {wasm_sql: 100, wasm_pandas: 100, flag: 10}
+        chains = self._mock_chains(
+            mock_sb,
+            hands_results=[
+                # Both WASM challenges solved; the rows carry empty flags.
+                {"question_id": wasm_sql, "verified": True, "score": 100,
+                 "submitted_flag": ""},
+                {"question_id": wasm_pandas, "verified": True, "score": 100,
+                 "submitted_flag": ""},
+                # Unsubmitted flag challenge -> no points, still counted in max.
+            ],
+            hands_ids=hands_ids,
+            points=points,
+        )
+
+        result = _score_attempt(MOCK_ATTEMPT_ID)
+        assert result["hands_on_score"] == 200
+        assert result["hands_on_max_score"] == 210
+        # mcq (1) + coding (0) + hands-on (200)
+        assert result["score"] == 201
+
+        update_call = chains["assessment_attempts"].update.call_args.args[0]
+        assert update_call["hands_on_score"] == 200
+        assert update_call["hands_on_max_score"] == 210
+
+    @patch("routers.assessment.supabase_client")
+    def test_failed_wasm_validation_contributes_nothing(self, mock_sb):
+        from routers.assessment import _score_attempt
+
+        wasm_sql = "eeee0001-0000-0000-0000-000000000001"
+        chains = self._mock_chains(
+            mock_sb,
+            hands_results=[{"question_id": wasm_sql, "verified": False, "score": 0,
+                            "submitted_flag": ""}],
+            hands_ids=[wasm_sql],
+            points={wasm_sql: 100},
+        )
+
+        result = _score_attempt(MOCK_ATTEMPT_ID)
+        assert result["hands_on_score"] == 0
+        assert result["hands_on_max_score"] == 100
+        assert result["score"] == 1  # mcq only
+        assert chains["assessment_attempts"].update.call_args.args[0]["hands_on_score"] == 0
+
+
+class TestAdminResultsWasmHandsOnView:
+    """Admin results must present WASM challenges as WASM, not as flag checks.
+
+    Reuses TestHandsOnAdminAPI's result-payload scaffolding (helpers only — the
+    inherited tests are not re-run).
+    """
+
+    _set_admin_override = TestHandsOnAdminAPI._set_admin_override
+    _configure_results_mocks = TestHandsOnAdminAPI._configure_results_mocks
+
+    def _wasm_attempt(self, challenge_id, points=100):
+        attempt = _make_attempt(status="scored")
+        attempt["selected_hands_on_question_ids"] = [challenge_id]
+        attempt["total_hands_on_questions"] = 1
+        attempt["hands_on_score"] = points
+        attempt["hands_on_max_score"] = points
+        # The old bug: the browser's 0/1 verdict was stored as the point score.
+        attempt["score"] = points + 1
+        attempt["max_score"] = points + 24
+        return attempt
+
+    def _view(self, client, mock_supabase, challenge_type, challenge_id,
+              result_score, verified, submitted_code):
+        attempt = self._wasm_attempt(challenge_id)
+        hq_row = {
+            "id": challenge_id,
+            "title": "Employee Analytics",
+            "difficulty": "easy",
+            "points": 100,
+            "challenge_type": challenge_type,
+        }
+        hr_rows = [{
+            "question_id": challenge_id,
+            "submitted_input": submitted_code,
+            "submitted_flag": "",
+            "verified": verified,
+            "score": result_score,
+            "started_at": "2026-09-22T19:29:08Z",
+            "completed_at": "2026-09-22T19:29:08Z" if verified else None,
+        }]
+        self._configure_results_mocks(mock_supabase, attempt, hq_row, hr_rows)
+        return client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+
+    def test_sql_wasm_view_is_not_a_flag_challenge(self, client, mock_supabase):
+        self._set_admin_override()
+        try:
+            r = self._view(
+                client, mock_supabase, "sql_wasm", MOCK_HANDS_ID,
+                result_score=100, verified=True,
+                submitted_code="SELECT department FROM employees;",
+            )
+            assert r.status_code == 200
+            data = r.json()
+            assert data["hands_on_score"] == 100
+            ho = data["hands_on_results"][0]
+            # The persisted row after the fix: full points, no flag evidence.
+            assert ho["challenge_type"] == "sql_wasm"
+            assert ho["verified"] is True
+            assert ho["score"] == 100
+            assert ho["points"] == 100
+            assert ho["submitted_flag"] in (None, "")
+            assert ho["submitted_input"] == "SELECT department FROM employees;"
+            assert ho["attempted"] is True
+            assert "expected_flag" not in json.dumps(data)
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_pandas_wasm_view_is_not_a_flag_challenge(self, client, mock_supabase):
+        self._set_admin_override()
+        try:
+            r = self._view(
+                client, mock_supabase, "pandas_wasm", MOCK_HANDS_ID_2,
+                result_score=100, verified=True,
+                submitted_code="result = df.groupby('department').size()",
+            )
+            assert r.status_code == 200
+            ho = r.json()["hands_on_results"][0]
+            assert ho["challenge_type"] == "pandas_wasm"
+            assert ho["verified"] is True
+            assert ho["score"] == 100
+            assert ho["submitted_flag"] in (None, "")
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_failed_wasm_view_scores_zero(self, client, mock_supabase):
+        self._set_admin_override()
+        try:
+            r = self._view(
+                client, mock_supabase, "sql_wasm", MOCK_HANDS_ID,
+                result_score=0, verified=False, submitted_code="SELECT 1;",
+            )
+            assert r.status_code == 200
+            ho = r.json()["hands_on_results"][0]
+            assert ho["verified"] is False
+            assert ho["score"] == 0
+            assert ho["attempted"] is True
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_flag_challenge_view_keeps_flag_evidence(self, client, mock_supabase):
+        self._set_admin_override()
+        attempt = self._wasm_attempt(MOCK_HANDS_ID, points=10)
+        hq_row = {
+            "id": MOCK_HANDS_ID, "title": "SQL Injection",
+            "difficulty": "medium", "points": 10,
+            "challenge_type": "sql_injection_employee_portal",
+        }
+        hr_rows = [{
+            "question_id": MOCK_HANDS_ID,
+            "submitted_input": "' OR 1=1 --",
+            "submitted_flag": "FLAG{sql1_1nj3ct10n_p0rt4l}",
+            "verified": True, "score": 10,
+            "started_at": "2026-09-22T18:28:39Z",
+            "completed_at": "2026-09-22T18:28:39Z",
+        }]
+        self._configure_results_mocks(mock_supabase, attempt, hq_row, hr_rows)
+        try:
+            r = client.get(f"/admin/assessments/{MOCK_ATTEMPT_ID}/results")
+            assert r.status_code == 200
+            ho = r.json()["hands_on_results"][0]
+            assert ho["challenge_type"] == "sql_injection_employee_portal"
+            # Flag challenges keep their flag evidence in the admin view.
+            assert ho["submitted_flag"] == "FLAG{sql1_1nj3ct10n_p0rt4l}"
+            assert ho["verified"] is True
+            assert ho["score"] == 10
+        finally:
+            client.app.dependency_overrides.clear()
