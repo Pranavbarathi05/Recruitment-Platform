@@ -259,7 +259,7 @@ const getDefaultStarter = (lang, problem) => {
 const AssessmentWorkspace = () => {
   const { attemptId } = useParams();
   const navigate = useNavigate();
-  const { getAuthHeaders } = useAuth();
+  const { getAuthHeaders, sessionExpired } = useAuth();
 
   const [activeTab, setActiveTab] = useState('mcq');
 
@@ -444,10 +444,14 @@ const AssessmentWorkspace = () => {
       // Cookie auth — always available
       const lang = codingStates[problem.id]?.language || 'python3';
       try {
-        await fetch(`${apiUrl}/coding/attempt/${attemptId}/draft`, {
+        const resp = await fetch(`${apiUrl}/coding/attempt/${attemptId}/draft`, {
           method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
           body: JSON.stringify({ problem_id: problem.id, language: lang, source_code: currentCode }),
         });
+        if (resp.status === 401) {
+          sessionExpired();
+          return;
+        }
         lastSavedRef.current[problem.id] = currentCode;
       } catch { /* silent */ }
     }, 2000);
@@ -464,7 +468,11 @@ const AssessmentWorkspace = () => {
         fetch(`${apiUrl}/assessment/attempt/${attemptId}/answers`, {
           method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
           body: JSON.stringify({ question_id: questionId, selected_option: option }),
-        }).catch(() => {});
+        })
+          // 401 = the login session ended: leave cleanly instead of
+          // pretending the answer was saved.
+          .then((r) => { if (r.status === 401) sessionExpired(); })
+          .catch(() => {});
       }
       return next;
     });
@@ -478,7 +486,9 @@ const AssessmentWorkspace = () => {
         fetch(`${apiUrl}/assessment/attempt/${attemptId}/descriptive-answers`, {
           method: 'PUT', headers: getAuthHeaders(), credentials: 'include',
           body: JSON.stringify({ question_id: questionId, answer_text: text }),
-        }).catch(() => {});
+        })
+          .then((r) => { if (r.status === 401) sessionExpired(); })
+          .catch(() => {});
       }
       return next;
     });
@@ -510,6 +520,10 @@ const AssessmentWorkspace = () => {
       body: JSON.stringify(body),
     });
     const data = await resp.json().catch(() => ({}));
+    if (resp.status === 401) {
+      sessionExpired();
+      return { status: 'session_expired' };
+    }
     if (resp.status === 409) {
       // Backend enforces one submission per challenge: a 409 means a result
       // already exists (refresh, second tab, direct API call). Lock the form
@@ -555,6 +569,7 @@ const AssessmentWorkspace = () => {
       body: JSON.stringify({ problem_id: problem.id, language: state.language, source_code: state.code }),
     });
     if (!resp.ok) {
+      if (resp.status === 401) sessionExpired();
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || 'Failed to run code');
     }
@@ -601,6 +616,8 @@ const AssessmentWorkspace = () => {
         const result = await resp.json();
         setCodingSubmissions((prev) => ({ ...prev, [problem.id]: result }));
         setCodingRunResults(null);
+      } else if (resp.status === 401) {
+        sessionExpired();
       }
     } catch { /* handled */ } finally {
       setCodingSubmitting(false);
@@ -620,6 +637,14 @@ const AssessmentWorkspace = () => {
       const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/submit`, {
         method: 'POST', headers: getAuthHeaders(), credentials: 'include',
       });
+      // 401 = the login session expired mid-attempt. Leave cleanly through
+      // AuthContext (ProtectedRoute → /login with the expiry notice). The
+      // attempt is NOT finalized — it stays in_progress server-side and
+      // resumes after re-login, so auth expiry never destroys it.
+      if (resp.status === 401) {
+        sessionExpired();
+        return;
+      }
       // 409 = the attempt was already finalized server-side (e.g. submit ran
       // twice, or the timer auto-submit raced a manual submit) — that is a
       // success from the candidate's point of view.

@@ -28,7 +28,14 @@ import httpx
 from fastapi import APIRouter, HTTPException, Depends, Response, Request
 from pydantic import BaseModel, Field
 
-from core.auth import decode_supabase_token, AuthUser
+from core.auth import (
+    ASSESSMENT_COOKIE_NAME,
+    AuthUser,
+    SESSION_MAX_AGE_SECONDS,
+    decode_assessment_capability,
+    decode_supabase_token,
+    validate_assessment_capability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +47,13 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 # Cookie configuration
 COOKIE_NAME = "dsc_session"
-COOKIE_MAX_AGE = 3600 * 24  # 24 hours
+# The SESSION cookie lives at most SESSION_MAX_AGE_SECONDS (2 hours — see
+# core.auth). Its Max-Age is min(Supabase-issued expires_in, this ceiling),
+# so it can never outlive the JWT it carries and can never exceed 2 hours
+# even if the Supabase JWT expiry setting is raised later.
+SESSION_COOKIE_MAX_AGE = SESSION_MAX_AGE_SECONDS
+# CSRF double-submit cookie only — NOT a login session (24 hours).
+COOKIE_MAX_AGE = 3600 * 24
 COOKIE_PATH = "/"
 CSRF_COOKIE_NAME = "dsc_csrf"
 
@@ -153,12 +166,22 @@ async def _supabase_sign_out(access_token: str) -> None:
         logger.warning(f"Supabase logout failed (non-critical): {e}")
 
 
-def _set_session_cookie(response: Response, access_token: str, expires_in: int = COOKIE_MAX_AGE) -> None:
-    """Set the session cookie on the response."""
+def _set_session_cookie(
+    response: Response,
+    access_token: str,
+    expires_in: int = SESSION_COOKIE_MAX_AGE,
+) -> None:
+    """Set the session cookie on the response.
+
+    Max-Age = min(expires_in, SESSION_COOKIE_MAX_AGE): the cookie expires with
+    the JWT it carries (never later than the Supabase TTL) and is additionally
+    capped at the application's 2-hour absolute session ceiling.
+    """
+    max_age = min(int(expires_in), SESSION_COOKIE_MAX_AGE)
     response.set_cookie(
         key=COOKIE_NAME,
         value=access_token,
-        max_age=expires_in,
+        max_age=max_age,
         path=COOKIE_PATH,
         httponly=True,
         samesite="lax",
@@ -182,7 +205,12 @@ def _set_csrf_cookie(response: Response) -> str:
 
 
 def _clear_session_cookie(response: Response) -> None:
-    """Clear the session cookie."""
+    """Clear the session, CSRF and assessment-capability cookies.
+
+    Logout also revokes assessment access: the capability is HttpOnly and
+    server-issued, so deleting it here (edge case below is handled by the
+    row re-check anyway) is the explicit, immediate revocation path.
+    """
     response.delete_cookie(
         key=COOKIE_NAME,
         path=COOKIE_PATH,
@@ -197,6 +225,43 @@ def _clear_session_cookie(response: Response) -> None:
         samesite="lax",
         secure=IS_PRODUCTION,
     )
+    response.delete_cookie(
+        key=ASSESSMENT_COOKIE_NAME,
+        path=COOKIE_PATH,
+        httponly=True,
+        samesite="lax",
+        secure=IS_PRODUCTION,
+    )
+
+
+def _reconcile_assessment_cookie(
+    response: Response,
+    request: Request,
+    user_id: Optional[str],
+) -> None:
+    """Keep an assessment capability across re-login only for its OWN owner.
+
+    A candidate resuming an in-flight assessment must be able to log back in
+    after the 2-hour session expired WITHOUT losing the attempt — so a valid
+    capability belonging to the same user is deliberately left untouched.
+    A capability for a different user (or an invalid one) is deleted so a
+    new login can never inherit someone else's assessment access.
+    """
+    token = request.cookies.get(ASSESSMENT_COOKIE_NAME)
+    keep = False
+    if token and user_id:
+        try:
+            keep = decode_assessment_capability(token).get("sub") == user_id
+        except HTTPException:
+            keep = False
+    if not keep:
+        response.delete_cookie(
+            key=ASSESSMENT_COOKIE_NAME,
+            path=COOKIE_PATH,
+            httponly=True,
+            samesite="lax",
+            secure=IS_PRODUCTION,
+        )
 
 
 def _extract_token_from_request(request: Request) -> Optional[str]:
@@ -266,6 +331,7 @@ async def signup(payload: SignupRequest, request: Request, response: Response):
         # Set session cookie (JWT never returned to browser)
         _set_session_cookie(response, access_token, expires_in)
         _set_csrf_cookie(response)
+        _reconcile_assessment_cookie(response, request, user.get("id"))
 
         return AuthResponse(
             user={"id": user.get("id"), "email": user.get("email")},
@@ -294,6 +360,7 @@ async def login(payload: LoginRequest, request: Request, response: Response):
         # Set session cookie (JWT never returned to browser)
         _set_session_cookie(response, access_token, expires_in)
         _set_csrf_cookie(response)
+        _reconcile_assessment_cookie(response, request, user.get("id"))
 
         return AuthResponse(
             user={"id": user.get("id"), "email": user.get("email")},
@@ -339,3 +406,23 @@ async def get_me(request: Request):
     except Exception as e:
         logger.error(f"Token verification error: {e}")
         raise HTTPException(status_code=401, detail="Invalid session")
+
+
+@router.get("/assessment-access")
+async def assessment_access(request: Request):
+    """Return the LIVE attempt this browser is currently authorized for.
+
+    Used by the frontend when the login session has expired (or /auth/me
+    401s) so an in-flight assessment can resume instead of bouncing the
+    candidate to the login screen.
+
+    Grants NOTHING by itself: validate_assessment_capability re-checks the
+    attempt row (ownership, status == in_progress, frozen expiry) and returns
+    401 for every failure mode — so this endpoint is true exactly while, and
+    only while, an assessment-scoped capability is legitimately active.
+    """
+    try:
+        attempt = validate_assessment_capability(request)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="No active assessment access")
+    return {"attempt_id": attempt["id"]}

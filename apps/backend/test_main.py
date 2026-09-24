@@ -5400,10 +5400,13 @@ class TestDescriptiveStartFlow:
         )
 
     def _set_auth_override(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
         return app
 
@@ -5498,10 +5501,13 @@ class TestDescriptiveQuestionsEndpoint:
     """GET /assessment/attempt/{id}/questions returns descriptive questions."""
 
     def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=profile_id, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _configure_questions_mocks(self, mock_sb, attempt, desc_questions, attempt_owner=MOCK_PROFILE_ID):
@@ -6015,10 +6021,13 @@ class TestAdminRemarkSecurity:
     """Candidate-facing endpoints must never expose admin_remark."""
 
     def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=profile_id, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     @patch("routers.assessment.supabase_client")
@@ -6231,10 +6240,13 @@ class TestSaveDescriptiveAnswerWordLimit:
     """PUT /assessment/attempt/{id}/descriptive-answers enforces word_limit."""
 
     def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=profile_id, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _attempt(self, **overrides):
@@ -6398,10 +6410,13 @@ class TestAdminResultsDescriptive:
     """GET /admin/assessments/{id}/results includes descriptive Q&A."""
 
     def _set_admin_override(self):
-        from core.auth import get_current_user, require_admin
+        from core.auth import get_current_user, require_admin, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="admin@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
         app.dependency_overrides[require_admin] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="admin@test.com"
@@ -6531,10 +6546,13 @@ class TestAdminResultsDescriptive:
             client.app.dependency_overrides.clear()
 
     def test_candidate_rejected_from_results(self, client, mock_supabase):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="cand@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
         self._configure_mocks(mock_supabase, self._attempt(), desc_questions=[], desc_answers=[])
         try:
@@ -6566,10 +6584,13 @@ class TestHandsOnStartFlow:
         )
 
     def _set_auth_override(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
         return app
 
@@ -6630,10 +6651,13 @@ class TestHandsOnQuestionsEndpoint:
     """GET /assessment/attempt/{id}/questions returns hands-on metadata."""
 
     def _set_auth_override(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _configure_mocks(self, mock_sb, attempt, ho_question=None, ho_results=None):
@@ -6769,10 +6793,13 @@ class TestHandsOnSubmitVerification:
     WRONG_FLAG = "FLAG{wrong}"
 
     def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=profile_id, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _configure_mocks(self, mock_sb, attempt, expected_flag=EXPECTED_FLAG,
@@ -7447,10 +7474,13 @@ class TestSubmissionLifecycle:
     """Submit finalizes the attempt server-side; completed attempts cannot resume."""
 
     def _set_auth_override(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _score_attempt_chains(self, mock_sb, hands_on=True):
@@ -8537,10 +8567,13 @@ class TestAttemptFrozenOnResume:
     """POST /assessment/start resume must return the frozen attempt, read-only."""
 
     def _auth(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def test_resume_ignores_live_config_changes(self, client, mock_supabase):
@@ -8653,10 +8686,13 @@ class TestAttemptFrozenOnQuestionsFetch:
     """GET /assessment/attempt/{id}/questions reads frozen sections, no writes."""
 
     def _auth(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _configure(self, mock_sb, attempt):
@@ -8753,10 +8789,13 @@ class TestAttemptExpiryUnchanged:
     """E: the existing expiry / scoring path still behaves as before."""
 
     def _auth(self):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     @patch("routers.assessment._score_attempt")
@@ -9086,10 +9125,13 @@ class TestHandsOnWasmSubmitScoring:
     )
 
     def _set_auth_override(self, profile_id=MOCK_PROFILE_ID):
-        from core.auth import get_current_user
+        from core.auth import get_current_user, get_assessment_actor
         from main import app
         app.dependency_overrides[get_current_user] = lambda: AuthUser(
             id=profile_id, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
         )
 
     def _attempt(self, challenge_id=MOCK_HANDS_ID):
@@ -9586,3 +9628,450 @@ class TestAdminResultsWasmHandsOnView:
             assert ho["score"] == 10
         finally:
             client.app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# Two-hour absolute login session (core.auth.SESSION_MAX_AGE_SECONDS)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionLifetime:
+    """The login session is hard-limited to 2 hours, server-side.
+
+    Three aligned layers, all at SESSION_MAX_AGE_SECONDS (7200 s):
+      1. the dsc_session cookie Max-Age is min(expires_in, 7200),
+      2. jwt.decode verifies the Supabase-issued `exp`,
+      3. decode_supabase_token rejects any token whose `iat` is older than
+         7200 s even when `exp` claims it is still valid.
+
+    There is deliberately NO refresh endpoint in the app: the refresh_token
+    GoTrue returns at login is discarded, so nothing can extend a session
+    beyond a single access-token lifetime — and never past the 2h ceiling.
+    """
+
+    # The tests sign their own HS256 tokens with a known secret and patch
+    # core.auth to verify against it, so they never depend on the host
+    # environment's SUPABASE_JWT_SECRET (which may be empty when the JWKS
+    # path is the configured one).
+    TEST_SECRET = "test-session-secret"
+
+    def _make_token(self, iat_offset_seconds, exp_offset_seconds):
+        """Craft a correctly signed Supabase-shaped JWT (HS256, test secret)."""
+        import jwt as pyjwt
+        from core.auth import SUPABASE_ISSUER
+
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": "user-123",
+            "email": "test@example.com",
+            "aud": "authenticated",
+            "iss": SUPABASE_ISSUER,
+            "iat": int((now + timedelta(seconds=iat_offset_seconds)).timestamp()),
+            "exp": int((now + timedelta(seconds=exp_offset_seconds)).timestamp()),
+        }
+        return pyjwt.encode(payload, self.TEST_SECRET, algorithm="HS256")
+
+    def test_session_ceiling_is_two_hours(self):
+        """The application-owned ceiling is exactly 2 hours."""
+        from core.auth import SESSION_MAX_AGE_SECONDS
+
+        assert SESSION_MAX_AGE_SECONDS == 2 * 60 * 60
+
+    @patch("routers.auth._supabase_sign_in")
+    def test_session_cookie_capped_at_two_hours(self, mock_login, client):
+        """A 24h Supabase TTL still yields a 7200s cookie (application cap)."""
+        mock_login.return_value = {
+            "access_token": "test-jwt",
+            "user": {"id": "u1", "email": "a@b.com"},
+            "expires_in": 86400,
+        }
+        response = client.post(
+            "/auth/login", json={"email": "a@b.com", "password": "pass1234"}
+        )
+        assert response.status_code == 200
+        assert "Max-Age=7200" in response.headers.get("set-cookie", "")
+
+    @patch("routers.auth._supabase_sign_in")
+    def test_session_cookie_never_outlives_the_jwt(self, mock_login, client):
+        """expires_in smaller than the cap is preserved verbatim."""
+        mock_login.return_value = {
+            "access_token": "test-jwt",
+            "user": {"id": "u1", "email": "a@b.com"},
+            "expires_in": 3600,
+        }
+        response = client.post(
+            "/auth/login", json={"email": "a@b.com", "password": "pass1234"}
+        )
+        assert response.status_code == 200
+        set_cookie = response.headers.get("set-cookie", "")
+        assert "Max-Age=3600" in set_cookie
+        assert "Max-Age=7200" not in set_cookie
+
+    def test_fresh_token_accepted(self, client):
+        """A token issued seconds ago passes both exp and the 2h ceiling."""
+        with patch("core.auth._get_jwk_client", return_value=None), patch(
+            "core.auth.SUPABASE_JWT_SECRET", self.TEST_SECRET
+        ):
+            token = self._make_token(iat_offset_seconds=-60, exp_offset_seconds=7140)
+            response = client.get("/auth/me", cookies={"dsc_session": token})
+        assert response.status_code == 200
+        assert response.json()["id"] == "user-123"
+
+    def test_token_older_than_two_hours_rejected_even_if_exp_valid(self, client):
+        """The iat ceiling bites BEFORE exp: age > 7200 => 401 regardless of exp.
+
+        This is what makes the 2-hour limit structurally un-extendable: even a
+        token whose exp claims days of validity is dead at 2 hours.
+        """
+        with patch("core.auth._get_jwk_client", return_value=None), patch(
+            "core.auth.SUPABASE_JWT_SECRET", self.TEST_SECRET
+        ):
+            token = self._make_token(
+                iat_offset_seconds=-7201, exp_offset_seconds=3600 * 24
+            )
+            response = client.get("/auth/me", cookies={"dsc_session": token})
+        assert response.status_code == 401
+
+    def test_expired_token_still_rejected(self, client):
+        """Standard Supabase exp verification is unchanged."""
+        with patch("core.auth._get_jwk_client", return_value=None), patch(
+            "core.auth.SUPABASE_JWT_SECRET", self.TEST_SECRET
+        ):
+            token = self._make_token(iat_offset_seconds=-7300, exp_offset_seconds=-60)
+            response = client.get("/auth/me", cookies={"dsc_session": token})
+        assert response.status_code == 401
+
+    def test_authenticated_endpoint_enforces_the_ceiling(self, client):
+        """The ceiling applies to EVERY authenticated route via get_current_user."""
+        with patch("core.auth._get_jwk_client", return_value=None), patch(
+            "core.auth.SUPABASE_JWT_SECRET", self.TEST_SECRET
+        ):
+            token = self._make_token(iat_offset_seconds=-7201, exp_offset_seconds=3600)
+            response = client.get("/assessment/current", cookies={"dsc_session": token})
+        assert response.status_code == 401
+
+    def test_no_refresh_endpoint_exists(self, client):
+        """No route can mint a fresh token — sessions cannot be extended.
+
+        Verifies structurally that refresh-token behaviour can never extend a
+        session beyond the 2-hour limit: there is nothing to refresh with.
+        """
+        response = client.get("/openapi.json")
+        assert response.status_code == 200
+        paths = list(response.json().get("paths", {}))
+        auth_paths = [p for p in paths if p.startswith("/auth/")]
+        assert auth_paths, "expected the /auth/* endpoints"
+        assert not any("refresh" in p.lower() for p in paths), (
+            "A refresh endpoint would allow sessions to outlive the 2-hour limit"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Assessment-scoped authorization capability
+# ---------------------------------------------------------------------------
+
+class TestAssessmentCapability:
+    """An in-flight attempt survives login-session expiry — bounded tightly.
+
+    The capability cookie is a signed pointer to (profile_id, attempt_id,
+    exp=attempt.expires_at). Every request re-validates it against the
+    assessment_attempts row: ownership, status == in_progress and the frozen
+    expiry are authoritative. It is accepted only by attempt endpoints and
+    rejected by /assessment/start, /assessment/current, /admin/*, /auth/*.
+    """
+
+    def _capability_token(
+        self,
+        *,
+        sub=MOCK_PROFILE_ID,
+        attempt_id=MOCK_ATTEMPT_ID,
+        exp_offset_seconds=1200,
+        typ="assessment_access",
+    ):
+        import jwt as pyjwt
+        from core.auth import _capability_key
+
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": sub,
+            "att": attempt_id,
+            "typ": typ,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(seconds=exp_offset_seconds)).timestamp()),
+        }
+        return pyjwt.encode(payload, _capability_key(), algorithm="HS256")
+
+    def _wire_attempt(self, mock_supabase, attempt):
+        """Attempt row + answers lookup + insert chains for PUT /answers."""
+        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        mock_supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([])
+        )
+        mock_supabase.table.return_value.insert.return_value.execute.return_value = (
+            _make_mock_response([{"id": "answer-1"}])
+        )
+
+    def _put_answer(self, client, attempt_id=MOCK_ATTEMPT_ID):
+        return client.put(
+            f"/assessment/attempt/{attempt_id}/answers",
+            json={"question_id": MOCK_MCQ_1_ID, "selected_option": "A"},
+        )
+
+    # ------------------------------------------------------------------
+    # Required scenarios
+    # ------------------------------------------------------------------
+
+    def test_active_assessment_survives_login_session_expiry(
+        self, client, mock_supabase
+    ):
+        """No session cookie at all — capability alone drives the attempt."""
+        attempt = _make_attempt()
+        self._wire_attempt(mock_supabase, attempt)
+        client.cookies.set("dsc_assessment", self._capability_token())
+
+        assert self._put_answer(client).status_code == 200
+
+    def test_active_assessment_works_with_valid_session_before_expiry(
+        self, client, mock_supabase
+    ):
+        """While the session is alive the normal path is used — capability
+        not even needed (session fast path in get_assessment_actor)."""
+        attempt = _make_attempt()
+        self._wire_attempt(mock_supabase, attempt)
+        import jwt as pyjwt
+        from core.auth import SUPABASE_ISSUER
+
+        now = datetime.now(timezone.utc)
+        token = pyjwt.encode(
+            {
+                "sub": MOCK_PROFILE_ID,  # session user owns this attempt
+                "email": "candidate@test.com",
+                "aud": "authenticated",
+                "iss": SUPABASE_ISSUER,
+                "iat": int((now - timedelta(seconds=300)).timestamp()),
+                "exp": int((now + timedelta(seconds=6900)).timestamp()),
+            },
+            TestSessionLifetime.TEST_SECRET,
+            algorithm="HS256",
+        )
+        with patch("core.auth._get_jwk_client", return_value=None), patch(
+            "core.auth.SUPABASE_JWT_SECRET", TestSessionLifetime.TEST_SECRET
+        ):
+            resp = client.put(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/answers",
+                json={"question_id": MOCK_MCQ_1_ID, "selected_option": "A"},
+                cookies={"dsc_session": token},
+            )
+        assert resp.status_code == 200
+
+    def test_expired_assessment_rejected_despite_live_capability(
+        self, client, mock_supabase
+    ):
+        """Row expiry beats the cookie: frozen expires_at is authoritative,
+        so reconnecting can never stretch the assessment."""
+        past_attempt = _make_attempt()
+        past_attempt["expires_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        self._wire_attempt(mock_supabase, past_attempt)
+        # Cookie exp deliberately still in the future (+20 min).
+        client.cookies.set(
+            "dsc_assessment", self._capability_token(exp_offset_seconds=1200)
+        )
+
+        assert self._put_answer(client).status_code == 401
+
+    def test_expired_capability_cookie_rejected(self, client, mock_supabase):
+        """A capability whose own exp has passed is dead even with a live row."""
+        attempt = _make_attempt()
+        self._wire_attempt(mock_supabase, attempt)
+        client.cookies.set(
+            "dsc_assessment", self._capability_token(exp_offset_seconds=-60)
+        )
+
+        assert self._put_answer(client).status_code == 401
+
+    def test_submitted_assessment_rejected(self, client, mock_supabase):
+        """status != in_progress ⇒ capability stops working immediately."""
+        attempt = _make_attempt(status="scored")
+        self._wire_attempt(mock_supabase, attempt)
+        client.cookies.set("dsc_assessment", self._capability_token())
+
+        assert self._put_answer(client).status_code == 403
+
+    def test_capability_bound_to_one_attempt_id(self, client, mock_supabase):
+        """Changing the URL to another attempt id ⇒ 403 (claims.att check
+        happens before any row lookup)."""
+        client.cookies.set("dsc_assessment", self._capability_token())
+
+        resp = self._put_answer(
+            client, attempt_id="cccc1111-1111-1111-1111-111111111111"
+        )
+        assert resp.status_code == 403
+
+    def test_capability_rejects_foreign_owner(self, client, mock_supabase):
+        """Capability sub must equal the attempt row's profile_id."""
+        attempt = _make_attempt()  # owned by MOCK_PROFILE_ID
+        self._wire_attempt(mock_supabase, attempt)
+        client.cookies.set(
+            "dsc_assessment", self._capability_token(sub="another-user-id")
+        )
+
+        assert self._put_answer(client).status_code == 403
+
+    def test_capability_rejected_on_unrelated_endpoints(self, client):
+        """A capability is useless outside the 10 attempt endpoints."""
+        client.cookies.set("dsc_assessment", self._capability_token())
+
+        # Session-only candidate endpoint
+        assert client.get("/assessment/current").status_code == 401
+        # Starting requires a real session — capability must not mint attempts
+        assert (
+            client.post("/assessment/start", json={"domain_ids": []}).status_code
+            == 401
+        )
+        # Admin surface
+        assert client.get("/admin/assessment-program/mcq-total").status_code == 401
+        # Auth surface
+        assert client.get("/auth/me").status_code == 401
+
+    def test_cannot_start_assessment_with_capability_only(self, client):
+        """Explicit: assessment authorization never starts new attempts."""
+        client.cookies.set("dsc_assessment", self._capability_token())
+        resp = client.post("/assessment/start", json={"domain_ids": []})
+        assert resp.status_code == 401
+
+    def test_candidate_without_capability_or_session_rejected(self, client):
+        """No cookies ⇒ exactly the pre-existing behaviour (401)."""
+        assert self._put_answer(client).status_code == 401
+        assert client.get("/auth/assessment-access").status_code == 401
+
+    def test_assessment_access_endpoint_reports_live_attempt(
+        self, client, mock_supabase
+    ):
+        """/auth/assessment-access is true exactly while the row is live."""
+        attempt = _make_attempt()
+        self._wire_attempt(mock_supabase, attempt)
+        client.cookies.set("dsc_assessment", self._capability_token())
+
+        resp = client.get("/auth/assessment-access")
+        assert resp.status_code == 200
+        assert resp.json() == {"attempt_id": MOCK_ATTEMPT_ID}
+
+        # Submitted row ⇒ endpoint reports NO access (401), never stale state.
+        scored = _make_attempt(status="scored")
+        self._wire_attempt(mock_supabase, scored)
+        assert client.get("/auth/assessment-access").status_code == 401
+
+    def test_logout_clears_the_assessment_capability(self, client):
+        """Logout revokes assessment access explicitly (edge case 10)."""
+        client.cookies.set("dsc_assessment", self._capability_token())
+        resp = client.post("/auth/logout")
+        assert resp.status_code == 200
+        cookies = resp.headers.get_list("set-cookie")
+        assert any(
+            c.startswith("dsc_assessment=") and "Max-Age=0" in c
+            for c in cookies
+        ), f"capability cookie not cleared: {cookies}"
+
+    def test_relogin_keeps_only_own_capability(self, client):
+        """Login keeps a capability ONLY for its owner; another user's is
+        deleted (a new login can never inherit someone's assessment)."""
+        import jwt as pyjwt
+        from core.auth import _capability_key
+
+        now = datetime.now(timezone.utc)
+        foreign = pyjwt.encode(
+            {
+                "sub": "someone-else",
+                "att": MOCK_ATTEMPT_ID,
+                "typ": "assessment_access",
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=20)).timestamp()),
+            },
+            _capability_key(),
+            algorithm="HS256",
+        )
+        client.cookies.set("dsc_assessment", foreign)
+        with patch("routers.auth._supabase_sign_in") as mock_login:
+            mock_login.return_value = {
+                "access_token": "test-jwt",
+                "user": {"id": "new-user-id", "email": "new@user.com"},
+                "expires_in": 3600,
+            }
+            resp = client.post(
+                "/auth/login",
+                json={"email": "new@user.com", "password": "pass1234"},
+            )
+        assert resp.status_code == 200
+        cookies = resp.headers.get_list("set-cookie")
+        assert any(
+            c.startswith("dsc_assessment=") and "Max-Age=0" in c
+            for c in cookies
+        ), f"foreign capability survived login: {cookies}"
+
+    # ------------------------------------------------------------------
+    # Issuance bounds + cross-unusability
+    # ------------------------------------------------------------------
+
+    def test_capability_exp_equals_frozen_expires_at(self):
+        """Issuance copies the frozen expires_at verbatim — never a default."""
+        from fastapi import Response
+        from core.auth import issue_assessment_capability, _capability_key
+
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=20)
+        response = Response()
+        issue_assessment_capability(
+            response,
+            profile_id=MOCK_PROFILE_ID,
+            attempt_id=MOCK_ATTEMPT_ID,
+            expires_at=expires_at,
+        )
+        set_cookie = response.headers["set-cookie"]
+        assert "Max-Age=1200" in set_cookie
+        token = set_cookie.split("dsc_assessment=", 1)[1].split(";", 1)[0]
+        claims = __import__("jwt").decode(
+            token, _capability_key(), algorithms=["HS256"], options={
+                "verify_aud": False, "verify_iss": False
+            }
+        )
+        assert claims["exp"] == int(expires_at.timestamp())
+        assert claims["sub"] == MOCK_PROFILE_ID
+        assert claims["att"] == MOCK_ATTEMPT_ID
+        assert claims["typ"] == "assessment_access"
+
+    def test_no_capability_issued_for_expired_attempt(self):
+        """Issuance for an already-over attempt sets NO cookie."""
+        from fastapi import Response
+        from core.auth import issue_assessment_capability
+
+        response = Response()
+        issue_assessment_capability(
+            response,
+            profile_id=MOCK_PROFILE_ID,
+            attempt_id=MOCK_ATTEMPT_ID,
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        assert "set-cookie" not in response.headers
+
+    def test_capability_cannot_act_as_session_jwt(self, client):
+        """Cross-unusability: capability in dsc_session ⇒ 401 (different key,
+        no aud/iss) and session JWT in dsc_assessment ⇒ 401."""
+        cap = self._capability_token()
+        with patch("core.auth._get_jwk_client", return_value=None), patch(
+            "core.auth.SUPABASE_JWT_SECRET", "test-session-secret"
+        ):
+            assert client.get("/auth/me", cookies={"dsc_session": cap}).status_code == 401
+
+        session_jwt = (
+            TestSessionLifetime()
+        )._make_token(iat_offset_seconds=-60, exp_offset_seconds=600)
+        assert (
+            client.get(
+                "/auth/assessment-access",
+                cookies={"dsc_assessment": session_jwt},
+            ).status_code
+            == 401
+        )

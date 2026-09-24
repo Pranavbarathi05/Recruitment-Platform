@@ -10,8 +10,13 @@ ONE timer (expires_at), ONE final submission, ONE combined score.
 
 import re
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException
-from core.auth import get_current_user, AuthUser
+from fastapi import APIRouter, Depends, HTTPException, Response
+from core.auth import (
+    AuthUser,
+    get_assessment_actor,
+    get_current_user,
+    issue_assessment_capability,
+)
 from core.supabase import supabase_client
 from schemas.assessment import (
     AssessmentStartRequest, AnswerSaveRequest, DescriptiveAnswerSaveRequest,
@@ -378,6 +383,7 @@ def _score_attempt(attempt_id: str) -> dict:
 @router.post("/start")
 def start_assessment(
     payload: AssessmentStartRequest,
+    response: Response,
     current_user: AuthUser = Depends(get_current_user),
 ):
     """Start ONE combined assessment with MCQ + Coding sections.
@@ -449,6 +455,15 @@ def start_assessment(
             # later admin configuration change can never alter an active
             # attempt.
             attempt = attempt_resp.data[0]
+            # Arm the assessment-scoped capability (bounded by the frozen
+            # expires_at) so this attempt survives later login-session expiry.
+            # Requires a valid session — capability holders can never start.
+            issue_assessment_capability(
+                response,
+                profile_id=profile_id,
+                attempt_id=attempt["id"],
+                expires_at=attempt["expires_at"],
+            )
             return {
                 "attempt_id": attempt["id"],
                 "total_mcq_questions": attempt["total_questions"],
@@ -530,6 +545,13 @@ def start_assessment(
     if not attempt:
         raise HTTPException(status_code=500, detail="Failed to create attempt")
 
+    issue_assessment_capability(
+        response,
+        profile_id=profile_id,
+        attempt_id=attempt["id"],
+        expires_at=attempt["expires_at"],
+    )
+
     return {
         "attempt_id": attempt["id"],
         "total_mcq_questions": attempt["total_questions"],
@@ -604,7 +626,8 @@ def get_attempt(attempt_id: str, current_user: AuthUser = Depends(get_current_us
 @router.get("/attempt/{attempt_id}/questions")
 def get_attempt_questions(
     attempt_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    response: Response,
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Get MCQ questions for the attempt. Correct answers are NEVER sent."""
     attempt_resp = (
@@ -624,6 +647,16 @@ def get_attempt_questions(
     if _is_expired(attempt):
         _score_attempt(attempt_id)
         raise HTTPException(status_code=400, detail="Assessment time has expired")
+
+    # (Re)issue the assessment capability while this session is still alive.
+    # Bounded by the frozen expires_at — re-issuing can never extend the
+    # assessment; it only re-arms the fallback for a later session expiry.
+    issue_assessment_capability(
+        response,
+        profile_id=attempt["profile_id"],
+        attempt_id=attempt_id,
+        expires_at=attempt["expires_at"],
+    )
 
     # FROZEN READ: Descriptive and Hands-on selections were resolved and frozen
     # at attempt creation. They are read verbatim here — never re-selected, never
@@ -746,7 +779,7 @@ def get_attempt_questions(
 def save_answer(
     attempt_id: str,
     payload: AnswerSaveRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Save/update a single MCQ answer."""
     attempt_resp = (
@@ -800,7 +833,7 @@ def save_answer(
 def save_descriptive_answer(
     attempt_id: str,
     payload: DescriptiveAnswerSaveRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Save/update a descriptive question answer."""
     attempt_resp = (
@@ -865,7 +898,7 @@ def save_descriptive_answer(
 @router.post("/attempt/{attempt_id}/submit")
 def submit_attempt(
     attempt_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Submit the ONE combined assessment. Scores both MCQ and Coding.
 
@@ -906,7 +939,7 @@ def submit_attempt(
 def submit_hands_on(
     attempt_id: str,
     payload: HandsOnSubmitRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Submit a Hands-On challenge result.
 

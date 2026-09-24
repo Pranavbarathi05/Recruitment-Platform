@@ -10,7 +10,7 @@ All endpoints:
 
 import json
 from fastapi import APIRouter, Depends, HTTPException
-from core.auth import get_current_user, AuthUser
+from core.auth import AuthUser, get_assessment_actor, get_current_user
 from core.supabase import supabase_client
 from schemas.coding import CodingSubmitRequest, CodingDraftSaveRequest, CodingRunRequest
 from services.code_executor import run_code_public, evaluate_submission
@@ -72,7 +72,7 @@ def _verify_attempt_ownership(attempt_id: str, user_id: str) -> dict:
 @router.get("/attempt/{attempt_id}/problems")
 def get_coding_problems(
     attempt_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Get coding problems for the shared attempt. Only PUBLIC test cases are sent."""
     attempt_resp = (
@@ -167,7 +167,7 @@ def get_coding_problems(
 def save_draft(
     attempt_id: str,
     payload: CodingDraftSaveRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Autosave code draft. Does NOT count as submission."""
     attempt = _verify_attempt_ownership(attempt_id, current_user.id)
@@ -206,7 +206,7 @@ def save_draft(
 def get_draft(
     attempt_id: str,
     problem_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Get saved draft for a specific problem."""
     attempt_resp = (
@@ -242,7 +242,7 @@ def get_draft(
 def run_code(
     attempt_id: str,
     payload: CodingRunRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Run code against PUBLIC test cases only (browser feedback, never scored)."""
     attempt = _verify_attempt_ownership(attempt_id, current_user.id)
@@ -292,7 +292,7 @@ def run_code(
 def submit_coding_solution(
     attempt_id: str,
     payload: CodingSubmitRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Submit one coding problem solution for server-side evaluation.
 

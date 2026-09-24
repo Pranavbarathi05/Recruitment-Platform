@@ -18,7 +18,7 @@ const Login = () => {
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const navigate = useNavigate();
-  const { signIn, isAuthenticated } = useAuth();
+  const { signIn, isAuthenticated, sessionNotice } = useAuth();
 
   const slides = [
     { title: 'Learn', description: 'Build a strong foundation in technology through hands-on sessions, workshops, and peer learning. Explore concepts from basics to advanced with guidance from mentors and real-world examples.', image: learn },
@@ -88,6 +88,14 @@ const Login = () => {
             <h1 className="text-3xl font-bold text-theme-primary mb-2">Welcome Back</h1>
             <p className="text-theme-secondary">Sign in to access DSC Recruitment Platform</p>
           </div>
+
+          {/* Session-expiry notice (set by AuthContext when a live session
+              ended — shown once, until the next successful sign-in) */}
+          {sessionNotice && (
+            <div className="mb-4 p-3 bg-blue-900/30 border border-blue-500 text-blue-200 rounded-lg text-sm">
+              {sessionNotice}
+            </div>
+          )}
 
           {error && (
             <div className="mb-4 p-3 bg-red-900/30 border border-red-500 text-red-300 rounded-lg text-sm">
