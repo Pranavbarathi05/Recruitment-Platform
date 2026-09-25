@@ -1254,6 +1254,314 @@ class TestCodingProblemAdmin:
         assert hidden_tc["is_public"] is False
 
 
+class TestCodingTestCaseBulkUpload:
+    """Regression tests for the Bulk Upload test-case path.
+
+    ``coding_test_cases.input`` is a legacy TEXT NOT NULL column (migration
+    006) that predates the function-based model. Admins author test cases as a
+    JSONB ``arguments`` array (migration 009) and the bulk format carries only
+    ``arguments`` + ``expected_output``, so the old implementation inserted
+    ``input=None`` and every bulk upload failed with::
+
+        null value in column "input" of relation "coding_test_cases"
+        violates not-null constraint
+
+    The admin router must mirror the JSON arguments into the legacy NOT NULL
+    column while keeping ``arguments`` a real JSONB array and
+    ``expected_output`` a real JSON value.
+    """
+
+    PROBLEM_ID = MOCK_CODING_PROBLEM_ID
+
+    # The exact public bulk-upload payload shape the admin UI accepts, wrapped
+    # in the envelope the endpoint expects ({test_cases: [...]}).
+    PUBLIC_BULK = [
+        {
+            "arguments": [[1, 1, 1], 2],
+            "expected_output": 2,
+            "is_public": True,
+            "points": 1,
+        },
+        {
+            "arguments": [[1, 2, 3], 3],
+            "expected_output": 2,
+            "is_public": True,
+            "points": 1,
+        },
+        {
+            "arguments": [[1, -1, 0], 0],
+            "expected_output": 3,
+            "is_public": False,
+            "points": 2,
+        },
+    ]
+
+    def _recording_supabase(self, problem_exists=True):
+        """Stub Supabase client that records every insert/update payload."""
+        from types import SimpleNamespace
+
+        writes = []
+        problem_id = self.PROBLEM_ID
+
+        class _Fluent:
+            def __init__(self, name):
+                self._name = name
+                self._mode = "select"
+                self._payload = None
+
+            def select(self, *a, **k):
+                self._mode = "select"
+                return self
+
+            def eq(self, *a, **k):
+                return self
+
+            def order(self, *a, **k):
+                return self
+
+            def insert(self, payload, *a, **k):
+                self._mode = "insert"
+                self._payload = payload
+                return self
+
+            def update(self, payload, *a, **k):
+                self._mode = "update"
+                self._payload = payload
+                return self
+
+            def execute(self):
+                if self._mode in ("insert", "update"):
+                    writes.append((self._name, dict(self._payload)))
+                    return SimpleNamespace(data=[dict(self._payload, id="new-tc")])
+                if self._name == "coding_problems":
+                    return SimpleNamespace(
+                        data=[{"id": problem_id}] if problem_exists else []
+                    )
+                if self._name == "coding_test_cases":
+                    # Existence probe used by update_test_case.
+                    return SimpleNamespace(data=[{"id": "existing-tc"}])
+                return SimpleNamespace(data=[])
+
+        class _Client:
+            def table(self, name):
+                return _Fluent(name)
+
+        return _Client(), writes
+
+    def _bulk_upload(self, test_cases, problem_exists=True):
+        from schemas.coding import CodingBulkTestUpload
+        from routers import coding_admin
+        from routers.coding_admin import bulk_upload_test_cases
+
+        stub, writes = self._recording_supabase(problem_exists=problem_exists)
+        with patch.object(coding_admin, "supabase_client", stub):
+            response = bulk_upload_test_cases(
+                self.PROBLEM_ID,
+                CodingBulkTestUpload(test_cases=test_cases),
+                admin=MagicMock(),
+            )
+        rows = [p for name, p in writes if name == "coding_test_cases"]
+        return response, rows
+
+    # ------------------------------------------------------------------
+    # Mapping: arguments -> JSONB arguments + legacy NOT NULL input
+    # ------------------------------------------------------------------
+
+    def test_bulk_upload_fills_the_not_null_input_column(self):
+        """Every bulk row must carry a non-null legacy ``input`` value."""
+        _, rows = self._bulk_upload(self.PUBLIC_BULK)
+
+        assert len(rows) == 3
+        for row in rows:
+            # The original bug: input was None -> not-null violation.
+            assert row["input"] is not None
+            assert isinstance(row["input"], str)
+
+    def test_bulk_upload_mirrors_arguments_into_input(self):
+        """``input`` is the JSON text of ``arguments`` and round-trips."""
+        _, rows = self._bulk_upload(self.PUBLIC_BULK)
+
+        for row, expected_args in zip(rows, [[[1, 1, 1], 2], [[1, 2, 3], 3], [[1, -1, 0], 0]]):
+            assert json.loads(row["input"]) == expected_args
+            assert row["arguments"] == expected_args
+
+    def test_bulk_upload_keeps_arguments_as_a_json_array(self):
+        """arguments stays a real array — it must not be stringified."""
+        _, rows = self._bulk_upload(self.PUBLIC_BULK)
+
+        assert isinstance(rows[0]["arguments"], list)
+        assert rows[0]["arguments"] == [[1, 1, 1], 2]
+        assert not isinstance(rows[0]["arguments"], str)
+
+    def test_bulk_upload_keeps_expected_output_typed(self):
+        """expected_output stays a JSON number, not a string."""
+        cases = [
+            {"arguments": [[1, 1, 1], 2], "expected_output": 2, "is_public": True, "points": 1},
+            {"arguments": [[1, 2, 3], 3], "expected_output": 2, "is_public": True, "points": 1},
+            {"arguments": [[1, -1, 0], 0], "expected_output": 3, "is_public": True, "points": 1},
+        ]
+        _, rows = self._bulk_upload(cases)
+
+        assert [row["expected_output"] for row in rows] == [2, 2, 3]
+        for row in rows:
+            assert isinstance(row["expected_output"], int)
+            assert not isinstance(row["expected_output"], str)
+
+    def test_bulk_upload_keeps_typed_json_outputs(self):
+        """Arrays/bools/strings as expected_output survive untouched."""
+        cases = [
+            {"arguments": [[2, 7, 11, 15], 9], "expected_output": [0, 1], "is_public": True, "points": 1},
+            {"arguments": [[1]], "expected_output": True, "is_public": False, "points": 1},
+            {"arguments": [["a"]], "expected_output": "abc", "is_public": True, "points": 1},
+        ]
+        _, rows = self._bulk_upload(cases)
+
+        assert rows[0]["expected_output"] == [0, 1]
+        assert rows[1]["expected_output"] is True
+        assert rows[2]["expected_output"] == "abc"
+
+    # ------------------------------------------------------------------
+    # Visibility, points and ordering
+    # ------------------------------------------------------------------
+
+    def test_bulk_upload_preserves_hidden_visibility_and_points(self):
+        """A hidden case with custom points is stored as hidden with its points."""
+        _, rows = self._bulk_upload(self.PUBLIC_BULK)
+
+        hidden = rows[2]
+        assert hidden["is_public"] is False
+        assert hidden["points"] == 2
+        assert rows[0]["is_public"] is True
+        assert rows[0]["points"] == 1
+
+    def test_bulk_upload_assigns_sequential_ordering(self):
+        """Without an explicit order, rows keep the upload order."""
+        cases = [
+            {"arguments": [i], "expected_output": i, "is_public": True, "points": 1}
+            for i in range(4)
+        ]
+        _, rows = self._bulk_upload(cases)
+
+        assert [row["ordering"] for row in rows] == [0, 1, 2, 3]
+
+    def test_bulk_upload_honours_explicit_ordering(self):
+        """An explicit non-zero order overrides the positional index."""
+        cases = [
+            {"arguments": [[1]], "expected_output": 1, "points": 1, "ordering": 7},
+            {"arguments": [[2]], "expected_output": 2, "points": 1},
+        ]
+        _, rows = self._bulk_upload(cases)
+
+        assert rows[0]["ordering"] == 7
+        assert rows[1]["ordering"] == 1
+
+    def test_bulk_upload_reports_every_inserted_case(self):
+        """Multiple cases in one request all come back in the response."""
+        response, rows = self._bulk_upload(self.PUBLIC_BULK)
+
+        assert response["status"] == "created"
+        assert response["count"] == 3
+        assert len(response["test_cases"]) == 3
+        assert len(rows) == 3
+
+    def test_bulk_upload_explicit_legacy_input_wins(self):
+        """A legacy ``input`` string is honoured verbatim when supplied."""
+        cases = [
+            {
+                "arguments": [[1]],
+                "expected_output": 1,
+                "input": "1",
+                "is_public": True,
+                "points": 1,
+            }
+        ]
+        _, rows = self._bulk_upload(cases)
+
+        assert rows[0]["input"] == "1"
+        assert rows[0]["arguments"] == [[1]]
+
+    def test_bulk_upload_missing_problem_is_404(self):
+        """Unknown problem -> 404, and nothing is written."""
+        with pytest.raises(HTTPException) as exc:
+            self._bulk_upload(self.PUBLIC_BULK, problem_exists=False)
+
+        assert exc.value.status_code == 404
+
+    # ------------------------------------------------------------------
+    # The individual "Add Test Case" path must keep working
+    # ------------------------------------------------------------------
+
+    def test_single_create_fills_the_not_null_input_column(self):
+        """POST /tests uses the same mapping as bulk upload."""
+        from schemas.coding import CodingTestCaseCreate
+        from routers import coding_admin
+        from routers.coding_admin import create_test_case
+
+        stub, writes = self._recording_supabase()
+        with patch.object(coding_admin, "supabase_client", stub):
+            create_test_case(
+                self.PROBLEM_ID,
+                CodingTestCaseCreate(
+                    arguments=[[2, 7, 11, 15], 9],
+                    expected_output=[0, 1],
+                    is_public=True,
+                    points=3,
+                    ordering=4,
+                ),
+                admin=MagicMock(),
+            )
+
+        (row,) = [p for name, p in writes if name == "coding_test_cases"]
+        assert row["input"] == "[[2, 7, 11, 15], 9]"
+        assert row["arguments"] == [[2, 7, 11, 15], 9]
+        assert row["expected_output"] == [0, 1]
+        assert row["is_public"] is True
+        assert row["points"] == 3
+        assert row["ordering"] == 4
+
+    # ------------------------------------------------------------------
+    # The stored row stays usable by the coding assessment runner
+    # ------------------------------------------------------------------
+
+    def test_stored_rows_survive_the_runner_read_boundary(self):
+        """Rows written by bulk upload read back as typed runner inputs.
+
+        The runner restores ``expected_output`` from the legacy TEXT column for
+        function-based rows (``arguments IS NOT NULL``). A bulk-uploaded row must
+        therefore keep ``arguments`` non-null and its JSON text parseable.
+        """
+        from routers.coding import _normalize_test_case_expected
+
+        _, rows = self._bulk_upload(self.PUBLIC_BULK)
+
+        # Simulate the TEXT column read: expected_output comes back as JSON text.
+        for row, expected in zip(rows, [2, 2, 3]):
+            stored = {**row, "expected_output": json.dumps(row["expected_output"])}
+            normalized = _normalize_test_case_expected(stored)
+            assert isinstance(normalized["arguments"], list)
+            assert normalized["arguments"] == row["arguments"]
+            assert normalized["expected_output"] == expected
+
+    def test_update_keeps_legacy_input_in_sync_with_arguments(self):
+        """Editing arguments rewrites the legacy mirror column too."""
+        from schemas.coding import CodingTestCaseUpdate
+        from routers import coding_admin
+        from routers.coding_admin import update_test_case
+
+        stub, writes = self._recording_supabase()
+        # update_test_case first checks the row exists on coding_test_cases.
+        with patch.object(coding_admin, "supabase_client", stub):
+            update_test_case(
+                MOCK_TEST_CASE_ID,
+                CodingTestCaseUpdate(arguments=[[4, 4], 8], expected_output=[0, 1]),
+                admin=MagicMock(),
+            )
+
+        (row,) = [p for name, p in writes if name == "coding_test_cases"]
+        assert json.loads(row["input"]) == [[4, 4], 8]
+        assert row["arguments"] == [[4, 4], 8]
+
+
 class TestCodingCandidateFlow:
     """Tests for candidate coding assessment flow."""
 

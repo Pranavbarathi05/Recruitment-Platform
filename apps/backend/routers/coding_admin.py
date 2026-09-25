@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from core.auth import require_admin, AuthUser
 from core.supabase import supabase_client
@@ -8,6 +10,48 @@ from schemas.coding import (
 )
 
 router = APIRouter(prefix="/admin/coding", tags=["Admin Coding"])
+
+
+# ============================================================
+# Test case column mapping
+# ============================================================
+
+# ``coding_test_cases.input`` predates the function-based model and is still
+# ``TEXT NOT NULL`` (migration 006). Admins author function-based test cases
+# as a JSONB ``arguments`` array (migration 009), so the arguments must be
+# mirrored into the legacy column — otherwise every insert fails with
+# ``null value in column "input" violates not-null constraint``.
+#
+# ``arguments`` itself is still stored as real JSONB (an array stays an array),
+# and ``expected_output`` keeps its JSON value; the TEXT column receives the
+# JSON text exactly like the ``expected_output`` legacy column already does.
+def _legacy_input_text(arguments, explicit_input=None):
+    """Text for the legacy NOT NULL ``input`` column.
+
+    An explicitly supplied legacy ``input`` string wins; otherwise the JSON
+    function arguments are mirrored as compact JSON text.
+    """
+    if explicit_input is not None:
+        return explicit_input
+    return json.dumps([] if arguments is None else arguments)
+
+
+def _test_case_insert_row(problem_id: str, tc, ordering: int) -> dict:
+    """Map one test-case payload onto the ``coding_test_cases`` columns.
+
+    ``arguments`` -> JSONB ``arguments`` (canonical) + legacy TEXT ``input``.
+    ``expected_output`` -> the TEXT ``expected_output`` column.
+    """
+    return {
+        "problem_id": problem_id,
+        "arguments": tc.arguments,
+        "expected_output": tc.expected_output,
+        "is_public": tc.is_public,
+        "points": tc.points,
+        "ordering": ordering,
+        # Legacy TEXT NOT NULL column: mirror the JSON arguments as JSON text.
+        "input": _legacy_input_text(tc.arguments, tc.input),
+    }
 
 
 # ============================================================
@@ -129,6 +173,11 @@ def update_test_case(
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
 
+        # Keep the legacy NOT NULL ``input`` column coherent with the function
+        # arguments so the two representations never drift apart.
+        if "arguments" in updates and "input" not in updates:
+            updates["input"] = _legacy_input_text(updates["arguments"])
+
         result = supabase_client.table("coding_test_cases").update(updates).eq("id", test_id).execute()
         return result.data[0] if result.data else {"status": "updated"}
     except HTTPException:
@@ -243,17 +292,9 @@ def create_test_case(
         if not existing.data:
             raise HTTPException(status_code=404, detail="Coding problem not found")
 
-        result = supabase_client.table("coding_test_cases").insert({
-            "problem_id": problem_id,
-            "arguments": payload.arguments,
-            "expected_output": payload.expected_output,
-            "is_public": payload.is_public,
-            "points": payload.points,
-            "ordering": payload.ordering,
-            # Legacy fields
-            "input": payload.input,
-            "expected_output": payload.expected_output,
-        }).execute()
+        result = supabase_client.table("coding_test_cases").insert(
+            _test_case_insert_row(problem_id, payload, payload.ordering)
+        ).execute()
 
         return result.data[0] if result.data else {"status": "created"}
     except HTTPException:
@@ -274,47 +315,18 @@ def bulk_upload_test_cases(
         if not existing.data:
             raise HTTPException(status_code=404, detail="Coding problem not found")
 
-        # Validate all test cases first
+        # Inserted one row at a time so a single bad case reports its own error.
         inserted = []
         for idx, tc in enumerate(payload.test_cases):
-            result = supabase_client.table("coding_test_cases").insert({
-                "problem_id": problem_id,
-                "arguments": tc.arguments,
-                "expected_output": tc.expected_output,
-                "is_public": tc.is_public,
-                "points": tc.points,
-                "ordering": tc.ordering if tc.ordering else idx,
-                "input": tc.input,
-                "expected_output": tc.expected_output,
-            }).execute()
+            result = supabase_client.table("coding_test_cases").insert(
+                _test_case_insert_row(
+                    problem_id, tc, tc.ordering if tc.ordering else idx
+                )
+            ).execute()
             if result.data:
                 inserted.append(result.data[0])
 
         return {"status": "created", "count": len(inserted), "test_cases": inserted}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.put("/tests/{test_id}")
-def update_test_case(
-    test_id: str,
-    payload: CodingTestCaseUpdate,
-    admin: AuthUser = Depends(require_admin),
-):
-    """Update a test case. Admin only."""
-    try:
-        existing = supabase_client.table("coding_test_cases").select("id").eq("id", test_id).execute()
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="Test case not found")
-
-        updates = payload.model_dump(exclude_unset=True)
-        if not updates:
-            raise HTTPException(status_code=400, detail="No fields to update")
-
-        result = supabase_client.table("coding_test_cases").update(updates).eq("id", test_id).execute()
-        return result.data[0] if result.data else {"status": "updated"}
     except HTTPException:
         raise
     except Exception as e:
