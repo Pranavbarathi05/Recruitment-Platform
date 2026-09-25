@@ -198,7 +198,18 @@ def load_module_configs(domain_ids, family) -> list:
         .eq("applies_to", family)
         .execute()
     )
-    return [ModuleConfigInput(**row) for row in response.data or []]
+    # hands_on_module is added by a later migration and may not exist yet in
+    # every environment. Absent column -> None -> the planner's legacy
+    # fallback (per-challenge deduplication) applies, so un-migrated
+    # databases keep their exact current behaviour.
+    rows = []
+    for row in response.data or []:
+        rows.append(
+            ModuleConfigInput(
+                **{**row, "hands_on_module": row.get("hands_on_module") or ""}
+            )
+        )
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +277,20 @@ def load_hands_on_pool(domain_ids) -> list:
         return []
     response = (
         supabase_client.table("hands_on_questions")
-        .select("id, domain_ids")
+        .select("id, domain_ids, challenge_type")
         .eq("is_active", True)
         .overlaps("domain_ids", list(domain_ids))
         .execute()
     )
+    # challenge_type is the challenge module the row runs (the SQL challenge
+    # today). The planner groups by module so the same module on several
+    # selected domains deduplicates to one shared requirement group.
     return [
         HandsOnPoolItem(
-            id=row["id"], domain_ids=row.get("domain_ids") or [], is_active=True
+            id=row["id"],
+            domain_ids=row.get("domain_ids") or [],
+            hands_on_modules=[row.get("challenge_type") or ""],
+            is_active=True,
         )
         for row in response.data or []
     ]

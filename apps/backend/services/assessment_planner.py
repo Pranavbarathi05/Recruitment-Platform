@@ -55,9 +55,7 @@ DETERMINISM
     still deterministic for identical inputs while letting the caller vary
     which questions a candidate receives. The seed is NOT part of the
     configuration fingerprint: it changes *which* questions are drawn, not the
-    configuration that governs the assessment.
-
-EXACT ALLOCATION (descriptive + hands-on)
+    configuration that governs the assessment.EXACT ALLOCATION (descriptive + hands-on)
     Per-domain descriptive and hands-on quotas are NOT filled greedily. A
     shared question (one whose domain_ids spans several selected domains) can
     satisfy only ONE of them, so the planner solves the whole quota set as a
@@ -65,7 +63,16 @@ EXACT ALLOCATION (descriptive + hands-on)
     what it takes to place a later one. It therefore refuses a configuration
     only when no valid allocation exists at all — never merely because the
     domains happened to be processed in an unlucky order.
-"""
+
+    Hands-on challenges additionally deduplicate ACROSS DOMAINS by their
+    challenge module: a module installed on several selected domains (today
+    exactly one challenge exists per module — SQL) forms ONE group whose
+    quota is the largest per-domain request among its members, never the sum.
+    One drawn challenge counts towards every member domain's requirement, so
+    two domains that both enable the SQL module share one challenge. Domains
+    with genuinely different modules stay in separate groups with independent
+    quotas.
+    """
 
 import hashlib
 import json
@@ -332,7 +339,12 @@ class DomainInput(_Input):
 
 
 class ModuleConfigInput(_Input):
-    """One assessment_module_config row (migration 016)."""
+    """One assessment_module_config row (migration 016).
+
+    ``hands_on_module`` is the hands-on challenge module the row installs
+    (e.g. ``sql_injection_employee_portal``); default keeps un-migrated rows
+    working by falling back to per-challenge deduplication.
+    """
 
     domain_id: str
     applies_to: ConfigFamily
@@ -341,6 +353,7 @@ class ModuleConfigInput(_Input):
     hands_on_enabled: bool = False
     hands_on_count: int = 0
     hands_on_additional_minutes: int = 0
+    hands_on_module: str = ""
 
 
 class MCQPoolItem(_Input):
@@ -361,10 +374,16 @@ class DescriptivePoolItem(_Input):
 
 
 class HandsOnPoolItem(_Input):
-    """One hands_on_questions row. domain_ids is an ARRAY (may overlap)."""
+    """One hands_on_questions row. domain_ids is an ARRAY (may overlap).
+
+    ``hands_on_modules`` is the challenge-type/module registry the row runs
+    (migration 012: the SQL challenge, ``sql_injection_employee_portal``).
+    Defaults to the id itself so ad-hoc in-memory rows still dedupe by id.
+    """
 
     id: str
     domain_ids: list[str] = Field(default_factory=list)
+    hands_on_modules: list[str] = Field(default_factory=list)
     is_active: bool = True
 
 
@@ -998,45 +1017,99 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
         config = resolved.get(domain.id)
         return bool(config is not None and config.hands_on_enabled)
 
-    quotas = {
-        d.id: (
-            resolved[d.id].hands_on_count
-            if practicals_allowed and _hands_on_enabled(d)
-            else 0
-        )
-        for d in selected
-    }
-    eligible = {
-        d.id: _candidate_order(
-            (
-                item.id
-                for item in hands_pool
-                if item.is_active and d.id in item.domain_ids
-            ),
-            rng,
-        )
-        for d in selected
-    }
-    allocation = _allocate_quotas([d.id for d in selected], quotas, eligible)
-    if allocation is None:
-        raise _allocation_error(
-            PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL,
-            "hands-on challenge(s)",
-            selected,
-            quotas,
-            eligible,
-        )
+    #
+    # SHARED-MODULE DEDUPLICATION
+    # A hands-on challenge belongs to every domain that lists its module, so
+    # two selected domains with the SAME module (e.g. both DevOps and Web
+    # Development run the SQL challenge) are ONE requirement group: the
+    # group's quota is the LARGEST per-domain request among its members,
+    # never the sum, because every member is eligible for every challenge in
+    # the group and one drawn challenge counts towards each member's
+    # requirement simultaneously. Domains with genuinely different modules
+    # land in different groups and keep independent, exact quotas.
+    #
+    # Group keys:
+    #   "module:<id>"      — the row declared hands_on_module. The configured
+    #      module is authoritative; NOT each row's domain_ids, which is merely
+    #      where a challenge is advertised.
+    #   "legacy:<domain>"  — NO hands_on_module declared (the current schema
+    #      state). Every challenge is its own module, so membership is the
+    #      raw domain overlap and each enabled domain forms its own group —
+    #      exactly the pre-module allocator behaviour.
+    # Groups are created in stable domain order, so the pass is deterministic.
+    hands_groups = {}  # group_key -> {"member_ids", "quotas"}
     for domain in selected:
         config = resolved.get(domain.id)
-        if (
-            not practicals_allowed
-            or config is None
-            or not config.hands_on_enabled
-        ):
+        if not practicals_allowed or config is None or not config.hands_on_enabled:
+            continue
+        if config.hands_on_module:
+            group_key = f"module:{config.hands_on_module}"
+            member_ids = frozenset(
+                item.id
+                for item in hands_pool
+                if item.is_active and config.hands_on_module in item.hands_on_modules
+            )
+        else:
+            group_key = f"legacy:{domain.id}"
+            member_ids = frozenset(
+                item.id
+                for item in hands_pool
+                if item.is_active and domain.id in item.domain_ids
+            )
+        group = hands_groups.setdefault(
+            group_key, {"member_ids": member_ids, "quotas": {}}
+        )
+        group["quotas"][domain.id] = config.hands_on_count
+
+    # -- Group-level allocation ---------------------------------------------
+    #
+    # Each group is allocated as ONE unit: its quota is the LARGEST
+    # per-domain request among its members, never the sum, because every
+    # member is eligible for every challenge in the group and one drawn
+    # challenge counts towards each member's requirement simultaneously. The
+    # group key is both the allocator's key and the failure message's summary
+    # entry; the matcher still guarantees no challenge id is drawn twice
+    # across groups.
+    group_labels = list(hands_groups)
+    group_quotas = {
+        key: max(group["quotas"].values()) for key, group in hands_groups.items()
+    }
+    group_eligible = {
+        key: _candidate_order(group["member_ids"], rng)
+        for key, group in hands_groups.items()
+    }
+
+    group_allocation = _allocate_quotas(group_labels, group_quotas, group_eligible)
+    if group_allocation is None:
+        union = set()
+        for candidates in group_eligible.values():
+            union.update(candidates)
+        summary = ", ".join(
+            f"{label}={count}" for label, count in group_quotas.items()
+        )
+        raise AssessmentPlanningError(
+            PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL,
+            f"No valid allocation of hands-on challenge(s) exists for the "
+            f"selected domains: their hands-on module groups require "
+            f"{sum(group_quotas.values())} unique item(s) in total "
+            f"({summary}), but only {len(union)} unique eligible item(s) "
+            f"remain after cross-domain deduplication",
+        )
+
+    # Flatten group draws into the frozen selection and bookkeeping. The
+    # per-domain plan entry keeps each row's own hands_on_count (the
+    # requirement the module configuration declared); the challenge DRAW is
+    # shared at group level, which is what makes one challenge count towards
+    # every member domain's requirement.
+    selected_hands_on_ids = sorted(
+        {qid for ids in group_allocation.values() for qid in ids}
+    )
+    for domain in selected:
+        config = resolved.get(domain.id)
+        if not practicals_allowed or config is None or not config.hands_on_enabled:
             # Disabled: contributes no challenges AND no time.
             per_domain_hands_on[domain.id] = (False, 0, 0)
             continue
-        selected_hands_on_ids.extend(allocation[domain.id])
         # Additional time belongs to the module that carries it, so it is
         # summed only for ENABLED hands-on modules.
         additional_minutes += config.hands_on_additional_minutes

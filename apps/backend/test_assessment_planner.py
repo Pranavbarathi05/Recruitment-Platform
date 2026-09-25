@@ -105,6 +105,7 @@ def cfg(
     hands_on=False,
     hands_on_count=0,
     minutes=0,
+    hands_on_module="",
 ):
     """Build an assessment_module_config row."""
     return ModuleConfigInput(
@@ -115,6 +116,7 @@ def cfg(
         hands_on_enabled=hands_on,
         hands_on_count=hands_on_count,
         hands_on_additional_minutes=minutes,
+        hands_on_module=hands_on_module,
     )
 
 
@@ -142,9 +144,15 @@ def desc_items(ids, domain_ids, active=True):
     ]
 
 
-def hands_items(ids, domain_ids, active=True):
+def hands_items(ids, domain_ids, active=True, module=""):
+    """Build hands-on pool rows; `module` declares the challenge module."""
     return [
-        HandsOnPoolItem(id=i, domain_ids=list(domain_ids), is_active=active)
+        HandsOnPoolItem(
+            id=i,
+            domain_ids=list(domain_ids),
+            hands_on_modules=[module] if module else [],
+            is_active=active,
+        )
         for i in ids
     ]
 
@@ -258,7 +266,10 @@ class TestProgramScopes:
         assert plan.practicals[0].module_kind.value == "single"
         assert plan.practicals[0].scoring.value == "single"
         assert plan.practicals[0].arms[0].kind.value == "hands_on"
-        assert plan.practicals[0].arms[0].question_ids == plan.selected_hands_on_question_ids
+        assert (
+            plan.practicals[0].arms[0].question_ids
+            == plan.selected_hands_on_question_ids
+        )
         assert plan.coding_total == 2
         # Senior CyberSec: hands-on enabled with +20 minutes.
         assert plan.additional_minutes == 20
@@ -861,9 +872,36 @@ class TestDescriptiveSelection:
 
 class TestHandsOnSelection:
     def test_per_domain_hands_on_counts(self):
-        cyber = cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=1, minutes=20)
-        web = cfg(WEB_ID, "senior", hands_on=True, hands_on_count=1, minutes=10)
-        plan = plan_assessment(build(PROGRAM_5, [CYBER_ID, WEB_ID], [cyber, web]))
+        """Different modules: Cyber 1 + Web 1 -> 2 distinct challenges."""
+        cyber = cfg(
+            CYBER_ID,
+            "senior",
+            hands_on=True,
+            hands_on_count=1,
+            minutes=20,
+            hands_on_module="sql_injection_employee_portal",
+        )
+        web = cfg(
+            WEB_ID,
+            "senior",
+            hands_on=True,
+            hands_on_count=1,
+            minutes=10,
+            hands_on_module="web_module_x",
+        )
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID, WEB_ID],
+                [cyber, web],
+                hands_on_pool=(
+                    hands_items(
+                        ["h-sql"], [CYBER_ID, WEB_ID], module=SQL_MODULE
+                    )
+                    + hands_items(["h-web"], [WEB_ID], module=OTHER_MODULE)
+                ),
+            )
+        )
         assert plan.hands_on_total == 2
         assert len(set(plan.selected_hands_on_question_ids)) == 2
         assert [(e.hands_on_enabled, e.hands_on_count) for e in plan.domains] == [
@@ -872,24 +910,45 @@ class TestHandsOnSelection:
         ]
 
     def test_hands_on_cross_domain_deduplication(self):
-        """Two domains each needing 2, pool entirely shared: 4 unique."""
-        shared = hands_items(["h1", "h2", "h3", "h4"], [CYBER_ID, WEB_ID])
+        """Two domains each needing 2, pool entirely shared: 4 unique.
+
+        The domains run DIFFERENT modules, so no module-level deduplication
+        applies and the allocator still needs 4 unique challenges.
+        """
+        shared = hands_items(
+            ["h1", "h2", "h3", "h4"], [CYBER_ID, WEB_ID], module=SQL_MODULE
+        ) + hands_items(
+            ["w1", "w2", "w3", "w4"], [CYBER_ID, WEB_ID], module=OTHER_MODULE
+        )
         req = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
             [
-                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=2),
-                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=2),
+                cfg(
+                    CYBER_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=2,
+                    hands_on_module=SQL_MODULE,
+                ),
+                cfg(
+                    WEB_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=2,
+                    hands_on_module=OTHER_MODULE,
+                ),
             ],
             hands_on_pool=shared,
         )
         plan = plan_assessment(req)
         assert plan.hands_on_total == 4
+        # Two distinct draws from EACH module's four-challenge pool.
         assert sorted(plan.selected_hands_on_question_ids) == [
             "h1",
             "h2",
-            "h3",
-            "h4",
+            "w1",
+            "w2",
         ]
 
     def test_hands_on_insufficient_unique_pool_fails(self):
@@ -1407,24 +1466,55 @@ class TestExactAllocation:
         assert [e.hands_on_count for e in plan.domains] == [2, 2]
 
     def test_hands_on_shared_challenge_is_reallocated(self):
-        """The hands-on equivalent of the descriptive reallocation case."""
+        """The hands-on equivalent of the descriptive reallocation case.
+
+        Cyber's module pool has the shared challenge plus its own exclusive
+        one, so Cyber ends up on both and Web keeps its own module's
+        challenge: 3 unique ids overall, with no cross-module borrowing.
+        """
         req = build(
             PROGRAM_5,
             [CYBER_ID, WEB_ID],
             [
-                cfg(CYBER_ID, "senior", hands_on=True, hands_on_count=1),
-                cfg(WEB_ID, "senior", hands_on=True, hands_on_count=1),
+                cfg(
+                    CYBER_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=2,
+                    hands_on_module="sql_injection_employee_portal",
+                ),
+                cfg(
+                    WEB_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=1,
+                    hands_on_module="web_module_x",
+                ),
             ],
-            hands_on_pool=(
-                hands_items(["a-shared"], [CYBER_ID, WEB_ID])
-                + hands_items(["b-cyber-only"], [CYBER_ID])
-            ),
+            hands_on_pool=[
+                HandsOnPoolItem(
+                    id="sql-a",
+                    domain_ids=[CYBER_ID, WEB_ID],
+                    hands_on_modules=["sql_injection_employee_portal"],
+                ),
+                HandsOnPoolItem(
+                    id="sql-b",
+                    domain_ids=[CYBER_ID],
+                    hands_on_modules=["sql_injection_employee_portal"],
+                ),
+                HandsOnPoolItem(
+                    id="web-a",
+                    domain_ids=[WEB_ID],
+                    hands_on_modules=["web_module_x"],
+                ),
+            ],
         )
         plan = plan_assessment(req)
-        assert plan.hands_on_total == 2
+        assert plan.hands_on_total == 3
         assert sorted(plan.selected_hands_on_question_ids) == [
-            "a-shared",
-            "b-cyber-only",
+            "sql-a",
+            "sql-b",
+            "web-a",
         ]
 
     def test_hands_on_cascading_reallocation(self):
@@ -1493,6 +1583,352 @@ class TestExactAllocation:
         with pytest.raises(AssessmentPlanningError) as excinfo:
             plan_assessment(req)
         assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL
+
+
+# ---------------------------------------------------------------------------
+# Shared hands-on modules (cross-domain deduplication by challenge module)
+# ---------------------------------------------------------------------------
+
+
+SQL_MODULE = "sql_injection_employee_portal"
+OTHER_MODULE = "web_module_x"
+
+
+class TestSharedHandsOnModule:
+    """One module installed on several domains is ONE requirement group.
+
+    The production shape: DevOps and Web Development both run the SQL
+    hands-on challenge (the only challenge that exists today, migration
+    012). Each domain's module row asks for 1, but both requirements point
+    at the SAME module, so the candidate performs exactly one challenge and
+    it counts towards both domains' requirement. The previous behaviour
+    summed the quotas (1 + 1 = 2), which made the combined selection fail
+    on a single-question pool.
+    """
+
+    def _sql_pool(self, ids=("sql-1", "sql-2", "sql-3")):
+        return hands_items(list(ids), [CYBER_ID, WEB_ID], module=SQL_MODULE)
+
+    def _sql_rows(self, ids, domain_ids):
+        """Pool rows carrying an explicit module registry."""
+        return [
+            HandsOnPoolItem(
+                id=item_id,
+                domain_ids=list(domain_ids),
+                hands_on_modules=[SQL_MODULE],
+            )
+            for item_id in ids
+        ]
+
+    def test_first_domain_with_the_shared_module_draws_one(self):
+        """DevOps alone -> exactly 1 SQL hands-on challenge."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    )
+                ],
+                hands_on_pool=self._sql_pool(),
+            )
+        )
+        assert plan.hands_on_total == 1
+        assert len(plan.selected_hands_on_question_ids) == 1
+
+    def test_second_domain_with_the_shared_module_draws_one(self):
+        """Web Development alone -> exactly 1 SQL hands-on challenge."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [WEB_ID],
+                [
+                    cfg(
+                        WEB_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    )
+                ],
+                hands_on_pool=self._sql_pool(),
+            )
+        )
+        assert plan.hands_on_total == 1
+        assert len(plan.selected_hands_on_question_ids) == 1
+
+    def test_both_domains_sharing_one_module_draw_exactly_one(self):
+        """DevOps + Web Development: 1 + 1 requests -> ONE shared challenge.
+
+        This is the exact production failure: a single-challenge SQL pool
+        used to be refused with "they require 2 unique item(s) in total".
+        """
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID, WEB_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                    cfg(
+                        WEB_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                ],
+                # THE production pool shape: exactly one SQL challenge.
+                hands_on_pool=self._sql_pool(("sql-1",)),
+            )
+        )
+        assert plan.hands_on_total == 1
+        assert plan.selected_hands_on_question_ids == ["sql-1"]
+        # Both domains still report the module as enabled with its own count.
+        assert [(e.hands_on_enabled, e.hands_on_count) for e in plan.domains] == [
+            (True, 1),
+            (True, 1),
+        ]
+        # The one practical arm carries the single shared challenge.
+        assert plan.practicals[0].arms[0].question_ids == ["sql-1"]
+
+    def test_higher_request_takes_the_max_not_the_sum(self):
+        """Same module, 2 + 1 requests over a 2-challenge pool: 2, not 3."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID, WEB_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=2,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                    cfg(
+                        WEB_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                ],
+                hands_on_pool=self._sql_pool(("sql-1", "sql-2")),
+            )
+        )
+        assert plan.hands_on_total == 2
+        assert sorted(plan.selected_hands_on_question_ids) == ["sql-1", "sql-2"]
+
+    def test_shortfall_of_the_shared_module_pool_still_fails(self):
+        """Dedup removes double counting, but a real shortage still fails."""
+        req = build(
+            PROGRAM_5,
+            [CYBER_ID, WEB_ID],
+            [
+                cfg(
+                    CYBER_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=2,
+                    hands_on_module=SQL_MODULE,
+                ),
+                cfg(
+                    WEB_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=1,
+                    hands_on_module=SQL_MODULE,
+                ),
+            ],
+            hands_on_pool=self._sql_pool(("sql-1",)),
+        )
+        with pytest.raises(AssessmentPlanningError) as excinfo:
+            plan_assessment(req)
+        assert excinfo.value.kind is PlanningErrorKind.INSUFFICIENT_HANDS_ON_POOL
+
+    def test_module_identity_groups_even_when_domain_ids_differ(self):
+        """Grouping keys on the MODULE, not on where rows advertise it.
+
+        Cyber's pool holds the SQL rows (plus an exclusive module row) while
+        Web's SQL rows were tagged differently: both selected domains still
+        land in one SQL group because their configured module is identical.
+        """
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID, WEB_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                    cfg(
+                        WEB_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                ],
+                # Cyber sees the SQL rows AND an unrelated module; Web's SQL
+                # row overlaps only WEB_ID. The SQL group must still merge.
+                hands_on_pool=(
+                    self._sql_rows(["sql-a"], [CYBER_ID])
+                    + self._sql_rows(["sql-b"], [WEB_ID])
+                    + [
+                        HandsOnPoolItem(
+                            id="other-1",
+                            domain_ids=[CYBER_ID],
+                            hands_on_modules=[OTHER_MODULE],
+                        )
+                    ]
+                ),
+            )
+        )
+        assert plan.hands_on_total == 1
+        assert plan.selected_hands_on_question_ids == ["sql-a"]
+
+    def test_three_domains_sharing_the_same_module_draw_exactly_one(self):
+        """Extensibility: a third domain adopting SQL dedups automatically."""
+        devops = DomainInput(
+            id="d-devops",
+            name="DevOps",
+            slug="devops",
+            assessment_scope="technical",
+        )
+        program = ProgramInput(
+            semester=5,
+            scope=Scope.TECHNICAL,
+            tier="senior",
+            max_domains=3,
+            coding_enabled=True,
+            mcq_total=30,
+        )
+        req = build(
+            program,
+            [CYBER_ID, WEB_ID, "d-devops"],
+            [
+                cfg(
+                    CYBER_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=1,
+                    hands_on_module=SQL_MODULE,
+                ),
+                cfg(
+                    WEB_ID,
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=1,
+                    hands_on_module=SQL_MODULE,
+                ),
+                cfg(
+                    "d-devops",
+                    "senior",
+                    hands_on=True,
+                    hands_on_count=1,
+                    hands_on_module=SQL_MODULE,
+                ),
+            ],
+            hands_on_pool=self._sql_pool(("sql-1",)),
+        )
+        # build() only knows the CATALOGUE domains; add DevOps explicitly.
+        req.domains = [CYBER, WEB, devops]
+        # big_pools() only seeds MCQs for CATALOGUE domains.
+        req.mcq_pool = list(req.mcq_pool) + mcq_items(
+            "d-devops", program.semester, 25, "q-devops"
+        )
+        plan = plan_assessment(req)
+        assert plan.hands_on_total == 1
+        assert plan.selected_hands_on_question_ids == ["sql-1"]
+        assert [e.hands_on_enabled for e in plan.domains] == [True, True, True]
+        assert all(e.hands_on_count == 1 for e in plan.domains)
+
+    def test_two_domains_with_different_modules_draw_two(self):
+        """Preserved: genuinely different modules stay distinct requirements."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID, WEB_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                    cfg(
+                        WEB_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=OTHER_MODULE,
+                    ),
+                ],
+                hands_on_pool=(
+                    self._sql_rows(["sql-1"], [CYBER_ID, WEB_ID])
+                    + [
+                        HandsOnPoolItem(
+                            id="other-1",
+                            domain_ids=[WEB_ID],
+                            hands_on_modules=[OTHER_MODULE],
+                        )
+                    ]
+                ),
+            )
+        )
+        assert plan.hands_on_total == 2
+        assert sorted(plan.selected_hands_on_question_ids) == ["other-1", "sql-1"]
+
+    def test_shared_module_selection_varies_under_a_seed(self):
+        """The seeded draw still varies WITHIN the shared module's pool."""
+        drawn = set()
+
+        for seed in range(1, 21):
+            req = build(
+                PROGRAM_5,
+                [CYBER_ID, WEB_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                    cfg(
+                        WEB_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                ],
+                hands_on_pool=self._sql_pool(
+                    ("sql-1", "sql-2", "sql-3", "sql-4", "sql-5")
+                ),
+            )
+            req.seed = seed
+            plan = plan_assessment(req)
+            assert plan.hands_on_total == 1
+            drawn.update(plan.selected_hands_on_question_ids)
+
+        assert len(drawn) > 1
 
     def test_selected_ids_are_globally_unique(self):
         """Heavy overlap: no id may appear twice anywhere in the plan."""
