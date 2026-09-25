@@ -186,9 +186,10 @@ describe('Domains — the offered list follows the candidate programme', () => {
 
     expect(await screen.findByText('Web Development')).toBeInTheDocument();
     expect(screen.getByText('Machine Learning')).toBeInTheDocument();
-    // The counts are still rendered as badges, not used as a filter.
-    expect(screen.getByText(/0 Questions/)).toBeInTheDocument();
-    expect(screen.getByText(/3 Questions/)).toBeInTheDocument();
+    // The counts are display metadata only: they are not a filter, and the
+    // cards deliberately render no question-count/duration badge.
+    expect(screen.queryByText(/Questions/)).toBeNull();
+    expect(screen.queryByText(/min$/)).toBeNull();
 
     // Both remain selectable and the low-count one still submits.
     fireEvent.click(screen.getByText('Web Development'));

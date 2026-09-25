@@ -357,22 +357,8 @@ const Domains = () => {
                     </div>
 
                     {domain.description && (
-                      <p className="text-theme-muted text-sm mb-4">{domain.description}</p>
+                      <p className="text-theme-muted text-sm">{domain.description}</p>
                     )}
-
-                    <div className="flex items-center gap-2">
-                      {domain.questionCount != null && (
-                        <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-theme-tertiary text-theme-muted">
-                          {domain.questionCount}{' '}
-                          {domain.questionCount === 1 ? 'Question' : 'Questions'}
-                        </span>
-                      )}
-                      {domain.durationMinutes != null && (
-                        <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-blue-900/50 text-blue-300">
-                          ⏱️ {domain.durationMinutes} min
-                        </span>
-                      )}
-                    </div>
                   </div>
                 </div>
               );
