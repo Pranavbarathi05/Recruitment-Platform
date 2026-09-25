@@ -791,6 +791,25 @@ const AdminPanel = () => {
                           />
                         </div>
                       </div>
+                      {/* Optional proctoring policy. The setting is frozen into an
+                          attempt when it is CREATED, so changing it here never alters
+                          an assessment that is already running. */}
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          data-testid="network-integrity-toggle"
+                          checked={!!configForm.network_integrity_monitoring}
+                          onChange={(e) => setConfigForm({ ...configForm, network_integrity_monitoring: e.target.checked })}
+                          className="mt-0.5 h-4 w-4 accent-blue-600"
+                        />
+                        <span>
+                          <span className="block text-sm text-theme-primary">Network Integrity Monitoring</span>
+                          <span className="block text-xs text-theme-muted">
+                            Detect direct internet connectivity during active assessments.
+                            Applies only to assessments started after this is saved.
+                          </span>
+                        </span>
+                      </label>
                       <p className="text-xs text-theme-muted">
                         Question quantities are configured elsewhere: technical MCQ totals and the
                         domain limit come from the assessment programme, and per-domain MCQ,
@@ -824,7 +843,7 @@ const AdminPanel = () => {
                           </span>
                         </div>
                         <button
-                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, coding_problem_count: cfg.coding_problem_count ?? 0, duration_minutes: cfg.duration_minutes, is_active: cfg.is_active }); setConfigError(''); }}
+                          onClick={() => { setEditingConfig(cfg); setConfigForm({ name: cfg.name, coding_problem_count: cfg.coding_problem_count ?? 0, duration_minutes: cfg.duration_minutes, is_active: cfg.is_active, network_integrity_monitoring: !!cfg.network_integrity_monitoring }); setConfigError(''); }}
                           className="text-xs px-2 py-1 bg-blue-600 text-white rounded"
                         >
                           Edit
@@ -833,6 +852,9 @@ const AdminPanel = () => {
                       <div className="grid grid-cols-2 gap-2 mt-3 text-xs text-theme-muted">
                         <span>Coding Problems: {cfg.coding_problem_count ?? 0}</span>
                         <span>Duration: {cfg.duration_minutes}m</span>
+                        <span data-testid="network-integrity-state">
+                          Network Integrity Monitoring: {cfg.network_integrity_monitoring ? 'On' : 'Off'}
+                        </span>
                       </div>
                       <p className="text-xs text-theme-muted mt-1">
                         Technical MCQ totals and the domain limit come from the assessment

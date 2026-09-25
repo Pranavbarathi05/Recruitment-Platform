@@ -393,6 +393,12 @@ class AssessmentPlanRequest(_Input):
     base_duration_minutes: int = Field(..., gt=0)
     global_coding_problem_count: int = Field(default=0, ge=0)
 
+    # Optional proctoring policy (assessment_config.network_integrity_monitoring),
+    # read once when the attempt is created and frozen into the plan. It changes
+    # no selection, count or duration — it only tells the candidate workspace
+    # whether to run the network-integrity monitor for this attempt.
+    network_integrity_monitoring: bool = False
+
     # Candidate-eligible content pools.
     mcq_pool: list[MCQPoolItem] = Field(default_factory=list)
     descriptive_pool: list[DescriptivePoolItem] = Field(default_factory=list)
@@ -504,6 +510,19 @@ class AssessmentPlan(BaseModel):
     base_duration_minutes: int
     additional_minutes: int
     duration_minutes: int
+
+    # Whether the optional network-integrity monitor applies to THIS attempt.
+    # Frozen here, in the plan snapshot, so an admin flipping the global toggle
+    # can never change the behaviour of an attempt that is already running: the
+    # candidate workspace reads the policy from this frozen plan.
+    #
+    # It is deliberately NOT part of config_fingerprint: the fingerprint
+    # identifies the CONFIGURATION that shaped the assessment's content
+    # (domains, counts, durations). Whether the machine is network-monitored is
+    # an orthogonal proctoring policy that changes no question, no count and no
+    # duration, so folding it in would make two content-identical plans look
+    # different for a reason that has nothing to do with the plan's content.
+    network_integrity_monitoring: bool = False
 
     # Stable digest of the CONFIGURATION that produced this plan. Not affected
     # by which questions were drawn, or by `seed`.
@@ -1161,5 +1180,6 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
         base_duration_minutes=base_duration,
         additional_minutes=additional_minutes,
         duration_minutes=total_duration,
+        network_integrity_monitoring=request.network_integrity_monitoring,
         config_fingerprint=fingerprint,
     )

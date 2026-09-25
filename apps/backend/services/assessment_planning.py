@@ -424,6 +424,11 @@ def plan_new_attempt(
         coding_pool=(
             load_coding_pool() if coding_enabled and coding_problem_count > 0 else []
         ),
+        # Optional proctoring policy, frozen into the plan snapshot for this
+        # attempt (see migration 023). Absent column / absent key -> False, so a
+        # database that has not had migration 023 applied, and every attempt
+        # created before this feature, keep monitoring strictly disabled.
+        network_integrity_monitoring=bool(config.get("network_integrity_monitoring", False)),
         seed=generate_seed(),
     )
 

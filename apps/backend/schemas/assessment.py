@@ -71,6 +71,34 @@ class AnswerSaveRequest(BaseModel):
     selected_option: str = Field(..., pattern=r'^[ABCD]$')
 
 
+# Termination reasons the candidate's workspace may report when it finalizes an
+# attempt from a monitoring policy rather than from the "Finish Assessment"
+# button. Fixed allowlist: anything else in the body is ignored, so a caller can
+# never invent an arbitrary audit label.
+TERMINATION_REASONS = frozenset({"network_integrity_violation"})
+
+
+class AttemptSubmitRequest(BaseModel):
+    """OPTIONAL body for POST /assessment/attempt/{id}/submit.
+
+    The endpoint is the single authoritative submission path for every trigger
+    (manual finish, duration timeout, fullscreen timeout, network-integrity
+    violation). Ordinary submissions send no body at all and therefore carry no
+    reason; only a policy termination identifies itself here.
+
+    ``reason`` is validated against TERMINATION_REASONS. An unknown value is
+    DROPPED (treated as an ordinary submission) rather than rejected: the
+    submission itself must never fail because an audit label was mistyped.
+    """
+    reason: Optional[str] = None
+
+    def resolved_reason(self) -> Optional[str]:
+        """The reason if it is one of the allowlisted values, else None."""
+        if self.reason in TERMINATION_REASONS:
+            return self.reason
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Assessment configuration
 # ---------------------------------------------------------------------------
@@ -84,6 +112,9 @@ class AssessmentConfigUpdate(BaseModel):
                                   enabled hands-on time to
       * ``coding_problem_count`` — the GLOBAL DSA/coding pool size (coding is
                                   domain-independent)
+      * ``network_integrity_monitoring`` — the optional proctoring policy that
+                                  detects direct internet connectivity on the
+                                  candidate machine during an active attempt
       * ``name`` / ``is_active`` — config row management
 
     The pre-modular knobs are deliberately NOT accepted any more. None of them
@@ -104,6 +135,11 @@ class AssessmentConfigUpdate(BaseModel):
     coding_problem_count: Optional[int] = Field(None, ge=0)
     duration_minutes: Optional[int] = Field(None, gt=0)
     is_active: Optional[bool] = None
+    # Optional network-integrity monitoring (migration 023). The frozen
+    # snapshot of this setting is taken when an attempt is CREATED, so flipping
+    # it never changes an attempt that is already running. Default OFF: an
+    # admin must opt in explicitly.
+    network_integrity_monitoring: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------

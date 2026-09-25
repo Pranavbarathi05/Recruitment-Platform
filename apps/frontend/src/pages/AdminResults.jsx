@@ -108,6 +108,7 @@ const AdminResults = () => {
     hands_on_results,
     hands_on_score,
     hands_on_max_score,
+    termination_reason,
   } = results;
   const questions = mcq_questions || [];
   const descriptives = descriptive_results || [];
@@ -188,6 +189,20 @@ const AdminResults = () => {
               <span className="text-theme-primary font-medium">{formatTime(submitted_at)}</span>
             </div>
           </div>
+
+          {/* Why the attempt ended, when it was not an ordinary submission.
+              NULL means ordinary, so a normal result is unchanged. */}
+          {termination_reason && (
+            <p
+              data-testid="termination-reason"
+              className="mt-4 text-sm text-red-300 bg-red-900/30 border border-red-500/50 rounded px-3 py-2"
+            >
+              <span className="font-semibold">Termination reason:</span>{' '}
+              {termination_reason === 'network_integrity_violation'
+                ? 'Network integrity violation'
+                : termination_reason}
+            </p>
+          )}
         </div>
 
         {/* Performance Summary */}

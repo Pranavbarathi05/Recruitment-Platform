@@ -50,6 +50,8 @@ const CONFIG = {
   duration_minutes: 20,
   max_domains: 2,
   is_active: true,
+  // Optional proctoring policy (migration 023). Defaults to off.
+  network_integrity_monitoring: false,
 };
 
 /**
@@ -172,8 +174,10 @@ describe('AdminPanel — assessment configuration editor', () => {
     const fetchMock = mockFetch({ configs: [CONFIG] });
     renderAdminPanel(fetchMock);
 
-    await clickConfigEdit();
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    // The domain list and the MCQ-total form also render a Save button, so
+    // scope to the config card under test.
+    const card = await clickConfigEdit();
+    fireEvent.click(within(card).getByRole('button', { name: 'Save' }));
 
     await waitFor(() => {
       const putCalls = fetchMock.mock.calls.filter(
@@ -186,6 +190,8 @@ describe('AdminPanel — assessment configuration editor', () => {
         coding_problem_count: 2,
         duration_minutes: 20,
         is_active: true,
+        // Saved alongside the other live settings, and off by default.
+        network_integrity_monitoring: false,
       });
       for (const field of [
         'total_questions',

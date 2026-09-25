@@ -2078,3 +2078,76 @@ class TestProductionRegressionSemesterComposition:
         )
         assert plan.descriptive_total == 0
         assert plan.mcq_total == 10
+
+
+# ---------------------------------------------------------------------------
+# Optional network-integrity policy in the frozen plan
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkIntegrityPolicyInPlan:
+    """The optional proctoring policy is frozen INTO the plan.
+
+    The policy has to travel with the attempt rather than being read live, so
+    that an admin flipping the global toggle can never change the behaviour of
+    an assessment that is already running. It must also be inert with respect to
+    the plan's CONTENT: no selection, count or duration may move.
+    """
+
+    def _plans(self, **kwargs):
+        return (
+            plan_assessment(build(PROGRAM_5, [CYBER_ID], [CYBER_SENIOR], coding=2)),
+            plan_assessment(
+                build(
+                    PROGRAM_5,
+                    [CYBER_ID],
+                    [CYBER_SENIOR],
+                    coding=2,
+                    **kwargs,
+                )
+            ),
+        )
+
+    def test_monitoring_is_disabled_by_default(self):
+        assert self._plans()[0].network_integrity_monitoring is False
+
+    def test_monitoring_travels_into_the_plan_when_requested(self):
+        assert self._plans(network_integrity_monitoring=True)[1].network_integrity_monitoring is True
+
+    def test_policy_changes_no_selection_count_or_duration(self):
+        off, on = self._plans(network_integrity_monitoring=True)
+
+        assert off.selected_mcq_ids == on.selected_mcq_ids
+        assert off.selected_coding_problem_ids == on.selected_coding_problem_ids
+        assert off.selected_descriptive_question_ids == on.selected_descriptive_question_ids
+        assert off.selected_hands_on_question_ids == on.selected_hands_on_question_ids
+        assert off.mcq_total == on.mcq_total
+        assert off.coding_total == on.coding_total
+        assert off.descriptive_total == on.descriptive_total
+        assert off.hands_on_total == on.hands_on_total
+        assert off.duration_minutes == on.duration_minutes
+
+    def test_policy_does_not_move_the_config_fingerprint(self):
+        """Monitoring is a proctoring policy, not assessment configuration."""
+        off, on = self._plans(network_integrity_monitoring=True)
+
+        assert off.config_fingerprint == on.config_fingerprint
+
+    def test_policy_survives_serialisation_for_the_plan_snapshot(self):
+        plan = self._plans(network_integrity_monitoring=True)[1]
+
+        restored = assessment_planner.AssessmentPlan.model_validate(
+            plan.model_dump(mode="json")
+        )
+
+        assert restored.network_integrity_monitoring is True
+        assert restored.config_fingerprint == plan.config_fingerprint
+
+    def test_a_plan_snapshot_without_the_key_reads_as_disabled(self):
+        """Attempts created before this feature carry no key at all."""
+        payload = self._plans()[0].model_dump(mode="json")
+        payload.pop("network_integrity_monitoring")
+
+        restored = assessment_planner.AssessmentPlan.model_validate(payload)
+
+        assert restored.network_integrity_monitoring is False

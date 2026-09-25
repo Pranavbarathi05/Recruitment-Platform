@@ -364,6 +364,40 @@ _VALID_SORTS = {
 }
 
 
+# Columns the admin submissions list reads off assessment_attempts.
+_ATTEMPT_LIST_COLUMNS = (
+    "id, profile_id, domain_ids, total_questions, score, max_score, mcq_score, "
+    "mcq_max_score, coding_score, coding_max_score, total_coding_problems, "
+    "total_descriptive_questions, started_at, submitted_at, status, admin_remark"
+)
+
+
+def _fetch_attempts_for_admin_listing():
+    """Fetch the listed attempts, tolerating a database without migration 023.
+
+    ``termination_reason`` is an audit extra added by migration 023. A database
+    that has not had it applied yet must still list submissions — the same
+    convention the hands-on columns follow for migration 013 — so on failure the
+    select is retried WITHOUT that single column and rows simply report no
+    reason. The fallback drops only the new column: every pre-existing field,
+    the filter and the admin contract are unchanged.
+    """
+    base = supabase_client.table("assessment_attempts")
+    try:
+        return (
+            base.select(f"{_ATTEMPT_LIST_COLUMNS}, termination_reason")
+            .in_("status", ["submitted", "scored", "reset"])
+            .execute()
+        )
+    except Exception:
+        return (
+            supabase_client.table("assessment_attempts")
+            .select(_ATTEMPT_LIST_COLUMNS)
+            .in_("status", ["submitted", "scored", "reset"])
+            .execute()
+        )
+
+
 @router.get("/assessments/submissions")
 def list_submissions(
     admin: AuthUser = Depends(require_admin),
@@ -385,13 +419,9 @@ def list_submissions(
         import logging
         logger = logging.getLogger(__name__)
         # 1. Fetch submitted/scored attempts (admin_remark is admin-only and
-        # only ever leaves the database through admin endpoints)
-        attempts_resp = (
-            supabase_client.table("assessment_attempts")
-            .select("id, profile_id, domain_ids, total_questions, score, max_score, mcq_score, mcq_max_score, coding_score, coding_max_score, total_coding_problems, total_descriptive_questions, started_at, submitted_at, status, admin_remark")
-            .in_("status", ["submitted", "scored", "reset"])
-            .execute()
-        )
+        # only ever leaves the database through admin endpoints;
+        # termination_reason is tolerated if migration 023 is not applied yet).
+        attempts_resp = _fetch_attempts_for_admin_listing()
         attempts = attempts_resp.data or []
 
         if not attempts:
@@ -461,6 +491,10 @@ def list_submissions(
                 "total_coding_problems": attempt.get("total_coding_problems") or 0,
                 "total_descriptive_questions": attempt.get("total_descriptive_questions") or 0,
                 "admin_remark": attempt.get("admin_remark"),
+                # Why the attempt ended when it was not an ordinary submission
+                # (migration 023). NULL means an ordinary submission, so the
+                # normal result presentation is completely unaffected.
+                "termination_reason": attempt.get("termination_reason"),
                 "status": attempt.get("status"),
                 "started_at": attempt.get("started_at"),
                 "submitted_at": attempt.get("submitted_at"),

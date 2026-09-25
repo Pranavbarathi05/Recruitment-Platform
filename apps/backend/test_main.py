@@ -10111,3 +10111,592 @@ class TestAssessmentCapability:
             ).status_code
             == 401
         )
+
+
+# ---------------------------------------------------------------------------
+# Optional network-integrity monitoring (migration 023)
+# ---------------------------------------------------------------------------
+
+from routers.assessment import (  # noqa: E402  (env is configured above)
+    _attempt_monitoring_policy,
+)
+
+
+class TestAttemptMonitoringPolicy:
+    """The optional proctoring policy is read from the FROZEN plan snapshot.
+
+    It is never read live: the attempt decides, once, whether the candidate
+    machine is monitored, so an admin flipping the global toggle cannot change
+    an assessment that is already running.
+    """
+
+    def test_plan_is_null_reads_as_disabled(self):
+        """Legacy attempts (plan IS NULL) are never monitored."""
+        assert _attempt_monitoring_policy({"plan": None}) is False
+        assert _attempt_monitoring_policy({}) is False
+
+    def test_missing_key_reads_as_disabled(self):
+        """Attempts created before this feature carry no key."""
+        assert _attempt_monitoring_policy({"plan": {"plan_version": 2}}) is False
+
+    def test_only_a_strict_true_enables_monitoring(self):
+        """A truthy value is not enough — anything else stays unmonitored."""
+        assert _attempt_monitoring_policy(
+            {"plan": {"network_integrity_monitoring": True}}
+        ) is True
+        for truthy_but_not_true in ("true", "True", 1, [], {}):
+            assert _attempt_monitoring_policy(
+                {"plan": {"network_integrity_monitoring": truthy_but_not_true}}
+            ) is False, truthy_but_not_true
+
+    def test_a_malformed_plan_reads_as_disabled(self):
+        """Defensive: a corrupted snapshot must never enable monitoring."""
+        for malformed in ("{}", [], 42, True):
+            assert _attempt_monitoring_policy({"plan": malformed}) is False, malformed
+
+
+class TestQuestionsExposeMonitoringPolicy:
+    """GET /assessment/attempt/{id}/questions carries the frozen policy."""
+
+    def _set_actor(self):
+        from core.auth import get_current_user, get_assessment_actor
+        from main import app
+
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
+        )
+        return app
+
+    def _configure(self, mock_sb, plan):
+        _route_table(mock_sb, "assessment_attempts")
+        attempt = _make_attempt()
+        attempt["selected_question_ids"] = []
+        attempt["total_questions"] = 0
+        attempt["plan"] = plan
+        chains = mock_sb._table_chains
+        chain = chains.setdefault("assessment_attempts", MagicMock())
+        chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        return attempt
+
+    def _get(self, client, mock_supabase, plan):
+        self._configure(mock_supabase, plan)
+        app = self._set_actor()
+        try:
+            response = client.get(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/questions"
+            )
+        finally:
+            app.dependency_overrides.clear()
+        return response
+
+    def test_questions_report_monitoring_enabled(self, client, mock_supabase):
+        response = self._get(
+            client, mock_supabase, {"network_integrity_monitoring": True}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["network_integrity_monitoring"] is True
+
+    def test_questions_report_monitoring_disabled(self, client, mock_supabase):
+        response = self._get(
+            client, mock_supabase, {"network_integrity_monitoring": False}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["network_integrity_monitoring"] is False
+
+    def test_legacy_attempt_without_a_plan_is_not_monitored(
+        self, client, mock_supabase
+    ):
+        response = self._get(client, mock_supabase, None)
+
+        assert response.status_code == 200
+        assert response.json()["network_integrity_monitoring"] is False
+
+    @patch("routers.assessment._get_active_config")
+    def test_a_later_admin_toggle_cannot_change_a_running_attempt(
+        self, mock_config, client, mock_supabase
+    ):
+        """The live config says ON; this attempt's frozen plan says OFF."""
+        mock_config.return_value = _make_config(network_integrity_monitoring=True)
+
+        response = self._get(
+            client, mock_supabase, {"network_integrity_monitoring": False}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["network_integrity_monitoring"] is False
+
+
+class TestAttemptSubmitTerminationReason:
+    """POST /submit stays the ONE authoritative path, with an optional reason."""
+
+    def _set_actor(self):
+        from core.auth import get_current_user, get_assessment_actor
+        from main import app
+
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
+        )
+        return app
+
+    def _configure(self, mock_sb, status="in_progress"):
+        _route_table(mock_sb, "assessment_attempts")
+        attempt = _make_attempt(status=status)
+        attempt["total_coding_problems"] = 0
+        chain = mock_sb._table_chains.setdefault(
+            "assessment_attempts", MagicMock()
+        )
+        chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+        return chain
+
+    def _post(self, client, mock_supabase, status="in_progress", **kwargs):
+        self._configure(mock_supabase, status=status)
+        app = self._set_actor()
+        try:
+            return client.post(
+                f"/assessment/attempt/{MOCK_ATTEMPT_ID}/submit", **kwargs
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+    @patch("routers.assessment._score_attempt")
+    def test_network_violation_reason_is_passed_to_scoring(
+        self, mock_score, client, mock_supabase
+    ):
+        response = self._post(
+            client,
+            mock_supabase,
+            json={"reason": "network_integrity_violation"},
+        )
+
+        assert response.status_code == 200
+        mock_score.assert_called_once_with(
+            MOCK_ATTEMPT_ID,
+            termination_reason="network_integrity_violation",
+        )
+
+    @patch("routers.assessment._score_attempt")
+    def test_an_ordinary_submission_sends_no_body_and_records_no_reason(
+        self, mock_score, client, mock_supabase
+    ):
+        """The manual button, duration timer and fullscreen timer send nothing.
+
+        Content-Type is application/json (as the real client sends it) with an
+        EMPTY body: the endpoint must stay backward compatible with that.
+        """
+        response = self._post(
+            client,
+            mock_supabase,
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 200
+        mock_score.assert_called_once_with(MOCK_ATTEMPT_ID, termination_reason=None)
+
+    @patch("routers.assessment._score_attempt")
+    def test_an_unknown_reason_is_dropped_not_rejected(
+        self, mock_score, client, mock_supabase
+    ):
+        response = self._post(
+            client, mock_supabase, json={"reason": "made_up_violation"}
+        )
+
+        assert response.status_code == 200
+        mock_score.assert_called_once_with(MOCK_ATTEMPT_ID, termination_reason=None)
+
+    @patch("routers.assessment._score_attempt")
+    def test_a_finalized_attempt_is_never_re_scored_so_the_reason_cannot_change(
+        self, mock_score, client, mock_supabase
+    ):
+        """The 409 fires before any write: the first reason wins, always."""
+        response = self._post(
+            client,
+            mock_supabase,
+            json={"reason": "network_integrity_violation"},
+            status="scored",
+        )
+
+        assert response.status_code == 409
+        mock_score.assert_not_called()
+
+
+class TestScoreAttemptWritesTerminationReason:
+    """The audit label is written only when a policy supplied one."""
+
+    def _score(self, mock_sb, reason):
+        """Run the real scoring write with the two section scorers stubbed."""
+        from routers.assessment import _score_attempt
+
+        _route_table(mock_sb, "assessment_attempts")
+        chain = mock_sb._table_chains.setdefault("assessment_attempts", MagicMock())
+        chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"selected_hands_on_question_ids": []}])
+        )
+        with patch(
+            "routers.assessment._score_mcq", return_value={"score": 0, "max_score": 0}
+        ), patch(
+            "routers.assessment._score_coding", return_value={"score": 0, "max_score": 0}
+        ):
+            _score_attempt(MOCK_ATTEMPT_ID, termination_reason=reason)
+        return chain.update.call_args.args[0]
+
+    def test_reason_is_persisted_with_the_finalization(self, mock_supabase):
+        written = self._score(mock_supabase, "network_integrity_violation")
+
+        assert written["status"] == "scored"
+        assert written["termination_reason"] == "network_integrity_violation"
+
+    def test_no_reason_leaves_the_column_untouched(self, mock_supabase):
+        """A database without migration 023 keeps finalizing attempts."""
+        written = self._score(mock_supabase, None)
+
+        assert written["status"] == "scored"
+        assert "termination_reason" not in written
+
+
+class TestAdminNetworkIntegrityToggle:
+    """The admin toggle persists on assessment_config, defaulting to off."""
+
+    def _set_admin(self):
+        from core.auth import require_admin
+        from main import app
+
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id="admin-user-id", email="admin@test.com"
+        )
+        return app
+
+    @patch("routers.admin.supabase_client")
+    def test_toggle_is_written(self, mock_admin_sb, client):
+        _route_table(mock_admin_sb, "assessment_config")
+        chain = mock_admin_sb._table_chains.setdefault(
+            "assessment_config", MagicMock()
+        )
+        chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_CONFIG_ID}])
+        )
+        chain.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([_make_config(network_integrity_monitoring=True)])
+        )
+        app = self._set_admin()
+        try:
+            response = client.put(
+                f"/admin/config/{MOCK_CONFIG_ID}",
+                json={"network_integrity_monitoring": True},
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert chain.update.call_args.args[0] == {
+            "network_integrity_monitoring": True
+        }
+        assert response.json()["network_integrity_monitoring"] is True
+
+    @patch("routers.admin.supabase_client")
+    def test_toggle_can_be_turned_back_off(self, mock_admin_sb, client):
+        _route_table(mock_admin_sb, "assessment_config")
+        chain = mock_admin_sb._table_chains.setdefault(
+            "assessment_config", MagicMock()
+        )
+        chain.select.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([{"id": MOCK_CONFIG_ID}])
+        )
+        chain.update.return_value.eq.return_value.execute.return_value = (
+            _make_mock_response([_make_config(network_integrity_monitoring=False)])
+        )
+        app = self._set_admin()
+        try:
+            response = client.put(
+                f"/admin/config/{MOCK_CONFIG_ID}",
+                json={"network_integrity_monitoring": False},
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert chain.update.call_args.args[0] == {
+            "network_integrity_monitoring": False
+        }
+
+    @patch("routers.admin.supabase_client")
+    def test_config_list_advertises_the_toggle(self, mock_admin_sb, client):
+        _route_table(mock_admin_sb, "assessment_config")
+        chain = mock_admin_sb._table_chains.setdefault(
+            "assessment_config", MagicMock()
+        )
+        chain.select.return_value.order.return_value.execute.return_value = (
+            _make_mock_response([
+                _make_config(coding_problem_count=2, network_integrity_monitoring=True)
+            ])
+        )
+        app = self._set_admin()
+        try:
+            response = client.get("/admin/config")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.json()[0]["network_integrity_monitoring"] is True
+
+
+class TestAdminSubmissionsExposeTerminationReason:
+    """Admin results can tell a policy termination from a normal submission."""
+
+    def _set_admin(self):
+        from core.auth import require_admin
+        from main import app
+
+        app.dependency_overrides[require_admin] = lambda: AuthUser(
+            id="admin-user-id", email="admin@test.com"
+        )
+        return app
+
+    def _configure(self, mock_sb, termination_reason):
+        _route_table(mock_sb, "assessment_attempts")
+        chains = mock_sb._table_chains
+
+        attempt = _make_attempt(status="scored")
+        attempt["termination_reason"] = termination_reason
+        attempts = chains.setdefault("assessment_attempts", MagicMock())
+        attempts.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response([attempt])
+        )
+
+        profiles = chains.setdefault("profiles", MagicMock())
+        profiles.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response(
+                [{"id": MOCK_PROFILE_ID, "full_name": "Test User", "email": "t@e.com"}]
+            )
+        )
+
+        candidates = chains.setdefault("candidates", MagicMock())
+        candidates.select.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response(
+                [{"profile_id": MOCK_PROFILE_ID, "usn": "01JST", "semester": 5, "branch": "CSE"}]
+            )
+        )
+
+        domains = chains.setdefault("domains", MagicMock())
+        domains.select.return_value.execute.return_value = _make_mock_response(
+            [{"id": MOCK_DOMAIN_1_ID, "name": "Test Domain"}]
+        )
+
+    def _get(self, client, mock_supabase, termination_reason):
+        self._configure(mock_supabase, termination_reason)
+        app = self._set_admin()
+        try:
+            response = client.get("/admin/assessments/submissions")
+        finally:
+            app.dependency_overrides.clear()
+        return response
+
+    def test_reason_survives_into_the_admin_response(self, client, mock_supabase):
+        response = self._get(
+            client, mock_supabase, "network_integrity_violation"
+        )
+
+        assert response.status_code == 200
+        assert response.json()[0]["termination_reason"] == "network_integrity_violation"
+
+    def test_an_ordinary_submission_reports_no_reason(self, client, mock_supabase):
+        response = self._get(client, mock_supabase, None)
+
+        assert response.status_code == 200
+        assert response.json()[0]["termination_reason"] is None
+
+    def test_the_list_still_works_without_migration_023(
+        self, client, mock_supabase
+    ):
+        """A database without the column must still list submissions."""
+        from routers.admin import _ATTEMPT_LIST_COLUMNS
+
+        self._configure(mock_supabase, None)
+        attempts = mock_supabase._table_chains["assessment_attempts"]
+
+        # First select (with the new column) fails exactly as PostgREST does
+        # when the column does not exist yet.
+        failing = MagicMock()
+        failing.in_.return_value.execute.side_effect = Exception(
+            "column assessment_attempts.termination_reason does not exist"
+        )
+        ok = MagicMock()
+        ok.in_.return_value.execute.return_value = _make_mock_response([
+            _make_attempt(status="scored")
+        ])
+        attempts.select.side_effect = [failing, ok]
+
+        app = self._set_admin()
+        try:
+            response = client.get("/admin/assessments/submissions")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.json()[0]["termination_reason"] is None
+        # The retry dropped ONLY the new column.
+        assert attempts.select.call_args_list[1].args[0] == _ATTEMPT_LIST_COLUMNS
+        assert "termination_reason" in attempts.select.call_args_list[0].args[0]
+
+
+class TestMonitoringPolicyFreezesWithTheAttempt:
+    """The policy is resolved ONCE, when the attempt is created."""
+
+    def _auth(self):
+        from core.auth import get_current_user, get_assessment_actor
+        from main import app
+
+        app.dependency_overrides[get_current_user] = lambda: AuthUser(
+            id=MOCK_PROFILE_ID, email="candidate@test.com"
+        )
+        app.dependency_overrides[get_assessment_actor] = (
+            app.dependency_overrides[get_current_user]
+        )
+        return app
+
+    def _read_config_with(self, mock_sb, **overrides):
+        chain = mock_sb._table_chains.setdefault("assessment_config", MagicMock())
+        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response(
+                [
+                    _make_config(
+                        total_questions=2,
+                        coding_problem_count=0,
+                        duration_minutes=20,
+                        **overrides,
+                    )
+                ]
+            )
+        )
+
+    def _start(self, client, mock_supabase):
+        app = self._auth()
+        try:
+            return client.post(
+                "/assessment/start", json={"domain_ids": [MOCK_DOMAIN_1_ID]}
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_new_attempt_snapshots_monitoring_on(self, client, mock_supabase):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, coding_problem_count=0)
+        self._read_config_with(mock_supabase, network_integrity_monitoring=True)
+
+        response = self._start(client, mock_supabase)
+
+        assert response.status_code == 200
+        payload = mock_supabase._table_chains[
+            "assessment_attempts"
+        ].insert.call_args.args[0]
+        assert payload["plan"]["network_integrity_monitoring"] is True
+        # The created attempt's own snapshot is the single source of truth for
+        # the workspace, which reads it from GET .../questions.
+        assert (
+            _attempt_monitoring_policy(
+                {"plan": payload["plan"]}
+            )
+            is True
+        )
+
+    def test_new_attempt_snapshots_monitoring_off(self, client, mock_supabase):
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, coding_problem_count=0)
+        self._read_config_with(mock_supabase)
+
+        response = self._start(client, mock_supabase)
+
+        assert response.status_code == 200
+        payload = mock_supabase._table_chains[
+            "assessment_attempts"
+        ].insert.call_args.args[0]
+        assert payload["plan"]["network_integrity_monitoring"] is False
+
+    def test_a_config_without_the_column_creates_an_unmonitored_attempt(
+        self, client, mock_supabase
+    ):
+        """A database without migration 023 must keep working unchanged."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(mock_supabase, coding_problem_count=0)
+        # No network_integrity_monitoring key at all.
+        chain = mock_supabase._table_chains.setdefault("assessment_config", MagicMock())
+        chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response([_make_config(total_questions=2, coding_problem_count=0)])
+        )
+
+        response = self._start(client, mock_supabase)
+
+        assert response.status_code == 200
+        payload = mock_supabase._table_chains[
+            "assessment_attempts"
+        ].insert.call_args.args[0]
+        assert payload["plan"]["network_integrity_monitoring"] is False
+
+    def test_resume_cannot_rewrite_the_frozen_policy(self, client, mock_supabase):
+        """Created with monitoring ON; the admin later turns it OFF, and the
+        resume path neither re-plans nor writes the attempt. The workspace keeps
+        reading the policy from that untouched snapshot."""
+        attempt = _frozen_attempt()
+        attempt["plan"] = {"network_integrity_monitoring": True}
+        chains = _configure_resume_chains(
+            mock_supabase,
+            attempt,
+            config=_make_config(network_integrity_monitoring=False),
+        )
+
+        response = self._start(client, mock_supabase)
+
+        assert response.status_code == 200
+        assert response.json()["resumed"] is True
+        # Resuming never creates or rewrites an attempt, so the policy that was
+        # frozen at creation stands.
+        chains["assessment_attempts"].insert.assert_not_called()
+        chains["assessment_attempts"].update.assert_not_called()
+        assert _attempt_monitoring_policy(attempt) is True
+
+
+class TestNetworkIntegrityMigration:
+    """Migration 023 is additive, rerun-safe, and rewrites no data."""
+
+    MIGRATION = "023_network_integrity_monitoring.sql"
+
+    def _sql(self):
+        from pathlib import Path
+
+        path = Path(__file__).parent / "migrations" / self.MIGRATION
+        assert path.exists(), f"missing migration {self.MIGRATION}"
+        return path.read_text()
+
+    def test_adds_the_admin_toggle_defaulting_to_off(self):
+        sql = self._sql()
+
+        assert "ADD COLUMN IF NOT EXISTS network_integrity_monitoring BOOLEAN NOT NULL DEFAULT false" in sql
+
+    def test_adds_the_nullable_termination_reason(self):
+        sql = self._sql()
+
+        assert "ADD COLUMN IF NOT EXISTS termination_reason TEXT" in sql
+
+    def test_rewrites_no_existing_data(self):
+        sql = self._sql().lower()
+
+        assert "update public.assessment_attempts" not in sql
+        assert "delete from" not in sql
+        assert "drop column" not in sql
+
+    def test_keeps_candidates_out_of_both_columns(self):
+        sql = self._sql()
+
+        assert "REVOKE ALL ON public.assessment_config FROM authenticated" in sql
+        assert "REVOKE ALL ON public.assessment_attempts FROM authenticated" in sql

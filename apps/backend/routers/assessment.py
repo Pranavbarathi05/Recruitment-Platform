@@ -10,6 +10,7 @@ ONE timer (expires_at), ONE final submission, ONE combined score.
 
 import re
 from datetime import timedelta
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 from core.auth import (
     AuthUser,
@@ -20,7 +21,7 @@ from core.auth import (
 from core.supabase import supabase_client
 from schemas.assessment import (
     AssessmentStartRequest, AnswerSaveRequest, DescriptiveAnswerSaveRequest,
-    HandsOnSubmitRequest,
+    HandsOnSubmitRequest, AttemptSubmitRequest,
 )
 # One expiry rule, shared with routers/coding.py.
 from utils.time_utils import is_expired as _is_expired, utcnow as _utcnow
@@ -211,6 +212,29 @@ def _get_active_config() -> dict:
     return dict(result.data[0])
 
 
+def _attempt_monitoring_policy(attempt: dict) -> bool:
+    """Whether the optional network-integrity monitor applies to THIS attempt.
+
+    The answer comes from the attempt's OWN frozen plan snapshot (migration
+    017), never from the live configuration: the policy was resolved once, when
+    the attempt was created, and an admin changing the global toggle afterwards
+    must not alter an attempt that is already running.
+
+    Anything that cannot positively say "monitored" is treated as unmonitored:
+
+      plan IS NULL (legacy attempt)             -> False
+      plan has no such key (pre-feature plan)   -> False
+      any non-True value                        -> False
+
+    so a database without migration 023, and every historical attempt, keep
+    monitoring strictly disabled.
+    """
+    plan = attempt.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    return plan.get("network_integrity_monitoring") is True
+
+
 def count_words(text: str) -> int:
     """Count words on a whitespace-run split, ignoring empty tokens.
 
@@ -357,8 +381,18 @@ def _score_coding(attempt_id: str) -> dict:
     return {"score": total_score, "max_score": total_max}
 
 
-def _score_attempt(attempt_id: str) -> dict:
-    """Score the combined attempt. Returns overall result (not exposed to candidate)."""
+def _score_attempt(attempt_id: str, termination_reason: Optional[str] = None) -> dict:
+    """Score the combined attempt. Returns overall result (not exposed to candidate).
+
+    ``termination_reason`` is the OPTIONAL audit label for an attempt that was
+    finalised by a monitoring policy rather than an ordinary submission (see
+    migration 023). It is written ONLY when supplied, so:
+
+      * an ordinary submission (manual finish, duration timeout, fullscreen
+        timeout) neither writes nor requires the column, and
+      * a database that has not had migration 023 applied keeps finalising
+        attempts exactly as before.
+    """
     mcq = _score_mcq(attempt_id)
     coding = _score_coding(attempt_id)
 
@@ -417,6 +451,10 @@ def _score_attempt(attempt_id: str) -> dict:
         "score": overall_score,
         "max_score": overall_max if overall_max > 0 else 1,
     }
+    # Why the attempt ended, when it did not end by ordinary submission. Absent
+    # -> the column keeps its default (NULL = ordinary submission).
+    if termination_reason:
+        final_update["termination_reason"] = termination_reason
     # Only touch the hands-on score columns when this attempt actually has
     # hands-on challenges. Otherwise the DB defaults (0) already reflect the
     # correct score, and databases predating migration 013 (which adds these
@@ -829,6 +867,9 @@ def get_attempt_questions(
     # admin_remark is admin-only. Never include it in candidate responses.
     return {
         "attempt_id": attempt_id,
+        # Frozen proctoring policy for this attempt. The candidate workspace
+        # starts the optional network-integrity monitor from this flag alone.
+        "network_integrity_monitoring": _attempt_monitoring_policy(attempt),
         "total_questions": attempt["total_questions"],
         "total_descriptive_questions": attempt.get("total_descriptive_questions", 0),
         "total_hands_on_questions": attempt.get("total_hands_on_questions", 0),
@@ -968,11 +1009,23 @@ def save_descriptive_answer(
 @router.post("/attempt/{attempt_id}/submit")
 def submit_attempt(
     attempt_id: str,
+    payload: Optional[AttemptSubmitRequest] = None,
     current_user: AuthUser = Depends(get_assessment_actor),
 ):
     """Submit the ONE combined assessment. Scores both MCQ and Coding.
 
     Does NOT return score to the candidate.
+
+    This is the SINGLE authoritative submission path for EVERY trigger:
+    the manual "Finish Assessment" button, the assessment duration timer,
+    the fullscreen-exit timeout, and the optional network-integrity monitor.
+
+    The body is OPTIONAL: an ordinary submission sends none (and therefore
+    records no reason), while a policy termination may identify itself with
+    {"reason": "network_integrity_violation"}. Because the already-finalised
+    case is rejected with 409 BEFORE anything is written, a duplicate submit
+    can never re-score the attempt or overwrite the recorded reason — the
+    single-submission guard is the 409, not a second code path.
     """
     attempt_resp = (
         supabase_client.table("assessment_attempts")
@@ -989,9 +1042,14 @@ def submit_attempt(
     if attempt["status"] != "in_progress":
         # 409 Conflict, matching /assessment/start's already-completed convention:
         # the attempt IS finalized, so this is an idempotent no-op, not a client error.
+        # Checked before any write, so a racing or repeated trigger can never
+        # re-score the attempt or overwrite its termination reason.
         raise HTTPException(status_code=409, detail="Attempt already submitted")
 
-    _score_attempt(attempt_id)
+    _score_attempt(
+        attempt_id,
+        termination_reason=payload.resolved_reason() if payload else None,
+    )
 
     return {
         "status": "submitted",

@@ -8,6 +8,12 @@ import PandasWasmChallenge from '../components/PandasWasmChallenge';
 import { runCodeLocally, isClientRunnable } from '../execution/runner';
 import { generatePythonStarterCode } from '../utils/codingStarterCode';
 import { countWords, limitToWords } from '../utils/wordLimit';
+import {
+  createNetworkIntegrityMonitor,
+  resolveNetworkMonitorUrl,
+  NETWORK_VIOLATION_REASON,
+  NETWORK_VIOLATION_MESSAGE,
+} from '../assessment/networkIntegrityMonitor';
 
 // Hands-On challenge — the SQLi "Employee Portal" server is reached through
 // the same Gateway as the rest of the platform (Traefik routes /challenge/*
@@ -327,6 +333,18 @@ const AssessmentWorkspace = () => {
   const [fullscreenEntryError, setFullscreenEntryError] = useState('');
   const [enteringFullscreen, setEnteringFullscreen] = useState(false);
 
+  // ========== OPTIONAL NETWORK-INTEGRITY MONITORING ==========
+  // Only an attempt whose FROZEN plan enabled the policy is ever monitored,
+  // and only while this workspace is mounted for an active attempt. A
+  // confirmed ICMP success on the candidate machine locks the workspace and
+  // finalises the attempt through the same single-submission guard used by the
+  // manual, duration-timeout and fullscreen-timeout triggers.
+  const [networkViolation, setNetworkViolation] = useState(false);
+  // Most recent monitoring problem (helper down, malformed reply, timeout).
+  // Never candidate-facing and never a violation: infrastructure failure is
+  // not evidence of anything.
+  const networkMonitorErrorRef = useRef(null);
+
   // Single submission guard shared by the manual button, the existing duration
   // timer and the fullscreen-timeout auto-submit.
   const hasSubmittedRef = useRef(false);
@@ -644,14 +662,23 @@ const AssessmentWorkspace = () => {
   // One guard for every submit trigger (manual, duration timer, fullscreen
   // timeout). Refs — not state — so two triggers in the same tick can never
   // both fire before a re-render.
-  const handleSubmitAll = async () => {
+  const handleSubmitAll = async (terminationReason) => {
     if (hasSubmittedRef.current || isSubmittingRef.current) return;
+    // Only a STRING is a termination reason. This handler is also used as a
+    // plain onClick / timer callback, where the argument is a click event or
+    // nothing at all — an event object must never be mistaken for a reason.
+    const reason = typeof terminationReason === 'string' ? terminationReason : undefined;
     isSubmittingRef.current = true;
     setSubmitting(true);
     setSubmitError(null);
     try {
+      // The request body is OPTIONAL on the existing endpoint: an ordinary
+      // submission (manual finish, duration timeout, fullscreen timeout) sends
+      // none, while a policy termination identifies itself so the attempt is
+      // audited as such. Same endpoint, same guard — never a second path.
+      const body = reason ? JSON.stringify({ reason }) : undefined;
       const resp = await fetch(`${apiUrl}/assessment/attempt/${attemptId}/submit`, {
-        method: 'POST', headers: getAuthHeaders(), credentials: 'include',
+        method: 'POST', headers: getAuthHeaders(), credentials: 'include', body,
       });
       // 401 = the login session expired mid-attempt. Leave cleanly through
       // AuthContext (ProtectedRoute → /login with the expiry notice). The
@@ -811,6 +838,35 @@ const AssessmentWorkspace = () => {
     }
   }, [fullscreenExited, fullscreenSeconds]);
 
+  // ========== NETWORK-INTEGRITY MONITORING (optional) ==========
+  // Enabled ONLY by the attempt's frozen policy, so an admin flipping the
+  // global toggle cannot change a running attempt, and a legacy attempt (or a
+  // database without migration 023) is never monitored.
+  const networkMonitoringEnabled = attemptData?.network_integrity_monitoring === true;
+
+  useEffect(() => {
+    if (!assessmentActive || !networkMonitoringEnabled || networkViolation) {
+      return undefined;
+    }
+    const monitor = createNetworkIntegrityMonitor({
+      attemptId,
+      url: resolveNetworkMonitorUrl(),
+      onError: (message) => { networkMonitorErrorRef.current = message; },
+      onViolation: () => {
+        // Another trigger is already finalising the attempt: that submission is
+        // the authoritative one, so do not claim a second termination reason.
+        if (hasSubmittedRef.current || isSubmittingRef.current) return;
+        setNetworkViolation(true);
+        submitRef.current?.(NETWORK_VIOLATION_REASON);
+      },
+    });
+    monitor.start();
+    // One timer per active attempt: it is stopped on submit (assessmentActive
+    // flips false), on unmount, and by the monitor itself the moment a
+    // violation is confirmed. Nothing survives the attempt.
+    return () => monitor.stop();
+  }, [assessmentActive, networkMonitoringEnabled, networkViolation, attemptId]);
+
   // Unmount: drop listeners and timers, and release any fullscreen we hold.
   useEffect(() => () => {
     clearFullscreenTimer();
@@ -882,8 +938,9 @@ const AssessmentWorkspace = () => {
   }
 
   const isWarning = timeRemaining <= 300 && timeRemaining > 0;
-  // The assessment is non-interactive while either fullscreen prompt is up.
-  const interactionLocked = fullscreenExited || fullscreenEntryRequired;
+  // The assessment is non-interactive while a fullscreen prompt is up OR while
+  // the attempt is being terminated by the network-integrity policy.
+  const interactionLocked = fullscreenExited || fullscreenEntryRequired || networkViolation;
 
   return (
     /* ROOT: flex-1 fills remaining viewport after Navbar. No overflow on body. */
@@ -953,7 +1010,7 @@ const AssessmentWorkspace = () => {
           }`}>
             ⏱ {formatTime(timeRemaining)}
           </div>
-          <button onClick={handleSubmitAll} disabled={submitting}
+          <button onClick={() => handleSubmitAll()} disabled={submitting}
             className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold text-sm disabled:opacity-50">
             {submitting ? 'Submitting...' : 'Finish Assessment'}
           </button>
@@ -968,7 +1025,7 @@ const AssessmentWorkspace = () => {
             {' '}— your attempt has NOT been finalized; all saved answers are kept. Please retry.
           </p>
           <button
-            onClick={handleSubmitAll}
+            onClick={() => handleSubmitAll()}
             disabled={submitting}
             className="shrink-0 bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-semibold disabled:opacity-50"
           >
@@ -1056,7 +1113,17 @@ const AssessmentWorkspace = () => {
       </div>
       </div>
 
-      {fullscreenExited ? (
+      {networkViolation ? (
+        /* The attempt is being terminated by policy. This overlay takes
+           precedence over the fullscreen prompt: there is nothing for the
+           candidate to fix, and no way back into the assessment. */
+        <NetworkTerminationOverlay
+          message={NETWORK_VIOLATION_MESSAGE}
+          submitError={submitError}
+          busy={submitting}
+          onRetry={() => submitRef.current?.(NETWORK_VIOLATION_REASON)}
+        />
+      ) : fullscreenExited ? (
         <FullscreenExitOverlay
           seconds={fullscreenSeconds}
           error={fullscreenError}
@@ -1728,6 +1795,46 @@ function FullscreenEntryGate({ error, busy, showSkip, onEnter, onSkip }) {
           >
             Continue without fullscreen
           </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function NetworkTerminationOverlay({ message, submitError, busy, onRetry }) {
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="Assessment terminated"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/95 backdrop-blur-sm px-4"
+    >
+      <div className="w-full max-w-md bg-theme-secondary border border-theme-border rounded-2xl p-8 text-center shadow-2xl">
+        <h2 className="text-2xl font-bold text-theme-primary mb-3">Assessment Terminated</h2>
+        <p data-testid="network-violation-message" className="text-theme-secondary text-sm mb-6">
+          {message}
+        </p>
+
+        {submitError ? (
+          /* The submit did NOT succeed: never claim otherwise. The workspace
+             stays locked and the candidate can retry deliberately (a button,
+             not a loop). */
+          <>
+            <p role="alert" className="text-sm text-red-300 bg-red-900/30 border border-red-500/50 rounded px-3 py-2 mb-4">
+              Your assessment could not be submitted: {submitError}
+            </p>
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={busy}
+              className="w-full bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold disabled:opacity-50"
+            >
+              {busy ? 'Submitting…' : 'Retry submission'}
+            </button>
+          </>
+        ) : (
+          <p className="text-theme-muted text-xs uppercase tracking-wider">Submitting your assessment…</p>
         )}
       </div>
     </div>

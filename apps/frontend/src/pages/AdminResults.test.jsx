@@ -348,3 +348,33 @@ describe('AdminResults — Hands-On Challenge Responses section', () => {
     expect(screen.getByText(/Validation: ✓ Passed/)).toBeInTheDocument();
   });
 });
+
+describe('AdminResults — termination reason', () => {
+  it('labels a network-integrity termination explicitly', async () => {
+    renderPage(
+      mockFetch({
+        ...buildResults(),
+        termination_reason: 'network_integrity_violation',
+      })
+    );
+
+    expect(await screen.findByTestId('termination-reason')).toHaveTextContent(
+      'Termination reason: Network integrity violation'
+    );
+  });
+
+  it('shows nothing for an ordinary submission', async () => {
+    renderPage(mockFetch({ ...buildResults(), termination_reason: null }));
+
+    // Wait for the page itself to render, then assert the absence.
+    expect(await screen.findByText('Performance')).toBeInTheDocument();
+    expect(screen.queryByTestId('termination-reason')).not.toBeInTheDocument();
+  });
+
+  it('shows nothing when the field is absent entirely', async () => {
+    renderPage(mockFetch(buildResults()));
+
+    expect(await screen.findByText('Performance')).toBeInTheDocument();
+    expect(screen.queryByTestId('termination-reason')).not.toBeInTheDocument();
+  });
+});
