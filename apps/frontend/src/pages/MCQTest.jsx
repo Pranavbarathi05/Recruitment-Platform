@@ -297,6 +297,12 @@ const AssessmentWorkspace = () => {
   const [handsOnQuestions, setHandsOnQuestions] = useState([]);
   const [handsOnResults, setHandsOnResults] = useState({}); // questionId -> result
   const [hasHandsOn, setHasHandsOn] = useState(false);
+  // Active Hands-On question + its per-question drafts. A two-domain
+  // assessment carries up to two challenges (e.g. Web Development + DevOps):
+  // each keeps its own code/evidence draft, exactly like MCQ/Coding do, so
+  // switching questions never bleeds one question's state into another.
+  const [handsOnIndex, setHandsOnIndex] = useState(0);
+  const [handsOnDrafts, setHandsOnDrafts] = useState({}); // questionId -> draft
 
   const autosaveTimerRef = useRef(null);
   const lastSavedRef = useRef({}); // { [problemId]: lastSavedCode }
@@ -500,6 +506,16 @@ const AssessmentWorkspace = () => {
     if (!problem) return null;
     return { problem, state: codingStates[problem.id] || { code: '', language: 'python3' } };
   }, [codingProblems, codingIndex, codingStates]);
+
+  // ========== HANDS-ON: PER-QUESTION DRAFT ==========
+  // Patch (never replace) one question's draft so SQL/Pandas/CTF state stays
+  // independently keyed by question id.
+  const setHandsOnDraft = useCallback((questionId, patch) => {
+    setHandsOnDrafts((prev) => ({
+      ...prev,
+      [questionId]: { ...(prev[questionId] || {}), ...patch },
+    }));
+  }, []);
 
   // ========== HANDS-ON: SUBMIT (evidence + flag) ==========
   // One submission per challenge: the backend rejects a second PUT with 409
@@ -991,6 +1007,10 @@ const AssessmentWorkspace = () => {
             questions={handsOnQuestions}
             results={handsOnResults}
             onSubmit={submitHandsOn}
+            currentIndex={handsOnIndex}
+            setCurrentIndex={setHandsOnIndex}
+            drafts={handsOnDrafts}
+            setDraft={setHandsOnDraft}
           />
         )}
 
@@ -1231,22 +1251,22 @@ function DescriptiveSection({ questions, answers, currentIndex, setCurrentIndex,
 // Shared challenge website + two-field submission (evidence + flag).
 // ============================================================
 
-function HandsOnSection({ questions, results, onSubmit }) {
+function HandsOnSection({
+  questions, results, onSubmit,
+  currentIndex = 0, setCurrentIndex = () => {},
+  drafts = {}, setDraft = () => {},
+}) {
   // Hooks must run unconditionally — the empty-state return comes after them.
-  const q = questions[0];
-  const result = q ? results[q.id] : undefined;
-
-  // For CTF challenges
-  const [sqlInput, setSqlInput] = useState(result?.submitted_input || '');
-  const [flagInput, setFlagInput] = useState(result?.submitted_flag || '');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   // One submission per challenge: a stored result (from the questions
   // endpoint or from a successful submit) locks the form permanently.
-  const [submitted, setSubmitted] = useState(!!result);
-  const submittedRef = useRef(!!result);
+  // Keyed by question id — a two-domain assessment carries up to two
+  // challenges and each one locks (and drafts) independently.
+  const [submittedExtras, setSubmittedExtras] = useState({}); // questionId -> true
+  const submittedRef = useRef({}); // synchronous double-submit guard per question
 
-  if (questions.length === 0 || !q) {
+  if (questions.length === 0) {
     return (
       <div className="h-full flex items-center justify-center text-theme-muted">
         <p>No hands-on challenges in this assessment.</p>
@@ -1254,18 +1274,82 @@ function HandsOnSection({ questions, results, onSubmit }) {
     );
   }
 
+  // Active challenge — clamped so a stale index can never escape the list.
+  const index = Math.min(currentIndex, questions.length - 1);
+  const q = questions[index];
+  const result = results[q.id];
+  const draft = drafts[q.id] || {};
+  const submitted = !!(result || submittedExtras[q.id]);
+
+  const markSubmitted = (questionId) => {
+    submittedRef.current[questionId] = true;
+    setSubmittedExtras((prev) => ({ ...prev, [questionId]: true }));
+  };
+
+  // Navigation bar — shown only for multi-question assessments (two selected
+  // technical domains). Numbered selector + prev/next, the same navigation
+  // model MCQ and Coding already use, so the active challenge is always
+  // obvious and both challenges are reachable.
+  const navBar = questions.length > 1 && (
+    <div className="shrink-0 bg-theme-secondary border-b border-theme-border px-6 py-2 flex items-center gap-3">
+      <span className="text-sm text-theme-muted">
+        Question {index + 1} of {questions.length}
+      </span>
+      <div className="flex items-center gap-1">
+        {questions.map((item, i) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setCurrentIndex(i)}
+            aria-label={`Question ${i + 1}`}
+            aria-current={i === index ? 'true' : undefined}
+            className={`w-7 h-7 rounded text-xs font-bold transition-colors ${
+              i === index
+                ? 'bg-blue-600 text-white'
+                : results[item.id] || submittedExtras[item.id]
+                  ? 'bg-green-700 text-white'
+                  : 'bg-theme-tertiary text-theme-muted hover:text-theme-primary'
+            }`}
+          >
+            {i + 1}
+          </button>
+        ))}
+      </div>
+      <div className="ml-auto flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setCurrentIndex(index - 1)}
+          disabled={index === 0}
+          aria-label="Previous question"
+          className="px-3 py-1 rounded-md text-xs font-medium bg-theme-primary text-theme-primary border border-theme-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-theme-tertiary"
+        >
+          ← Previous
+        </button>
+        <button
+          type="button"
+          onClick={() => setCurrentIndex(index + 1)}
+          disabled={index === questions.length - 1}
+          aria-label="Next question"
+          className="px-3 py-1 rounded-md text-xs font-medium bg-theme-primary text-theme-primary border border-theme-border disabled:opacity-40 disabled:cursor-not-allowed hover:bg-theme-tertiary"
+        >
+          Next →
+        </button>
+      </div>
+    </div>
+  );
+
   // WASM challenge types: delegate to specialized components
   const challengeType = q.challenge_type;
   if (challengeType === 'sql_wasm') {
     return (
       <div className="h-full flex flex-col">
-        {/* Challenge header */}
+        {navBar}
+        {/* Challenge header — question information only. Difficulty, points
+            and internal runtime labels are admin metadata and are never
+            shown to the candidate. */}
         <div className="shrink-0 bg-theme-secondary px-6 py-3 border-b border-theme-border">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-bold text-theme-primary">{q.title}</h2>
-            <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
-            <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
-            <span className="text-xs px-2 py-0.5 bg-orange-900/50 text-orange-300 rounded">SQL WASM</span>
             {submitted && <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>}
           </div>
           <p className="text-theme-muted text-sm mt-1 line-clamp-2">{q.description}</p>
@@ -1273,11 +1357,13 @@ function HandsOnSection({ questions, results, onSubmit }) {
         {/* Editor + Runner */}
         <div className="flex-1 min-h-0">
           <SqlWasmChallenge
+            key={q.id}
             problem={q}
+            initialCode={draft.code}
+            onDraftChange={(code) => setDraft(q.id, { code })}
             onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
               await onSubmit(questionId, submittedCode, '', validationPassed);
-              submittedRef.current = true;
-              setSubmitted(true);
+              markSubmitted(questionId);
             }}
             submitted={submitted}
           />
@@ -1289,13 +1375,11 @@ function HandsOnSection({ questions, results, onSubmit }) {
   if (challengeType === 'pandas_wasm') {
     return (
       <div className="h-full flex flex-col">
-        {/* Challenge header */}
+        {navBar}
+        {/* Challenge header — question information only (see above). */}
         <div className="shrink-0 bg-theme-secondary px-6 py-3 border-b border-theme-border">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-bold text-theme-primary">{q.title}</h2>
-            <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
-            <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
-            <span className="text-xs px-2 py-0.5 bg-orange-900/50 text-orange-300 rounded">Pandas WASM</span>
             {submitted && <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>}
           </div>
           <p className="text-theme-muted text-sm mt-1 line-clamp-2">{q.description}</p>
@@ -1303,11 +1387,13 @@ function HandsOnSection({ questions, results, onSubmit }) {
         {/* Editor + Runner */}
         <div className="flex-1 min-h-0">
           <PandasWasmChallenge
+            key={q.id}
             problem={q}
+            initialCode={draft.code}
+            onDraftChange={(code) => setDraft(q.id, { code })}
             onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
               await onSubmit(questionId, submittedCode, '', validationPassed);
-              submittedRef.current = true;
-              setSubmitted(true);
+              markSubmitted(questionId);
             }}
             submitted={submitted}
           />
@@ -1317,15 +1403,19 @@ function HandsOnSection({ questions, results, onSubmit }) {
   }
 
   // Default: CTF challenge (sql_injection_employee_portal)
+  // Evidence/flag fields are drafts keyed by this question id, so switching
+  // challenges never carries one question's input into another.
+  const sqlInput = draft.sqlInput ?? result?.submitted_input ?? '';
+  const flagInput = draft.flagInput ?? result?.submitted_flag ?? '';
+
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (submitting || submittedRef.current) return;
+    if (submitting || submitted || submittedRef.current[q.id]) return;
     setSubmitting(true);
     setError('');
     try {
       await onSubmit(q.id, sqlInput, flagInput);
-      submittedRef.current = true;
-      setSubmitted(true);
+      markSubmitted(q.id);
     } catch (err) {
       setError(err.message || 'Failed to submit');
     } finally {
@@ -1336,13 +1426,13 @@ function HandsOnSection({ questions, results, onSubmit }) {
   return (
     <div className="h-full overflow-y-auto p-4 md:p-8">
       <div className="max-w-4xl mx-auto">
-        {/* Challenge header */}
+        {navBar}
+        {/* Challenge header — question information only. Difficulty and
+            points are admin metadata and are never shown to the candidate. */}
         <div className="bg-theme-secondary rounded-lg p-6 mb-6">
           <div className="flex items-start justify-between mb-3">
             <h2 className="text-xl font-bold text-theme-primary">{q.title}</h2>
             <div className="flex items-center gap-2 flex-shrink-0">
-              <span className="text-xs px-2 py-0.5 bg-purple-900/50 text-purple-300 rounded capitalize">{q.difficulty}</span>
-              <span className="text-xs px-2 py-0.5 bg-blue-900/50 text-blue-300 rounded">{q.points} pts</span>
               {submitted && (
                 <span className="text-xs px-2 py-0.5 rounded font-semibold bg-blue-900/50 text-blue-300">
                   Submitted
@@ -1382,7 +1472,7 @@ function HandsOnSection({ questions, results, onSubmit }) {
             <label className="block text-sm font-medium text-theme-primary mb-1">SQL Input Used</label>
             <textarea
               value={sqlInput}
-              onChange={(e) => setSqlInput(e.target.value)}
+              onChange={(e) => setDraft(q.id, { sqlInput: e.target.value })}
               rows={5}
               disabled={submitted}
               readOnly={submitted}
@@ -1398,7 +1488,7 @@ function HandsOnSection({ questions, results, onSubmit }) {
             <label className="block text-sm font-medium text-theme-primary mb-1">Flag</label>
             <input
               value={flagInput}
-              onChange={(e) => setFlagInput(e.target.value)}
+              onChange={(e) => setDraft(q.id, { flagInput: e.target.value })}
               disabled={submitted}
               readOnly={submitted}
               className="w-full px-4 py-3 bg-theme-input border border-theme-secondary rounded-lg text-theme-primary text-sm font-mono disabled:opacity-60"

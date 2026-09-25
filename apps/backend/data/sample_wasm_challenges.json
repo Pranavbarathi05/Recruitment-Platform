@@ -4,7 +4,7 @@
     "description": "Write a SQL query to calculate the average salary by department from the employees table.\n\nThe result should have two columns: `department` and `avg_salary`.\n\nThe average salary should be rounded to 2 decimal places.",
     "challenge_type": "sql_wasm",
     "difficulty": "easy",
-    "points": 100,
+    "points": 10,
     "domain_ids": [],
     "schema_sql": "CREATE TABLE employees (\n  id INTEGER,\n  name VARCHAR,\n  department VARCHAR,\n  salary DOUBLE\n);",
     "dataset_json": {
@@ -38,7 +38,7 @@
     "description": "Write Python code using pandas to calculate the average salary grouped by department.\n\nCreate a DataFrame called `result` with columns `department` and `salary` (the average).",
     "challenge_type": "pandas_wasm",
     "difficulty": "easy",
-    "points": 100,
+    "points": 10,
     "domain_ids": [],
     "dataset_json": {
       "name": "df",

@@ -8,7 +8,7 @@
  * Hooked into postinstall, predev, and prebuild so the copy is always fresh
  * relative to the installed @duckdb/duckdb-wasm version.
  */
-import { cpSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -33,14 +33,30 @@ export function copyDuckdbTo(dest = DEFAULT_DEST) {
     );
   }
 
-  rmSync(dest, { recursive: true, force: true });
+  // NOTE: the destination directory is intentionally NEVER deleted wholesale.
+  // A running Vite dev server keeps an index of public/ files that is kept in
+  // sync by filesystem watch events; wiping + re-creating the directory made
+  // that index lose entries, after which Vite served index.html for the
+  // DuckDB worker/wasm files and the SQL runner hung at "Preparing SQL
+  // environment...". Overwriting in place only produces `change` events,
+  // which never affect index membership.
   mkdirSync(dest, { recursive: true });
+
+  const expected = new Set();
 
   // Copy only the files we actually need at runtime
   for (const name of ASSET_PATTERNS) {
     const srcPath = resolve(SRC, name);
     if (existsSync(srcPath)) {
-      cpSync(srcPath, resolve(dest, name));
+      cpSync(srcPath, resolve(dest, name), { force: true });
+      expected.add(name);
+    }
+  }
+
+  // Prune individual stale files only — never the directory itself.
+  for (const name of readdirSync(dest)) {
+    if (!expected.has(name)) {
+      rmSync(resolve(dest, name), { recursive: true, force: true });
     }
   }
 

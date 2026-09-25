@@ -62,6 +62,7 @@ from services.assessment_planner import (
     ProgramInput,
     Scope,
     assert_organizational_exclusive,
+    assessment_mode_of,
     plan_assessment,
 )
 
@@ -114,19 +115,34 @@ def resolve_program(semester: int) -> ProgramInput:
         ) from exc
 
 
-def config_family_for(program: ProgramInput):
-    """The assessment_module_config.applies_to value for this programme.
+def config_family_for(program: ProgramInput, mode=None):
+    """The assessment_module_config.applies_to value for this assessment.
 
-    technical -> the programme's tier (junior / senior)
+    technical      -> the programme's tier (junior / senior)
     organizational -> "organizational" (common, never semester-keyed)
 
-    Returns None when the programme cannot resolve a family at all (a technical
-    programme with no tier); the caller then skips the config query and the
-    planner rejects the programme outright.
+    ``mode`` is the assessment MODE derived from the SELECTED domains
+    (:func:`assessment_mode_of`), not the semester's default: a 3rd/5th
+    semester candidate who chooses Organizational Roles gets the
+    ``organizational`` family exactly like a 1st semester candidate. When no
+    selection has resolved yet, ``mode`` is None and the programme's default
+    decides (it only ever shapes a config query that will find nothing).
+
+    Returns None when the family cannot resolve at all (a technical
+    selection with no tier); the caller then skips the config query and the
+    planner rejects the selection outright.
     """
-    if program.scope is Scope.TECHNICAL:
+    if mode is None:
+        if program.scope is Scope.NONE:
+            return None
+        mode = (
+            Scope.ORGANIZATIONAL
+            if program.scope is Scope.ORGANIZATIONAL
+            else Scope.TECHNICAL
+        )
+    if mode is Scope.TECHNICAL:
         return program.tier.value if program.tier is not None else None
-    if program.scope is Scope.ORGANIZATIONAL:
+    if mode is Scope.ORGANIZATIONAL:
         return ConfigFamily.ORGANIZATIONAL.value
     return None
 
@@ -356,18 +372,25 @@ def plan_new_attempt(
     except AssessmentPlanningError as exc:
         raise _planning_refusal(exc, semester, domain_ids) from exc
 
-    # 3. Per-domain module configuration for this programme's family.
+    # The ASSESSMENT MODE comes from the domains the candidate selected, never
+    # from their semester: a technical programme may still be taken as the
+    # standalone Organizational assessment, and that choice decides the
+    # module-config family, whether descriptive questions are in scope, and
+    # whether coding applies.
+    mode = assessment_mode_of(domains)
+
+    # 3. Per-domain module configuration for this assessment's family.
     #
-    # For a technical scope these rows only switch on OPTIONAL modules, so the
-    # result may legitimately be empty or partial. For the organizational scope
-    # the row is the source of the assessment's content and a missing one makes
-    # the planner refuse the plan.
-    family = config_family_for(program)
+    # For a technical selection these rows only switch on OPTIONAL modules, so
+    # the result may legitimately be empty or partial. For the organizational
+    # mode the row is the source of the assessment's content and a missing one
+    # makes the planner refuse the plan.
+    family = config_family_for(program, mode)
     module_configs = load_module_configs(domain_ids, family)
 
     # 4. Global, module-independent values.
     coding_problem_count = int(config.get("coding_problem_count", 0) or 0)
-    coding_enabled = bool(program.coding_enabled) and program.scope is Scope.TECHNICAL
+    coding_enabled = bool(program.coding_enabled) and mode is Scope.TECHNICAL
 
     # 5. Build the planner input. The planner performs no database access.
     request = AssessmentPlanRequest(
@@ -384,7 +407,7 @@ def plan_new_attempt(
         # any chance of a technical assessment acquiring descriptive content.
         descriptive_pool=(
             load_descriptive_pool(domain_ids)
-            if program.scope is Scope.ORGANIZATIONAL
+            if mode is Scope.ORGANIZATIONAL
             and _pool_required([c.descriptive_count for c in module_configs])
             else []
         ),

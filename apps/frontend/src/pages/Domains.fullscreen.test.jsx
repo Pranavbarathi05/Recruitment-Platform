@@ -55,8 +55,12 @@ function mockFetch() {
   startResolvers = [];
   return vi.fn((url) => {
     const u = String(url);
-    if (u.includes('/questions/domains')) {
-      return Promise.resolve({ ok: true, status: 200, json: async () => DOMAINS });
+    if (u.includes('/assessment/available-domains')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ domains: DOMAINS, max_domains: 2, scope: 'technical' }),
+      });
     }
     if (u.includes('/assessment/start')) {
       // Held open so we can prove the fullscreen request happens from the

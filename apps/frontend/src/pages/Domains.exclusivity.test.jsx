@@ -13,9 +13,13 @@ vi.mock('../hooks/useAuth', () => ({
  * The rule is: Organizational Roles must NEVER coexist with any other domain,
  * in either click order. The excluded states are exactly the ones the real
  * browser produced, so the payload shapes below are reproduced faithfully —
- * including the one the running DEV API currently serves, which carries no
- * scope field at all and previously made the exclusivity rule silently
- * ineffective.
+ * including the one an older/stale API serves, which carries no scope field at
+ * all and previously made the exclusivity rule silently ineffective.
+ *
+ * The payloads are served by GET /assessment/available-domains, the endpoint
+ * that resolves the candidate's semester -> assessment_program -> scope, so a
+ * real response never mixes scopes: the mixed catalogue below is deliberately
+ * hostile input proving the UI still refuses to combine them.
  */
 const TECH = [
   {
@@ -59,8 +63,16 @@ function mockFetch(domains) {
   startBodies = [];
   return vi.fn((url, options = {}) => {
     const u = String(url);
+    if (u.includes('/assessment/available-domains')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ domains, max_domains: 2, scope: 'technical', semester: 5 }),
+      });
+    }
     if (u.includes('/questions/domains')) {
-      return Promise.resolve({ ok: true, status: 200, json: async () => domains });
+      // The semester-agnostic catalogue must never be used by this page.
+      throw new Error(`Domains page must not fetch the global catalogue: ${u}`);
     }
     if (u.includes('/assessment/start')) {
       startBodies.push(JSON.parse(options.body));

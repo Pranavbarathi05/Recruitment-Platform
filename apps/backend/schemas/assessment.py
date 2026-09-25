@@ -169,7 +169,10 @@ class HandsOnCreate(BaseModel):
     domain_ids: list[str] = Field(default_factory=list)
     challenge_type: str = Field(default="sql_injection_employee_portal")
     difficulty: str = Field(default="medium")
-    points: int = Field(default=100, ge=0, le=1000)
+    # Hands-On challenges are worth 10 points (see migration
+    # 022_hands_on_points_10.sql — the column default and every existing row
+    # were aligned to 10; MCQ/coding scoring is unaffected).
+    points: int = Field(default=10, ge=0, le=1000)
     challenge_url: str = Field(default="")
     expected_flag: str = Field(default="")
     is_active: bool = True

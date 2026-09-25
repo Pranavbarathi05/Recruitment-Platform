@@ -449,7 +449,16 @@ class TestDomainEligibility:
         finally:
             client.app.dependency_overrides.clear()
 
-    def test_semester_3_rejects_organizational_domain(self, client, mock_supabase):
+    def test_semester_3_accepts_standalone_organizational_domain(
+        self, client, mock_supabase
+    ):
+        """CORRECTED RULE: sem 3 may take Organizational Roles standalone.
+
+        ``assessment_program.scope`` for semester 3 is 'technical', but that is
+        the programme's DEFAULT mode, not an exclusive restriction: the mode
+        comes from the selected domains, so the ORGANIZATIONAL module
+        configuration is the one that applies here.
+        """
         _route_table(mock_supabase, "assessment_attempts")
         _configure_start_mocks(
             mock_supabase,
@@ -458,7 +467,9 @@ class TestDomainEligibility:
             domains=[ORG_DOMAIN],
             module_configs=[
                 _make_module_config(
-                    domain_id=MOCK_DOMAIN_1_ID, applies_to="junior", mcq_count=2
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="organizational",
+                    mcq_count=2,
                 )
             ],
         )
@@ -468,8 +479,41 @@ class TestDomainEligibility:
         finally:
             client.app.dependency_overrides.clear()
 
+        assert response.status_code == 200
+        mock_supabase._table_chains["assessment_attempts"].insert.assert_called_once()
+
+    def test_semester_3_rejects_mixed_organizational_and_technical(
+        self, client, mock_supabase
+    ):
+        """Organizational Roles + a technical domain is INVALID for sem 3."""
+        _route_table(mock_supabase, "assessment_attempts")
+        second_technical = dict(
+            TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Web Dev", slug="webDevelopment"
+        )
+        _configure_start_mocks(
+            mock_supabase,
+            semester=3,
+            program=JUNIOR_PROGRAM,
+            domains=[ORG_DOMAIN, second_technical],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="organizational",
+                    mcq_count=2,
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
         assert response.status_code == 400
-        assert "technical" in response.json()["detail"].lower()
+        assert "cannot be combined" in response.json()["detail"].lower()
+        mock_supabase._table_chains["assessment_attempts"].insert.assert_not_called()
 
     def test_semester_5_accepts_technical_domains(self, client, mock_supabase):
         _route_table(mock_supabase, "assessment_attempts")
@@ -488,6 +532,100 @@ class TestDomainEligibility:
             assert _post(client).status_code == 200
         finally:
             client.app.dependency_overrides.clear()
+
+    def test_semester_5_accepts_standalone_organizational_domain(
+        self, client, mock_supabase
+    ):
+        """CORRECTED RULE: sem 5 may take Organizational Roles standalone.
+
+        Same corrected rule as semester 3: a technical programme offers both
+        modes and the SELECTED domains decide which mode is planned, so the
+        organizational module configuration is used and no technical validation
+        is bypassed.
+        """
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            program=SENIOR_PROGRAM,
+            domains=[ORG_DOMAIN],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="organizational",
+                    mcq_count=2,
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(client)
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        mock_supabase._table_chains["assessment_attempts"].insert.assert_called_once()
+
+    def test_semester_5_rejects_mixed_organizational_and_technical(
+        self, client, mock_supabase
+    ):
+        """Organizational Roles + a technical domain is INVALID for sem 5."""
+        _route_table(mock_supabase, "assessment_attempts")
+        second_technical = dict(
+            TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Web Dev", slug="webDevelopment"
+        )
+        _configure_start_mocks(
+            mock_supabase,
+            program=SENIOR_PROGRAM,
+            domains=[ORG_DOMAIN, second_technical],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="organizational",
+                    mcq_count=2,
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 400
+        assert "cannot be combined" in response.json()["detail"].lower()
+        mock_supabase._table_chains["assessment_attempts"].insert.assert_not_called()
+
+    def test_semester_1_organizational_plan_matches_the_offered_scope(
+        self, client, mock_supabase
+    ):
+        """The 1st-semester flow is unchanged: Organizational Roles is accepted."""
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN],
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="organizational",
+                    mcq_count=2,
+                )
+            ],
+        )
+        _auth()
+        try:
+            response = _post(client)
+        finally:
+            client.app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["domain_ids"] == [MOCK_DOMAIN_1_ID]
+        # Organizational carries no coding section.
+        assert body["total_coding_problems"] == 0
 
     def test_inactive_domain_rejected(self, client, mock_supabase):
         inactive = dict(TECH_DOMAIN, is_active=False, name="Retired Domain")
@@ -1620,11 +1758,14 @@ class TestPlanPersistence:
         """Static guard: migration 017 must exist and add the expected columns.
 
         A live-schema probe would need the network, so this asserts the repo's
-        own migrations end at 017 and contain the expected ALTER statements.
+        own migrations are a contiguous, gapless sequence (every migration
+        number from 1 to the highest present, so none was skipped or
+         duplicated) and that 017 contains the expected ALTER statements.
         """
         migrations = Path(__file__).resolve().parent / "migrations"
         files = sorted(migrations.glob("*.sql"))
-        assert [int(p.name.split("_")[0]) for p in files] == list(range(1, 20))
+        numbers = [int(p.name.split("_")[0]) for p in files]
+        assert numbers == list(range(1, len(numbers) + 1))
 
         m017 = migrations / "017_plan_snapshot_columns.sql"
         assert m017.exists()
@@ -1676,6 +1817,39 @@ class TestPlanPersistence:
         assert statements.count("INSERT INTO") == 1
         assert statements.count("UPDATE public.domains") == 1
         assert "DELETE" not in statements.upper()
+
+    def test_migration_021_activates_the_final_technical_catalogue(self):
+        """Static guard: migration 021 activates the documented catalogue.
+
+        The candidate eligibility query returns only
+        is_active AND scope-matching domains, so a technical catalogue row
+        left is_active = false is invisible to every 3rd/5th semester
+        candidate no matter what the Admin panel lists. This migration
+        asserts the four catalogue slugs active + technical, and it must
+        stay a single targeted UPDATE: no schema change, no insert/delete,
+        and no blanket table-wide activation.
+        """
+        migrations = Path(__file__).resolve().parent / "migrations"
+        m021 = migrations / "021_activate_technical_catalogue.sql"
+        assert m021.exists()
+        content = m021.read_text(encoding="utf-8")
+        assert "'webDevelopment'" in content
+        assert "'machineLearning'" in content
+        assert "'devOps'" in content
+        assert "'cyberSecurity'" in content
+        # Data-only (no DDL) and additive (no destructive statement).
+        assert "CREATE TABLE" not in content
+        assert "ALTER TABLE" not in content
+
+        statements = "\n".join(
+            line for line in content.splitlines() if not line.strip().startswith("--")
+        )
+        assert statements.count("UPDATE public.domains") == 1
+        assert "INSERT INTO" not in statements
+        assert "DELETE" not in statements.upper()
+        # The two non-catalogue domains stay untouched.
+        assert "backendDevelopment" not in statements
+        assert "userInterface" not in statements
 
     def test_plan_persistence_flag_has_been_removed(self):
         """Phase 5's temporary rollout flag is gone.
@@ -1870,19 +2044,30 @@ class TestDomainAvailability:
         return client.get("/assessment/available-domains")
 
     def _configure_availability(
-        self, mock_sb, semester=5, program=None, domains=None
+        self,
+        mock_sb,
+        semester=5,
+        program=None,
+        domains=None,
+        mcq_rows=None,
+        duration_minutes=60,
+        config_available=True,
     ):
         """Configure mock chains for the availability endpoint.
 
         The endpoint queries (in order):
-          candidates       -> select("id, semester").eq("profile_id", ...)
-          assessment_program -> select(...).eq("semester", ...).eq("is_active", True)
-          domains          -> select(...).eq("is_active", True).eq("assessment_scope", ...)
+          candidates        -> select("id, semester").eq("profile_id", ...)
+          assessment_program-> select(...).eq("semester", ...).eq("is_active", True)
+          domains           -> select(...).eq("is_active", True).eq("assessment_scope", ...).order(...)
+          mcq_questions     -> select("id, domain_id").eq("semester", ...).eq("is_active", True).in_(...)
+          assessment_config -> select("duration_minutes").eq("is_active", True).limit(1)
         """
         if program is None:
             program = _make_program(semester=semester)
         if domains is None:
             domains = []
+        if mcq_rows is None:
+            mcq_rows = []
 
         chains = mock_sb._table_chains
 
@@ -1897,8 +2082,22 @@ class TestDomainAvailability:
         )
 
         domains_chain = chains.setdefault("domains", MagicMock())
-        domains_chain.select.return_value.eq.return_value.eq.return_value.order.return_value.execute.return_value = (
+        # Chain: select(...).eq("is_active", True)
+        #             .in_("assessment_scope", <allowed modes>).order("name")
+        domains_chain.select.return_value.eq.return_value.in_.return_value.order.return_value.execute.return_value = (
             _make_mock_response(domains)
+        )
+
+        mcq_chain = chains.setdefault("mcq_questions", MagicMock())
+        mcq_chain.select.return_value.eq.return_value.eq.return_value.in_.return_value.execute.return_value = (
+            _make_mock_response(mcq_rows)
+        )
+
+        config_chain = chains.setdefault("assessment_config", MagicMock())
+        config_chain.select.return_value.eq.return_value.limit.return_value.execute.return_value = (
+            _make_mock_response(
+                [{"duration_minutes": duration_minutes}] if config_available else []
+            )
         )
 
     def test_semester_3_receives_technical_domains(self, client, mock_supabase):
@@ -2077,6 +2276,176 @@ class TestDomainAvailability:
         finally:
             client.app.dependency_overrides.clear()
 
+    def test_empty_question_pool_does_not_hide_an_eligible_domain(
+        self, client, mock_supabase
+    ):
+        """questionCount is display metadata, never an eligibility condition.
+
+        Three separate concepts must not be conflated:
+
+          A. eligible for this candidate  -> scope match + is_active
+          B. questions currently in the pool -> questionCount (display only)
+          C. questions the candidate receives -> the planner's decision
+
+        Only (A) may decide whether a domain card is offered. A domain whose
+        semester pool is empty — or smaller than the programme's mcq_total —
+        is still a configured, eligible assessment and must be returned with
+        questionCount 0; hiding it here would silently make a valid technical
+        assessment invisible. Whether there is enough content to actually
+        start remains the planner's call (POST /assessment/start).
+        """
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=3,
+            program=JUNIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+            mcq_rows=[],  # no active MCQs at semester 3 for this domain
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            # Still offered — the empty pool did NOT turn it invisible.
+            assert len(data["domains"]) == 1
+            assert data["domains"][0]["id"] == MOCK_DOMAIN_1_ID
+            assert data["domains"][0]["questionCount"] == 0
+        finally:
+            client.app.dependency_overrides.clear()
+
+    # ------------------------------------------------------------------
+    # The selection UI's data source (the bug this endpoint now owns)
+    # ------------------------------------------------------------------
+
+    def test_technical_programmes_offer_both_assessment_modes(
+        self, client, mock_supabase
+    ):
+        """A technical programme offers technical AND organizational domains.
+
+        assessment_program.scope ('technical' for 3rd/5th semester) is the
+        programme's DEFAULT mode, not an exclusive restriction: the candidate
+        may take the standalone Organizational assessment or one/two technical
+        domains, and which mode applies is decided per selection. Only an
+        ORGANIZATIONAL programme narrows the list, so this asserts both that
+        the query allows both modes and that the response carries both.
+        """
+        _route_table(mock_supabase, "candidates")
+        for semester, program in ((3, JUNIOR_PROGRAM), (5, SENIOR_PROGRAM)):
+            self._configure_availability(
+                mock_sb=mock_supabase,
+                semester=semester,
+                program=program,
+                domains=[TECH_DOMAIN, ORG_DOMAIN],
+            )
+            _auth()
+            try:
+                resp = self._get(client)
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["semester"] == semester
+                assert data["scope"] == "technical"
+                assert {d["assessment_scope"] for d in data["domains"]} == {
+                    "technical",
+                    "organizational",
+                }
+                # Chain: select().eq("is_active", True)
+                #             .in_("assessment_scope", <allowed modes>).order(...)
+                scope_filter = (
+                    mock_supabase._table_chains["domains"]
+                    .select.return_value.eq.return_value.in_
+                )
+                scope_filter.assert_any_call(
+                    "assessment_scope", ["technical", "organizational"]
+                )
+            finally:
+                client.app.dependency_overrides.clear()
+
+    def test_organizational_programme_queries_the_organizational_scope_only(
+        self, client, mock_supabase
+    ):
+        """Semester 1 (organizational) is offered organizational domains only."""
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=1,
+            program=ORG_PROGRAM,
+            domains=[ORG_DOMAIN],
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["scope"] == "organizational"
+            assert [d["id"] for d in data["domains"]] == [MOCK_DOMAIN_1_ID]
+            # Organizational programmes query ORGANIZATIONAL domains only:
+            # technical domains are never fetched for a 1st-semester candidate.
+            (
+                mock_supabase._table_chains["domains"]
+                .select.return_value.eq.return_value.in_
+            ).assert_any_call("assessment_scope", ["organizational"])
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_card_metadata_is_semester_scoped(self, client, mock_supabase):
+        """Cards get description, the candidate's own semester pool count and duration."""
+        _route_table(mock_supabase, "candidates")
+        domain_rows = [dict(TECH_DOMAIN, description="Security work.")]
+        more = dict(TECH_DOMAIN, id=MOCK_DOMAIN_2_ID, name="Machine Learning")
+        domain_rows.append(more)
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=domain_rows,
+            mcq_rows=[
+                {"id": MOCK_MCQ_1_ID, "domain_id": MOCK_DOMAIN_1_ID},
+                {"id": MOCK_MCQ_2_ID, "domain_id": MOCK_DOMAIN_1_ID},
+                {"id": "mcq-2a", "domain_id": MOCK_DOMAIN_2_ID},
+                # An unknown domain must not leak into any card.
+                {"id": "mcq-9", "domain_id": "domain-not-offered"},
+            ],
+            duration_minutes=60,
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            cards = {d["id"]: d for d in resp.json()["domains"]}
+            assert cards[MOCK_DOMAIN_1_ID]["description"] == "Security work."
+            assert cards[MOCK_DOMAIN_1_ID]["questionCount"] == 2
+            assert cards[MOCK_DOMAIN_2_ID]["questionCount"] == 1
+            assert cards[MOCK_DOMAIN_2_ID]["description"] == ""
+            for card in cards.values():
+                assert card["durationMinutes"] == 60
+
+            # The pool query is filtered by the CANDIDATE'S semester.
+            # Chain: select().eq("semester", ...).eq("is_active", True).in_(...)
+            pool_select = mock_supabase._table_chains["mcq_questions"].select.return_value
+            pool_select.eq.assert_any_call("semester", 5)
+            pool_select.eq.return_value.eq.assert_any_call("is_active", True)
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_duration_is_omitted_when_unconfigured(self, client, mock_supabase):
+        """No active assessment_config -> no invented duration on the cards."""
+        _route_table(mock_supabase, "candidates")
+        self._configure_availability(
+            mock_sb=mock_supabase,
+            semester=5,
+            program=SENIOR_PROGRAM,
+            domains=[TECH_DOMAIN],
+            config_available=False,
+        )
+        _auth()
+        try:
+            resp = self._get(client)
+            assert resp.status_code == 200
+            assert resp.json()["domains"][0]["durationMinutes"] is None
+        finally:
+            client.app.dependency_overrides.clear()
+
     def test_missing_candidate_rejected(self, client, mock_supabase):
         """No candidate row -> 404."""
         _route_table(mock_supabase, "candidates")
@@ -2129,11 +2498,18 @@ class TestDomainAvailability:
             assert set(data.keys()) == {
                 "semester", "scope", "tier", "max_domains", "domains",
             }
-            # Domain keys must be exactly the expected set
+            # Domain keys must be exactly the expected set: identity, scope
+            # and the three presentation fields the selection cards render.
+            # Nothing about the pool, the plan or the candidate is exposed.
             for d in data["domains"]:
                 assert set(d.keys()) == {
                     "id", "name", "slug", "assessment_scope",
+                    "description", "questionCount", "durationMinutes",
                 }
+                assert not {
+                    "correct_option", "explanation", "selected_question_ids",
+                    "plan", "config_fingerprint", "profile_id",
+                } & set(d.keys())
         finally:
             client.app.dependency_overrides.clear()
 

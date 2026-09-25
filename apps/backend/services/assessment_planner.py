@@ -242,6 +242,53 @@ def assert_organizational_exclusive(domains) -> None:
         )
 
 
+def allowed_domain_scopes(program_scope: Scope) -> tuple:
+    """Which ``domains.assessment_scope`` values a programme may offer.
+
+    ``assessment_program.scope`` is the programme's DEFAULT MODE, not an
+    exclusive restriction. The product requirement is:
+
+        organizational (semester 1) -> Organizational Roles only
+        technical      (3rd / 5th)  -> technical domains AND Organizational
+                                       Roles as a STANDALONE assessment
+        none           (7th)        -> nothing
+
+    So a technical semester must not make every assessment technical: a
+    3rd/5th-semester candidate may take Organizational Roles on its own,
+    exactly like a 1st-semester candidate. The mutual exclusion lives on the
+    DOMAINS (``assert_organizational_exclusive``), not on the semester.
+
+    Returns domain scopes so the eligibility query and the planner can share
+    the same rule; an empty tuple means the programme offers no assessment at
+    all.
+    """
+    if program_scope is Scope.ORGANIZATIONAL:
+        return (DomainScope.ORGANIZATIONAL,)
+    if program_scope is Scope.TECHNICAL:
+        return (DomainScope.TECHNICAL, DomainScope.ORGANIZATIONAL)
+    return ()
+
+
+def assessment_mode_of(domains) -> Scope:
+    """The assessment MODE a resolved domain set implies.
+
+    The mode follows the candidate's SELECTION, never the semester: a single
+    Organizational domain plans an organizational assessment (organizational
+    MCQ/descriptive module config, no coding, no hands-on), while technical
+    domains plan a technical one (programme mcq_total, tier-shaped modules,
+    coding).
+
+    ``assert_organizational_exclusive`` guarantees the set is either one
+    Organizational domain or technical domains only, so the first row
+    describes the whole set. An empty set means nothing has resolved yet —
+    the planner will refuse it regardless, so technical is only used to pick a
+    module-config family for a query that returns nothing.
+    """
+    if domains and domains[0].assessment_scope is DomainScope.ORGANIZATIONAL:
+        return Scope.ORGANIZATIONAL
+    return Scope.TECHNICAL
+
+
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
@@ -579,16 +626,23 @@ def _allocation_error(kind, label, selected, quotas, eligible_by_domain):
     )
 
 
-def _family_for(program: ProgramInput) -> ConfigFamily:
-    """The assessment_module_config.applies_to family for this program."""
-    if program.scope is Scope.TECHNICAL:
-        if program.tier is None:
-            raise AssessmentPlanningError(
-                PlanningErrorKind.INVALID_PROGRAM,
-                f"Semester {program.semester} has scope 'technical' but no tier",
-            )
-        return ConfigFamily(program.tier.value)
-    return ConfigFamily.ORGANIZATIONAL
+def _family_for(program: ProgramInput, domain_scope: DomainScope) -> ConfigFamily:
+    """The assessment_module_config.applies_to family for this assessment.
+
+    The family follows the ASSESSMENT MODE the candidate chose, not the
+    semester's default: a 3rd/5th-semester candidate taking Organizational
+    Roles gets the ``organizational`` module configuration exactly like a
+    1st-semester candidate, while a technical selection keeps the programme's
+    tier (junior / senior).
+    """
+    if domain_scope is DomainScope.ORGANIZATIONAL:
+        return ConfigFamily.ORGANIZATIONAL
+    if program.tier is None:
+        raise AssessmentPlanningError(
+            PlanningErrorKind.INVALID_PROGRAM,
+            f"Semester {program.semester} has scope 'technical' but no tier",
+        )
+    return ConfigFamily(program.tier.value)
 
 
 def _validate_module_config(config: ModuleConfigInput, domain: DomainInput) -> None:
@@ -653,11 +707,9 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
             f"is planned for this candidate",
         )
 
-    is_technical = program.scope is Scope.TECHNICAL
-    expected_domain_scope = (
-        DomainScope.TECHNICAL if is_technical else DomainScope.ORGANIZATIONAL
-    )
-    family = _family_for(program)
+    # The programme's DEFAULT mode decides which assessment modes are allowed
+    # for this semester — it does not decide which one the candidate chose.
+    allowed_scopes = allowed_domain_scopes(program.scope)
 
     # -- 2. Domain selection ------------------------------------------------
     requested = list(request.requested_domain_ids)
@@ -672,31 +724,18 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
     # reported as the combination it is, rather than as "exactly one domain"
     # or a scope mismatch.
     catalogue = {domain.id: domain for domain in request.domains}
-    assert_organizational_exclusive(
-        [catalogue[domain_id] for domain_id in requested if domain_id in catalogue]
-    )
+    # Ids that actually resolve. assert_organizational_exclusive is given only
+    # these so an unknown id keeps reporting DOMAIN_NOT_FOUND instead of being
+    # misread as a combination problem.
+    resolvable = [
+        catalogue[domain_id] for domain_id in requested if domain_id in catalogue
+    ]
+    assert_organizational_exclusive(resolvable)
 
-    # The organizational assessment is exactly-one-domain by definition. This
-    # is asserted explicitly rather than left to max_domains, so the rule holds
-    # even if a program row is misconfigured.
-    if not is_technical and len(requested) > 1:
-        raise AssessmentPlanningError(
-            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
-            f"The {program.scope.value} assessment allows exactly one domain "
-            f"(got {len(requested)})",
-        )
-    if len(requested) > program.max_domains:
-        raise AssessmentPlanningError(
-            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
-            f"Select between 1 and {program.max_domains} domains "
-            f"(got {len(requested)})",
-        )
-    if len(set(requested)) != len(requested):
-        raise AssessmentPlanningError(
-            PlanningErrorKind.DUPLICATE_DOMAINS,
-            f"Duplicate domain ids in selection: {requested}",
-        )
-
+    # Resolve the requested domains BEFORE any scope or count rule: the
+    # assessment mode is derived from the selection, and a selection that
+    # references a domain which does not exist (or is inactive) has no mode to
+    # decide yet.
     selected = []
     for domain_id in requested:
         domain = catalogue.get(domain_id)
@@ -710,20 +749,72 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
                 PlanningErrorKind.DOMAIN_INACTIVE,
                 f"Domain '{domain.name}' is inactive",
             )
-        if domain.assessment_scope is not expected_domain_scope:
-            raise AssessmentPlanningError(
-                PlanningErrorKind.WRONG_DOMAIN_SCOPE,
-                f"Domain '{domain.name}' has assessment_scope "
-                f"'{domain.assessment_scope.value}' but the "
-                f"'{program.scope.value}' assessment requires "
-                f"'{expected_domain_scope.value}'",
-            )
         selected.append(domain)
 
     # Deterministic order: (name, id). Matches the project's convention of
     # ordering domains by name, and removes any dependence on the order the
     # caller happened to fetch or pass them in.
     selected.sort(key=lambda domain: (domain.name, domain.id))
+
+    # -- Scope: derived from the SELECTION, validated against the programme --
+    #
+    # assessment_program.scope only decides WHICH MODES a semester may offer;
+    # the mode itself comes from the domains the candidate selected:
+    #   [Organizational Roles]          -> organizational assessment
+    #   [Web Development]               -> technical assessment
+    #   [Web Development, ML]           -> technical assessment
+    #   [Organizational Roles, Web Dev] -> already refused above
+    #
+    # assert_organizational_exclusive guarantees the set is either one
+    # Organizational domain or technical domains only, so it has exactly one
+    # scope unless something already refused the mixed case.
+    scopes_present = {domain.assessment_scope for domain in selected}
+    if len(scopes_present) > 1:
+        raise AssessmentPlanningError(
+            PlanningErrorKind.WRONG_DOMAIN_SCOPE,
+            ORGANIZATIONAL_EXCLUSIVE_DETAIL,
+        )
+    expected_domain_scope = next(iter(scopes_present))
+    if expected_domain_scope not in allowed_scopes:
+        allowed_text = ", ".join(
+            sorted(scope.value for scope in allowed_scopes)
+        )
+        raise AssessmentPlanningError(
+            PlanningErrorKind.WRONG_DOMAIN_SCOPE,
+            f"Domain '{selected[0].name}' has assessment_scope "
+            f"'{expected_domain_scope.value}' but the "
+            f"'{program.scope.value}' assessment for semester "
+            f"{program.semester} allows only: {allowed_text}",
+        )
+
+    assessment_mode = (
+        Scope.TECHNICAL
+        if expected_domain_scope is DomainScope.TECHNICAL
+        else Scope.ORGANIZATIONAL
+    )
+    is_technical = assessment_mode is Scope.TECHNICAL
+    family = _family_for(program, expected_domain_scope)
+
+    # The organizational assessment is exactly-one-domain by definition. This
+    # is asserted explicitly rather than left to max_domains, so the rule holds
+    # even if a program row is misconfigured.
+    if not is_technical and len(requested) > 1:
+        raise AssessmentPlanningError(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            f"The {assessment_mode.value} assessment allows exactly one domain "
+            f"(got {len(requested)})",
+        )
+    if len(requested) > program.max_domains:
+        raise AssessmentPlanningError(
+            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
+            f"Select between 1 and {program.max_domains} domains "
+            f"(got {len(requested)})",
+        )
+    if len(set(requested)) != len(requested):
+        raise AssessmentPlanningError(
+            PlanningErrorKind.DUPLICATE_DOMAINS,
+            f"Duplicate domain ids in selection: {requested}",
+        )
 
     # -- 3. Resolve module configuration -----------------------------------
     configs_by_key = {}
@@ -1008,7 +1099,7 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
         {
             "plan_version": PLAN_VERSION,
             "semester": program.semester,
-            "scope": program.scope.value,
+            "scope": assessment_mode.value,
             "tier": program.tier.value if program.tier else None,
             "max_domains": program.max_domains,
             "program_mcq_total": program.mcq_total,
@@ -1050,7 +1141,7 @@ def plan_assessment(request: AssessmentPlanRequest) -> AssessmentPlan:
     return AssessmentPlan(
         plan_version=PLAN_VERSION,
         semester=program.semester,
-        scope=program.scope,
+        scope=assessment_mode,
         tier=program.tier,
         max_domains=program.max_domains,
         config_source=config_source,

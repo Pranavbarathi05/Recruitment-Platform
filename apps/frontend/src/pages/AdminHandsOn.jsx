@@ -31,7 +31,7 @@ const EMPTY_FORM = {
   domain_ids: [],
   challenge_type: 'sql_wasm',
   difficulty: 'medium',
-  points: 100,
+  points: 10,
   challenge_url: '',
   expected_flag: '',
   is_active: true,
@@ -160,7 +160,7 @@ const AdminHandsOn = () => {
         domain_ids: form.domain_ids,
         challenge_type: form.challenge_type,
         difficulty: form.difficulty,
-        points: parseInt(form.points, 10) || 100,
+        points: parseInt(form.points, 10) || 10,
         is_active: form.is_active,
       };
 
@@ -255,7 +255,7 @@ const AdminHandsOn = () => {
       domain_ids: q.domain_ids || [],
       challenge_type: q.challenge_type || 'sql_injection_employee_portal',
       difficulty: q.difficulty || 'medium',
-      points: q.points ?? 100,
+      points: q.points ?? 10,
       challenge_url: q.challenge_url || '',
       expected_flag: q.expected_flag || '',
       is_active: q.is_active,

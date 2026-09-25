@@ -13,8 +13,11 @@ import { validatePandas } from '../execution/validators';
  *   problem - Challenge object with dataset_json, starter_code, validation_spec
  *   onSubmit - Function called with { questionId, submittedCode, clientScore }
  *   submitted - Boolean, whether this challenge has already been submitted
+ *   initialCode - Optional draft restored from the parent (per-question state
+ *                 so switching Hands-On questions preserves the editor contents)
+ *   onDraftChange - Called with the current editor contents on every edit
  */
-const PandasWasmChallenge = ({ problem, onSubmit, submitted }) => {
+const PandasWasmChallenge = ({ problem, onSubmit, submitted, initialCode, onDraftChange }) => {
   const [sourceCode, setSourceCode] = useState('');
   const [runner, setRunner] = useState(null);
   const [initializing, setInitializing] = useState(true);
@@ -39,7 +42,9 @@ const PandasWasmChallenge = ({ problem, onSubmit, submitted }) => {
         if (!cancelled) {
           runnerRef.current = r;
           setRunner(r);
-          setSourceCode(problem.starter_code || '');
+          // Restore this question's draft when there is one (switched away
+          // and back), otherwise start from the admin-provided starter.
+          setSourceCode(initialCode ?? problem.starter_code ?? '');
         }
       } catch (err) {
         if (!cancelled) {
@@ -128,7 +133,11 @@ const PandasWasmChallenge = ({ problem, onSubmit, submitted }) => {
         <CodeEditor
           language="python"
           value={sourceCode}
-          onChange={(val) => setSourceCode(val || '')}
+          onChange={(val) => {
+            const next = val || '';
+            setSourceCode(next);
+            onDraftChange?.(next);
+          }}
           height="100%"
           options={{ readOnly: submitted }}
         />

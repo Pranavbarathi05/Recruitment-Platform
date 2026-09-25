@@ -309,16 +309,38 @@ class TestDomainSelection:
         )
 
     def test_organizational_more_than_one_domain_rejected(self):
-        """Semester 1 allows exactly one domain — enforced explicitly."""
-        err = expect_failure(
-            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
-            program=PROGRAM_1,
-            domain_ids=[ORG_ID, ORG_ID + "-x"],
+        """The organizational assessment allows exactly one domain.
+
+        Uses a SECOND real organizational row: the rule is about the
+        assessment's shape, so it must be exercised with two rows that both
+        resolve rather than with an unresolvable id (which would correctly
+        report DOMAIN_NOT_FOUND first).
+        """
+        second_org = DomainInput(
+            id="d-org-2",
+            name="Second Organizational Roles",
+            slug="secondOrganizationalRoles",
+            assessment_scope="organizational",
+            is_active=True,
         )
-        assert "exactly one" in err.detail
+        request = build(PROGRAM_1, [ORG_ID, second_org.id], [ORG_COMMON])
+        request = request.model_copy(
+            update={"domains": [*request.domains, second_org]}
+        )
+        with pytest.raises(AssessmentPlanningError) as excinfo:
+            plan_assessment(request)
+        assert excinfo.value.kind is PlanningErrorKind.INVALID_DOMAIN_SELECTION
+        assert "exactly one" in excinfo.value.detail
 
     def test_organizational_one_domain_allowed_even_if_max_domains_wrong(self):
         """The one-domain rule holds even if a program row says max_domains=2."""
+        second_org = DomainInput(
+            id="d-org-2",
+            name="Second Organizational Roles",
+            slug="secondOrganizationalRoles",
+            assessment_scope="organizational",
+            is_active=True,
+        )
         misconfigured = ProgramInput(
             semester=1,
             scope=Scope.ORGANIZATIONAL,
@@ -326,12 +348,16 @@ class TestDomainSelection:
             max_domains=2,
             coding_enabled=False,
         )
-        err = expect_failure(
-            PlanningErrorKind.INVALID_DOMAIN_SELECTION,
-            program=misconfigured,
-            domain_ids=[ORG_ID, ORG_ID + "-x"],
+        request = build(
+            misconfigured, [ORG_ID, second_org.id], [ORG_COMMON]
         )
-        assert "exactly one" in err.detail
+        request = request.model_copy(
+            update={"domains": [*request.domains, second_org]}
+        )
+        with pytest.raises(AssessmentPlanningError) as excinfo:
+            plan_assessment(request)
+        assert excinfo.value.kind is PlanningErrorKind.INVALID_DOMAIN_SELECTION
+        assert "exactly one" in excinfo.value.detail
 
     def test_duplicate_domains_rejected(self):
         expect_failure(
@@ -370,14 +396,24 @@ class TestDomainSelection:
             )
         assert excinfo.value.kind is PlanningErrorKind.DOMAIN_INACTIVE
 
-    def test_technical_assessment_rejects_organizational_domain(self):
-        err = expect_failure(
-            PlanningErrorKind.WRONG_DOMAIN_SCOPE,
-            program=PROGRAM_5,
-            domain_ids=[ORG_ID],
-            module_configs=[ORG_COMMON],
-        )
-        assert "organizational" in err.detail
+    def test_technical_programme_accepts_standalone_organizational_domain(self):
+        """CORRECTED RULE: ``assessment_program.scope`` is a DEFAULT mode.
+
+        A technical programme (3rd/5th) may still be taken as the standalone
+        Organizational assessment, because the assessment MODE is derived from
+        the SELECTED domains, not from the semester. The programme's scope
+        still decides which domains are eligible at all — see
+        ``test_organizational_assessment_rejects_technical_domain`` for a
+        1st-semester candidate picking a technical domain, which stays
+        rejected.
+        """
+        plan = plan_assessment(build(PROGRAM_5, [ORG_ID], [ORG_COMMON]))
+        assert plan.scope is Scope.ORGANIZATIONAL
+        assert plan.domain_ids == [ORG_ID]
+        # Organizational mode: module-config quantity, no coding, no hands-on.
+        assert plan.mcq_total == 10
+        assert plan.coding_total == 0
+        assert plan.hands_on_total == 0
 
     def test_organizational_assessment_rejects_technical_domain(self):
         err = expect_failure(

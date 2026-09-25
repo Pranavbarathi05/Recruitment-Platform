@@ -14,6 +14,16 @@ vi.mock('../components/CodeEditor', () => ({
   default: ({ value }) => <textarea data-testid="code-editor" readOnly value={value} />,
 }));
 
+// The WASM challenge editors boot a real WASM runtime; the workspace behavior
+// under test here is the header/navigation around them, so they are stubbed
+// (same convention as MCQTest.wasm-submit.test.jsx).
+vi.mock('../components/SqlWasmChallenge', () => ({
+  default: ({ problem }) => <div data-testid="sql-wasm-stub">{problem.id}</div>,
+}));
+vi.mock('../components/PandasWasmChallenge', () => ({
+  default: ({ problem }) => <div data-testid="pandas-wasm-stub">{problem.id}</div>,
+}));
+
 const FUTURE = new Date(Date.now() + 3600_000).toISOString();
 
 const HANDS_ON_CHALLENGE = {
@@ -27,7 +37,8 @@ const HANDS_ON_CHALLENGE = {
   // NOTE: no expected_flag here — candidate APIs must never carry it.
 };
 
-function mockFetch({ withHandsOn = true, priorResult = null, putStatus = 200 } = {}) {
+function mockFetch({ withHandsOn = true, priorResult = null, putStatus = 200, handsOn = null } = {}) {
+  const challenges = handsOn ?? (withHandsOn ? [HANDS_ON_CHALLENGE] : []);
   const fetchMock = vi.fn(async (url, options) => {
     const u = String(url);
     if (u.includes('/assessment/attempt/attempt-1/questions')) {
@@ -41,7 +52,7 @@ function mockFetch({ withHandsOn = true, priorResult = null, putStatus = 200 } =
           answers: { 'mcq-1': '4' },
           descriptive_questions: [],
           descriptive_answers: {},
-          hands_on_questions: withHandsOn ? [HANDS_ON_CHALLENGE] : [],
+          hands_on_questions: challenges,
           // Candidate results carry evidence only — never verified/score.
           hands_on_results: priorResult
             ? [{
@@ -52,7 +63,7 @@ function mockFetch({ withHandsOn = true, priorResult = null, putStatus = 200 } =
                 completed_at: priorResult.completed_at ?? null,
               }]
             : [],
-          total_hands_on_questions: withHandsOn ? 1 : 0,
+          total_hands_on_questions: challenges.length,
           expires_at: FUTURE,
         }),
       };
@@ -125,7 +136,10 @@ describe('MCQTest — Hands-On section', () => {
     await openHandsOnTab();
 
     expect(screen.getByText(/Gain access to the administrator account/i)).toBeInTheDocument();
-    expect(screen.getByText('100 pts')).toBeInTheDocument();
+    // Candidate-facing header: internal metadata (difficulty, points, type
+    // labels) must never be shown — only question information.
+    expect(screen.queryByText('100 pts')).not.toBeInTheDocument();
+    expect(screen.queryByText('medium')).not.toBeInTheDocument();
 
     const iframe = screen.getByTitle('Hands-on challenge');
     expect(iframe).toHaveAttribute('src', '/challenge/');
@@ -233,4 +247,129 @@ describe('MCQTest — Hands-On section', () => {
     expect(screen.queryByText(/score/i)).not.toBeInTheDocument();
     expect(fetchMock.putCalls).toHaveLength(1);
   });
+});
+
+const SECOND_CHALLENGE = {
+  ...HANDS_ON_CHALLENGE,
+  id: 'hands-2',
+  title: 'Second Challenge — DevOps',
+  description: 'Deploy the service and verify the rollout.',
+};
+
+async function openTwoChallengeTab() {
+  fireEvent.click(await screen.findByRole('button', { name: /Hands-On \(2\)/i }));
+  await screen.findByText('SQL Injection — Employee Portal');
+}
+
+describe('MCQTest — multi-question Hands-On navigation', () => {
+  it('renders both challenges and switches between them with the nav controls', async () => {
+    renderWorkspace(mockFetch({ handsOn: [HANDS_ON_CHALLENGE, SECOND_CHALLENGE] }));
+    await openTwoChallengeTab();
+
+    expect(screen.getByText('Question 1 of 2')).toBeInTheDocument();
+    expect(screen.queryByText('Second Challenge — DevOps')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next question' }));
+    expect(await screen.findByText('Second Challenge — DevOps')).toBeInTheDocument();
+    expect(screen.getByText('Question 2 of 2')).toBeInTheDocument();
+    expect(screen.queryByText('SQL Injection — Employee Portal')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous question' }));
+    expect(await screen.findByText('SQL Injection — Employee Portal')).toBeInTheDocument();
+    expect(screen.getByText('Question 1 of 2')).toBeInTheDocument();
+  });
+
+  it('supports direct selection through the numbered question selector', async () => {
+    renderWorkspace(mockFetch({ handsOn: [HANDS_ON_CHALLENGE, SECOND_CHALLENGE] }));
+    await openTwoChallengeTab();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Question 2' }));
+    expect(await screen.findByText('Second Challenge — DevOps')).toBeInTheDocument();
+
+    const active = screen.getByRole('button', { name: 'Question 2' });
+    expect(active).toHaveAttribute('aria-current', 'true');
+  });
+
+  it("keeps each question's evidence/flag drafts independent while switching", async () => {
+    renderWorkspace(mockFetch({ handsOn: [HANDS_ON_CHALLENGE, SECOND_CHALLENGE] }));
+    await openTwoChallengeTab();
+
+    fireEvent.change(screen.getByPlaceholderText(/Paste the SQL input/i), {
+      target: { value: 'first payload' },
+    });
+    fireEvent.change(screen.getByPlaceholderText(/FLAG\{\.\.\.\}/i), {
+      target: { value: 'FLAG{one}' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next question' }));
+    await screen.findByText('Second Challenge — DevOps');
+
+    // Question 2 starts empty — question 1's draft must not leak into it.
+    expect(screen.getByPlaceholderText(/Paste the SQL input/i)).toHaveValue('');
+    expect(screen.getByPlaceholderText(/FLAG\{\.\.\.\}/i)).toHaveValue('');
+
+    fireEvent.change(screen.getByPlaceholderText(/Paste the SQL input/i), {
+      target: { value: 'second payload' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous question' }));
+    await screen.findByText('SQL Injection — Employee Portal');
+    expect(screen.getByPlaceholderText(/Paste the SQL input/i)).toHaveValue('first payload');
+    expect(screen.getByPlaceholderText(/FLAG\{\.\.\.\}/i)).toHaveValue('FLAG{one}');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next question' }));
+    await screen.findByText('Second Challenge — DevOps');
+    expect(screen.getByPlaceholderText(/Paste the SQL input/i)).toHaveValue('second payload');
+    expect(screen.getByPlaceholderText(/FLAG\{\.\.\.\}/i)).toHaveValue('');
+  });
+
+  it('locks only the challenge that was already submitted', async () => {
+    renderWorkspace(mockFetch({
+      handsOn: [HANDS_ON_CHALLENGE, SECOND_CHALLENGE],
+      priorResult: {
+        question_id: 'hands-1',
+        submitted_input: 'saved input',
+        submitted_flag: 'FLAG{done}',
+      },
+    }));
+    await openTwoChallengeTab();
+
+    expect(screen.getByText('Submitted')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/Paste the SQL input/i)).toHaveValue('saved input');
+    expect(screen.queryByRole('button', { name: /Submit Challenge/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next question' }));
+    await screen.findByText('Second Challenge — DevOps');
+    // Question 2 is untouched: no Submitted badge, submit still available.
+    expect(screen.queryByText('Submitted')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Submit Challenge/i })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/Paste the SQL input/i)).toHaveValue('');
+  });
+});
+
+describe('MCQTest — Hands-On header shows only question information', () => {
+  for (const type of ['sql_wasm', 'pandas_wasm']) {
+    it(`hides difficulty, points and runtime labels for ${type}`, async () => {
+      const challenge = {
+        ...HANDS_ON_CHALLENGE,
+        id: `hands-${type}`,
+        challenge_type: type,
+        difficulty: 'easy',
+        points: 100,
+        title: 'Employee Analytics',
+        description: 'Write a query to calculate the average salary by department.',
+      };
+      renderWorkspace(mockFetch({ handsOn: [challenge] }));
+
+      fireEvent.click(await screen.findByRole('button', { name: /Hands-On \(1\)/i }));
+      await screen.findByText('Employee Analytics');
+
+      expect(screen.getByText(/Write a query to calculate the average salary/i)).toBeInTheDocument();
+      expect(screen.queryByText('easy')).not.toBeInTheDocument();
+      expect(screen.queryByText('100 pts')).not.toBeInTheDocument();
+      expect(screen.queryByText('10 pts')).not.toBeInTheDocument();
+      expect(screen.queryByText('SQL WASM')).not.toBeInTheDocument();
+      expect(screen.queryByText('Pandas WASM')).not.toBeInTheDocument();
+    });
+  }
 });

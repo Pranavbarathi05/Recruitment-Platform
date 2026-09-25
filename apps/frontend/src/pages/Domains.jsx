@@ -78,8 +78,12 @@ const ORGANIZATIONAL_EXCLUSIVE_MESSAGE =
  *   [Organizational] + click Cyber -> [Organizational] (click refused)
  *
  * Neither order can ever reach [Organizational, Cyber].
+ *
+ * `maxDomains` is the programme's own limit (assessment_program.max_domains,
+ * served by the eligibility endpoint), never a hardcoded number here: the
+ * selection UI must not disagree with the programme that will validate it.
  */
-function reconcileSelection(selection, clicked, domains) {
+function reconcileSelection(selection, clicked, domains, maxDomains) {
   const ids = selection.ids;
 
   // Deselecting is always allowed — the only way out of the Organizational lock.
@@ -103,8 +107,8 @@ function reconcileSelection(selection, clicked, domains) {
     };
   }
 
-  if (ids.length >= 2) {
-    return selection; // unchanged: the ordinary cap stays 2
+  if (ids.length >= maxDomains) {
+    return selection; // unchanged: the programme's cap already reached
   }
   return { ids: [...ids, clicked.id], notice: null };
 }
@@ -112,12 +116,25 @@ function reconcileSelection(selection, clicked, domains) {
 /**
  * Domains Page
  *
- * Fetches active domains from the backend.
- * Candidate selects 1 or 2 domains, then starts assessment.
+ * Fetches the CANDIDATE-ELIGIBLE domains from the backend.
+ * Candidate selects their domain(s), then starts assessment.
  * The Organizational domain may only ever be selected on its own.
+ *
+ * THE DOMAIN LIST IS SEMESTER-DEPENDENT
+ *   assessment_program maps the candidate's semester to an assessment scope,
+ *   and only domains whose assessment_scope matches that programme may be
+ *   selected (migration 014: 1 -> organizational, 3 -> junior technical,
+ *   5 -> senior technical, 7 -> none). GET /assessment/available-domains is the
+ *   endpoint that resolves this, so it — not the semester-agnostic catalogue
+ *   GET /questions/domains — is what this page loads. Falling back to the
+ *   catalogue offered the Organizational domain to 3rd/5th semester
+ *   candidates, whose technical programme can never accept it.
  */
 const Domains = () => {
   const [domains, setDomains] = useState([]);
+  // The programme's own domain cap (assessment_program.max_domains). 2 is the
+  // backend's maximum, so it is the safe default until the answer arrives.
+  const [maxDomains, setMaxDomains] = useState(2);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   // Selection and its exclusivity notice move together, atomically.
@@ -132,14 +149,24 @@ const Domains = () => {
     const fetchDomains = async () => {
       try {
         setLoading(true);
-        const response = await fetch(`${apiUrl}/questions/domains`);
+        // The endpoint resolves the candidate from the session cookie, so the
+        // request must carry it (and the CSRF header the API expects).
+        const response = await fetch(`${apiUrl}/assessment/available-domains`, {
+          headers: getAuthHeaders(),
+          credentials: 'include',
+        });
 
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        const data = await response.json();
-        setDomains(data);
+        const payload = await response.json();
+        setDomains(Array.isArray(payload?.domains) ? payload.domains : []);
+        const cap = Number(payload?.max_domains);
+        setMaxDomains(Number.isInteger(cap) && cap > 0 ? cap : 2);
+        // A programme that offers different domains must never keep a
+        // selection made under the previous one.
+        setSelection({ ids: [], notice: null });
         setError(null);
       } catch (err) {
         console.error('Error fetching domains:', err);
@@ -150,6 +177,10 @@ const Domains = () => {
     };
 
     fetchDomains();
+    // getAuthHeaders is memoised by AuthContext (useCallback with no deps), so
+    // it is deliberately not a dependency: re-fetching on every render would
+    // be a worse failure than a stale closure that cannot occur.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiUrl]);
 
   // Derived from the same state the cards render, so the UI can never show a
@@ -159,7 +190,7 @@ const Domains = () => {
   const organizationalSelected = organizationalIn(selectedDomains, domains);
 
   const toggleDomain = (domain) =>
-    setSelection((prev) => reconcileSelection(prev, domain, domains));
+    setSelection((prev) => reconcileSelection(prev, domain, domains, maxDomains));
 
   const handleStartAssessment = async () => {
     if (selectedDomains.length === 0) {
@@ -227,9 +258,9 @@ const Domains = () => {
         <div className="text-center mb-12">
           <h1 className="text-4xl font-bold text-theme-primary mb-4">Choose Your Domain</h1>
           <p className="text-theme-secondary text-lg max-w-2xl mx-auto">
-            Select up to 2 domains for your assessment. The Organizational
-            domain is a standalone assessment and cannot be combined with other
-            domains.
+            Select up to {maxDomains} domain{maxDomains === 1 ? '' : 's'} for
+            your assessment. The Organizational domain is a standalone
+            assessment and cannot be combined with other domains.
           </p>
 
         </div>
@@ -265,7 +296,9 @@ const Domains = () => {
           <div className="text-center mb-8">
             <p className="text-theme-muted">
               {selectedDomains.length === 0
-                ? 'Select 1 or 2 domains to begin'
+                ? maxDomains > 1
+                  ? `Select 1 or ${maxDomains} domains to begin`
+                  : 'Select 1 domain to begin'
                 : `${selectedDomains.length} domain${selectedDomains.length > 1 ? 's' : ''} selected`}
             </p>
             {organizationalSelected && (
@@ -328,12 +361,17 @@ const Domains = () => {
                     )}
 
                     <div className="flex items-center gap-2">
-                      <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-theme-tertiary text-theme-muted">
-                        {domain.questionCount} {domain.questionCount === 1 ? 'Question' : 'Questions'}
-                      </span>
-                      <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-blue-900/50 text-blue-300">
-                        ⏱️ {domain.durationMinutes} min
-                      </span>
+                      {domain.questionCount != null && (
+                        <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-theme-tertiary text-theme-muted">
+                          {domain.questionCount}{' '}
+                          {domain.questionCount === 1 ? 'Question' : 'Questions'}
+                        </span>
+                      )}
+                      {domain.durationMinutes != null && (
+                        <span className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-blue-900/50 text-blue-300">
+                          ⏱️ {domain.durationMinutes} min
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>

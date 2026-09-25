@@ -31,6 +31,7 @@ from services.assessment_planning import (
     resolve_program,
 )
 from services.assessment_planner import Scope as ProgramScope
+from services.assessment_planner import allowed_domain_scopes
 
 router = APIRouter(prefix="/assessment", tags=["Assessment"])
 
@@ -47,11 +48,25 @@ def get_available_domains(
     """Return the domains the authenticated candidate may select.
 
     Eligibility is derived from:
-        candidate semester  ->  assessment_program  ->  scope
-        domains with matching assessment_scope + is_active
+        candidate semester  ->  assessment_program  ->  allowed modes
+        active domains whose assessment_scope is one of those modes
 
-    This is a discovery/selection-UI endpoint.  The actual assessment
-    planner (POST /assessment/start) remains the authoritative validator.
+    assessment_program.scope is the programme's DEFAULT mode, not an
+    exclusive filter: a technical programme (semesters 3 and 5) also offers
+    Organizational Roles as a STANDALONE assessment, so its candidates must
+    see organizational AND technical domains and pick one of the two modes.
+    An organizational programme (semester 1) offers organizational domains
+    only. Which mode a selection forms is decided per selection by the
+    planner, which still validates assessment_scope strictly.
+
+    This is a discovery/selection-UI endpoint: it is the ONLY source the
+    candidate selection page may use for the domains it offers. The
+    semester-agnostic catalogue (GET /questions/domains) returns every active
+    domain to every caller, so using it here would offer a candidate domains
+    their own programme can never accept.
+
+    The actual assessment planner (POST /assessment/start) remains the
+    authoritative validator.
     """
     profile_id = current_user.id
 
@@ -84,24 +99,79 @@ def get_available_domains(
             "domains": [],
         }
 
-    # 4. Fetch active domains whose assessment_scope matches the program.
+    # 4. Fetch every ACTIVE domain this programme is allowed to offer.
+    #
+    # The set of allowed scopes comes from the shared rule
+    # (allowed_domain_scopes), so the catalogue a candidate sees and the
+    # validation POST /assessment/start applies can never disagree: a
+    # technical programme offers technical AND organizational domains, an
+    # organizational programme offers organizational domains only. The
+    # Organizational/technical split is enforced per SELECTION, not by
+    # hiding one side from the list.
+    allowed_scopes = allowed_domain_scopes(program.scope)
     response = (
         supabase_client.table("domains")
-        .select("id, name, slug, assessment_scope")
+        .select("id, name, slug, description, assessment_scope")
         .eq("is_active", True)
-        .eq("assessment_scope", program.scope.value)
+        .in_("assessment_scope", [scope.value for scope in allowed_scopes])
         .order("name")
         .execute()
+    )
+    rows = response.data or []
+    domain_ids = [row["id"] for row in rows]
+
+    # 5. Selection-card content for exactly those domains.
+    #
+    # NOTE ON THE ENDPOINT BOUNDARY: the candidate UI must never fall back to
+    # the global catalogue to render its cards (see the docstring above), so
+    # the presentation fields the cards need are served from here — where the
+    # candidate's programme is already resolved.
+    #
+    # questionCount: active MCQs for this domain AT THE CANDIDATE'S SEMESTER,
+    # which is the pool the assessment is actually drawn from (the planner
+    # filters mcq_questions by candidates.semester). It is pool inventory, not
+    # the number of questions this candidate will answer.
+    question_counts = {domain_id: 0 for domain_id in domain_ids}
+    if domain_ids:
+        pool = (
+            supabase_client.table("mcq_questions")
+            .select("id, domain_id")
+            .eq("semester", candidate_semester)
+            .eq("is_active", True)
+            .in_("domain_id", domain_ids)
+            .execute()
+        )
+        for mcq in pool.data or []:
+            domain_id = mcq.get("domain_id")
+            if domain_id in question_counts:
+                question_counts[domain_id] += 1
+
+    # durationMinutes: the GLOBAL base assessment duration. Module minutes
+    # (e.g. the senior hands-on extension) are not per-domain, so they are not
+    # part of a domain card. None when no active configuration exists — the UI
+    # then simply omits the duration badge rather than inventing a number.
+    config_resp = (
+        supabase_client.table("assessment_config")
+        .select("duration_minutes")
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    duration_minutes = (
+        config_resp.data[0]["duration_minutes"] if config_resp.data else None
     )
 
     domains = [
         {
-            "id": d["id"],
-            "name": d["name"],
-            "slug": d["slug"],
-            "assessment_scope": d["assessment_scope"],
+            "id": row["id"],
+            "name": row["name"],
+            "slug": row["slug"],
+            "assessment_scope": row["assessment_scope"],
+            "description": row.get("description") or "",
+            "questionCount": question_counts[row["id"]],
+            "durationMinutes": duration_minutes,
         }
-        for d in (response.data or [])
+        for row in rows
     ]
 
     return {
