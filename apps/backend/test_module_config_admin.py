@@ -1046,3 +1046,153 @@ class TestSecurity:
                 assert isinstance(preflight[key], int)
         finally:
             _clear_auth()
+
+
+# ===========================================================================
+# HANDS_ON_MODULE PERSISTENCE (shared-module deduplication)
+# ===========================================================================
+
+
+class TestHandsOnModulePersistence:
+    """hands_on_module survives the admin write path and round-trips out."""
+
+    SQL_MODULE = "sql_injection_employee_portal"
+
+    def _put_config(self, client, domain_id, **overrides):
+        body = {
+            "applies_to": "senior",
+            "mcq_count": 5,
+            "descriptive_count": 0,
+            "hands_on_enabled": True,
+            "hands_on_count": 1,
+            "hands_on_additional_minutes": 10,
+        }
+        body.update(overrides)
+        return client.put(f"/admin/assessment/modules/{domain_id}", json=body)
+
+    def test_hands_on_module_is_persisted_on_insert(
+        self, client, mock_supabase
+    ):
+        _route_table(mock_supabase, "domains")
+        _configure_domains(mock_supabase, [TECH_DOMAIN])
+        _configure_module_config(mock_supabase)
+        _configure_preflight_pools(
+            mock_supabase, mcq_count=10, desc_count=5, hands_count=3
+        )
+        _admin_auth()
+        try:
+            resp = self._put_config(
+                client,
+                MOCK_DOMAIN_1_ID,
+                hands_on_module=self.SQL_MODULE,
+            )
+            assert resp.status_code == 200
+
+            written = mock_supabase._table_chains[
+                "assessment_module_config"
+            ].insert.call_args.args[0]
+            assert written["hands_on_module"] == self.SQL_MODULE
+
+            # And it round-trips out through the response projection.
+            assert resp.json()["config"]["hands_on_module"] == self.SQL_MODULE
+        finally:
+            _clear_auth()
+
+    def test_hands_on_module_is_persisted_on_update(
+        self, client, mock_supabase
+    ):
+        existing = {
+            "id": "cfg-row-1",
+            "domain_id": MOCK_DOMAIN_1_ID,
+            "applies_to": "senior",
+            "mcq_count": 5,
+            "descriptive_count": 0,
+            "hands_on_enabled": True,
+            "hands_on_count": 1,
+            "hands_on_additional_minutes": 10,
+            "hands_on_module": None,
+        }
+        _route_table(mock_supabase, "domains")
+        _configure_domains(mock_supabase, [TECH_DOMAIN])
+        _configure_module_config(mock_supabase, configs=[existing])
+        # The upsert lookup (.select("id").eq().eq()) must find the row so
+        # the PUT takes the UPDATE branch instead of INSERT.
+        mock_supabase._table_chains[
+            "assessment_module_config"
+        ].select.return_value.eq.return_value.eq.return_value.execute.return_value = _make_mock_response(
+            [existing]
+        )
+        _configure_preflight_pools(
+            mock_supabase, mcq_count=10, desc_count=5, hands_count=3
+        )
+        _admin_auth()
+        try:
+            resp = self._put_config(
+                client,
+                MOCK_DOMAIN_1_ID,
+                hands_on_module=self.SQL_MODULE,
+            )
+            assert resp.status_code == 200
+
+            update_chain = mock_supabase._table_chains[
+                "assessment_module_config"
+            ].update
+            written = update_chain.call_args.args[0]
+            assert written["hands_on_module"] == self.SQL_MODULE
+        finally:
+            _clear_auth()
+
+    def test_whitespace_only_module_is_normalised_to_null(
+        self, client, mock_supabase
+    ):
+        _route_table(mock_supabase, "domains")
+        _configure_domains(mock_supabase, [TECH_DOMAIN])
+        _configure_module_config(mock_supabase)
+        _configure_preflight_pools(
+            mock_supabase, mcq_count=10, desc_count=5, hands_count=3
+        )
+        _admin_auth()
+        try:
+            resp = self._put_config(
+                client, MOCK_DOMAIN_1_ID, hands_on_module="   "
+            )
+            assert resp.status_code == 200
+            written = mock_supabase._table_chains[
+                "assessment_module_config"
+            ].insert.call_args.args[0]
+            assert written["hands_on_module"] is None
+        finally:
+            _clear_auth()
+
+    def test_read_endpoints_surface_hands_on_module(
+        self, client, mock_supabase
+    ):
+        config_row = {
+            "id": "cfg-row-1",
+            "domain_id": MOCK_DOMAIN_1_ID,
+            "applies_to": "senior",
+            "mcq_count": 5,
+            "descriptive_count": 0,
+            "hands_on_enabled": True,
+            "hands_on_count": 1,
+            "hands_on_additional_minutes": 10,
+            "hands_on_module": self.SQL_MODULE,
+        }
+        _route_table(mock_supabase, "domains")
+        _configure_domains(mock_supabase, [TECH_DOMAIN])
+        _configure_module_config(mock_supabase, configs=[config_row])
+        _admin_auth()
+        try:
+            resp = client.get("/admin/assessment/modules")
+            assert resp.status_code == 200
+            domain_entry = next(
+                d
+                for d in resp.json()
+                if d["domain"]["id"] == MOCK_DOMAIN_1_ID
+            )
+            assert (
+                domain_entry["configs"][0]["hands_on_module"]
+                == self.SQL_MODULE
+            )
+        finally:
+            _clear_auth()

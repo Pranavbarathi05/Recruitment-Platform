@@ -24,6 +24,7 @@ from test_main import (
     MOCK_DESC_ID,
     MOCK_DOMAIN_1_ID,
     MOCK_DOMAIN_2_ID,
+    MOCK_HANDS_ID_2,
     MOCK_HANDS_ID,
     MOCK_MCQ_1_ID,
     MOCK_MCQ_2_ID,
@@ -2861,3 +2862,186 @@ class TestTechnicalStartNeverTouchesDescriptive:
         assert response.json()["total_descriptive_questions"] == 0
         mock_supabase._table_chains["descriptive_questions"].select.assert_not_called()
         assert spy.plan.descriptive_total == 0
+
+
+# ===========================================================================
+# SHARED HANDS-ON MODULE DEDUPLICATION (assessment_module_config.hands_on_module)
+# ===========================================================================
+
+
+SQL_MODULE = "sql_injection_employee_portal"
+
+
+class TestSharedHandsOnModuleStartFlow:
+    """Two selected domains sharing a hands_on_module draw ONE challenge.
+
+    The production mapping has App Development, Web Development and DevOps
+    all running the SQL module (hands_on_questions.challenge_type), and a
+    candidate selects at most two domains. The attempt that is frozen must
+    therefore contain exactly one SQL challenge per shared module — not one
+    per domain — while domains with different modules still each get their
+    own.
+    """
+
+    TWO_DOMAIN_POOL = [
+        {
+            "id": MOCK_HANDS_ID,
+            "domain_ids": [MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID],
+            "challenge_type": SQL_MODULE,
+        },
+    ]
+
+    def _run(self, client, mock_supabase, spy, module_1, module_2, pool):
+        domains = [
+            {
+                "id": MOCK_DOMAIN_1_ID,
+                "name": "App Development",
+                "slug": "appDevelopment",
+                "assessment_scope": "technical",
+                "is_active": True,
+            },
+            {
+                "id": MOCK_DOMAIN_2_ID,
+                "name": "Web Development",
+                "slug": "webDevelopment",
+                "assessment_scope": "technical",
+                "is_active": True,
+            },
+        ]
+        _route_table(mock_supabase, "assessment_attempts")
+        _configure_start_mocks(
+            mock_supabase,
+            program=SENIOR_PROGRAM,
+            domains=domains,
+            module_configs=[
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_1_ID,
+                    applies_to="senior",
+                    mcq_count=2,
+                    hands_on_enabled=True,
+                    hands_on_count=1,
+                    hands_on_module=module_1,
+                ),
+                _make_module_config(
+                    domain_id=MOCK_DOMAIN_2_ID,
+                    applies_to="senior",
+                    mcq_count=2,
+                    hands_on_enabled=True,
+                    hands_on_count=1,
+                    hands_on_module=module_2,
+                ),
+            ],
+            hands_on_available=pool,
+            # mcq_total=2 splits 1+1 across the two domains, so both need
+            # eligible MCQ rows.
+            mcq_available=[
+                {"id": MOCK_MCQ_1_ID, "domain_id": MOCK_DOMAIN_1_ID},
+                {"id": MOCK_MCQ_2_ID, "domain_id": MOCK_DOMAIN_2_ID},
+            ],
+        )
+        _auth()
+        try:
+            response = _post(
+                client, domain_ids=[MOCK_DOMAIN_1_ID, MOCK_DOMAIN_2_ID]
+            )
+        finally:
+            client.app.dependency_overrides.clear()
+        return response
+
+    def test_two_domains_sharing_sql_draw_exactly_one(
+        self, client, mock_supabase, spy
+    ):
+        """Same declared module + a single-challenge pool -> 1 challenge."""
+        response = self._run(
+            client,
+            mock_supabase,
+            spy,
+            SQL_MODULE,
+            SQL_MODULE,
+            self.TWO_DOMAIN_POOL,
+        )
+
+        assert response.status_code == 200
+        assert spy.plan.hands_on_total == 1
+        assert spy.plan.selected_hands_on_question_ids == [MOCK_HANDS_ID]
+        payload = _payload(mock_supabase)
+        assert payload["total_hands_on_questions"] == 1
+        assert payload["selected_hands_on_question_ids"] == [MOCK_HANDS_ID]
+
+    def test_two_domains_without_declarations_keep_per_domain_allocation(
+        self, client, mock_supabase, spy
+    ):
+        """Legacy rows (hands_on_module NULL) still allocate one per domain.
+
+        A two-domain selection with undeclared modules and a ONE-challenge
+        pool is refused exactly as before this feature: the unique-pool
+        validation is not weakened by the deduplication.
+        """
+        response = self._run(
+            client,
+            mock_supabase,
+            spy,
+            None,
+            None,
+            self.TWO_DOMAIN_POOL,
+        )
+
+        assert response.status_code == 400
+        assert "No valid allocation of hands-on challenge(s)" in response.json()[
+            "detail"
+        ]
+        # The refusal happens INSIDE the planner on the real allocation math.
+        assert spy.called
+
+    def test_different_modules_each_get_their_own_challenge(
+        self, client, mock_supabase, spy
+    ):
+        """SQL + pandas: two distinct draws from two disjoint pools."""
+        pool = [
+            {
+                "id": MOCK_HANDS_ID,
+                "domain_ids": [MOCK_DOMAIN_1_ID],
+                "challenge_type": SQL_MODULE,
+            },
+            {
+                "id": MOCK_HANDS_ID_2,
+                "domain_ids": [MOCK_DOMAIN_2_ID],
+                "challenge_type": "pandas_wasm",
+            },
+        ]
+        response = self._run(
+            client,
+            mock_supabase,
+            spy,
+            SQL_MODULE,
+            "pandas_wasm",
+            pool,
+        )
+
+        assert response.status_code == 200
+        assert spy.plan.hands_on_total == 2
+        assert sorted(spy.plan.selected_hands_on_question_ids) == sorted(
+            [MOCK_HANDS_ID, MOCK_HANDS_ID_2]
+        )
+
+    def test_module_config_query_selects_hands_on_module(
+        self, client, mock_supabase, spy
+    ):
+        """Regression: the bridge must SELECT hands_on_module.
+
+        Without the column in the SELECT list the value silently reads as
+        NULL for every row and every domain falls back to the per-domain
+        legacy allocation — the exact bug this feature fixes.
+        """
+        self._run(
+            client,
+            mock_supabase,
+            spy,
+            SQL_MODULE,
+            SQL_MODULE,
+            self.TWO_DOMAIN_POOL,
+        )
+
+        chain = _chain(mock_supabase, "assessment_module_config")
+        select_arg = chain.select.call_args.args[0]
+        assert "hands_on_module" in select_arg

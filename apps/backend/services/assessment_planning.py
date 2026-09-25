@@ -192,16 +192,17 @@ def load_module_configs(domain_ids, family) -> list:
         supabase_client.table("assessment_module_config")
         .select(
             "domain_id, applies_to, mcq_count, descriptive_count, "
-            "hands_on_enabled, hands_on_count, hands_on_additional_minutes"
+            "hands_on_enabled, hands_on_count, hands_on_additional_minutes, "
+            "hands_on_module"
         )
         .in_("domain_id", list(domain_ids))
         .eq("applies_to", family)
         .execute()
     )
-    # hands_on_module is added by a later migration and may not exist yet in
-    # every environment. Absent column -> None -> the planner's legacy
-    # fallback (per-challenge deduplication) applies, so un-migrated
-    # databases keep their exact current behaviour.
+    # hands_on_module was added by migration 024 and is nullable: a row that
+    # predates the module declaration (or simply has not been tagged yet)
+    # carries NULL, which maps to "" so the planner's legacy per-domain
+    # fallback applies for that row alone.
     rows = []
     for row in response.data or []:
         rows.append(

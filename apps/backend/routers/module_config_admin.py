@@ -51,6 +51,7 @@ def _config_row(row: dict) -> dict:
         "hands_on_enabled": row["hands_on_enabled"],
         "hands_on_count": row["hands_on_count"],
         "hands_on_additional_minutes": row["hands_on_additional_minutes"],
+        "hands_on_module": row.get("hands_on_module"),
         "notes": row.get("notes"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
@@ -430,6 +431,7 @@ def upsert_domain_module_config(
             "hands_on_enabled": payload.hands_on_enabled,
             "hands_on_count": payload.hands_on_count,
             "hands_on_additional_minutes": payload.hands_on_additional_minutes,
+            "hands_on_module": payload.hands_on_module,
             "notes": payload.notes,
         }
 

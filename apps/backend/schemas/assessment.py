@@ -348,11 +348,19 @@ class ModuleConfigUpdate(BaseModel):
     hands_on_enabled: bool = False
     hands_on_count: int = Field(..., ge=0)
     hands_on_additional_minutes: int = Field(0, ge=0)
+    # Which hands-on challenge module this row installs (e.g.
+    # 'sql_injection_employee_portal', 'sql_wasm', 'pandas_wasm'). The
+    # planner deduplicates hands-on requirements across the selected domains
+    # by this value, so two domains sharing a module perform ONE challenge.
+    # Empty/NULL keeps the per-domain legacy allocation.
+    hands_on_module: Optional[str] = Field(None, max_length=200)
     notes: Optional[str] = Field(None, max_length=2000)
 
     def model_post_init(self, __context):
         if self.applies_to not in VALID_APPLIES_TO:
             raise ValueError(f"applies_to must be one of {VALID_APPLIES_TO}")
+        if self.hands_on_module is not None:
+            self.hands_on_module = self.hands_on_module.strip() or None
         if not self.hands_on_enabled:
             if self.hands_on_count != 0:
                 raise ValueError(

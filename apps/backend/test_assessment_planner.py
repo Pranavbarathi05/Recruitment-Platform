@@ -1930,6 +1930,82 @@ class TestSharedHandsOnModule:
 
         assert len(drawn) > 1
 
+    def test_all_three_sql_domain_pairs_draw_exactly_one(self):
+        """Every two-domain pairing over ONE shared module -> ONE challenge.
+
+        Production mapping: App Development, Web Development and DevOps all
+        run the SQL module, and a candidate selects at most two domains.
+        Each of the three pairings must therefore resolve to exactly one
+        SQL challenge, not SQL + SQL.
+        """
+        app_dev = DomainInput(
+            id="d-appdev",
+            name="App Development",
+            slug="appDevelopment",
+            assessment_scope="technical",
+        )
+        catalogue = [CYBER, WEB, app_dev]
+        pairs = [
+            ("d-appdev", WEB_ID),  # App Development + Web Development
+            ("d-appdev", CYBER_ID),  # App Development + DevOps
+            (WEB_ID, CYBER_ID),  # Web Development + DevOps
+        ]
+        for first, second in pairs:
+            req = build(
+                PROGRAM_5,
+                [first, second],
+                [
+                    cfg(
+                        first,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                    cfg(
+                        second,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    ),
+                ],
+                # The production shape: exactly ONE SQL challenge in the pool.
+                hands_on_pool=self._sql_pool(("sql-1",)),
+            )
+            req.domains = catalogue
+            # big_pools() only seeds MCQs for CATALOGUE domains.
+            req.mcq_pool = list(req.mcq_pool) + mcq_items(
+                "d-appdev", 5, 25, "q-appdev"
+            )
+            plan = plan_assessment(req)
+            assert plan.hands_on_total == 1, (first, second)
+            assert plan.selected_hands_on_question_ids == ["sql-1"], (first, second)
+            # Both domains still report the module as enabled.
+            assert [e.hands_on_enabled for e in plan.domains] == [True, True]
+
+    def test_single_domain_shared_module_unchanged(self):
+        """Single-domain behaviour is untouched: 1 module -> 1 challenge."""
+        plan = plan_assessment(
+            build(
+                PROGRAM_5,
+                [CYBER_ID],
+                [
+                    cfg(
+                        CYBER_ID,
+                        "senior",
+                        hands_on=True,
+                        hands_on_count=1,
+                        hands_on_module=SQL_MODULE,
+                    )
+                ],
+                hands_on_pool=self._sql_pool(("sql-1",)),
+            )
+        )
+        assert plan.hands_on_total == 1
+        assert plan.selected_hands_on_question_ids == ["sql-1"]
+        assert plan.additional_minutes == 0
+
     def test_selected_ids_are_globally_unique(self):
         """Heavy overlap: no id may appear twice anywhere in the plan."""
         shared = ["s1", "s2", "s3"]

@@ -5485,7 +5485,8 @@ def _make_program(semester=5, scope="technical", tier="senior",
 
 def _make_module_config(*, domain_id, applies_to="senior", mcq_count=0,
                         descriptive_count=0, hands_on_enabled=False,
-                        hands_on_count=0, hands_on_additional_minutes=0):
+                        hands_on_count=0, hands_on_additional_minutes=0,
+                        hands_on_module=None):
     """A mock assessment_module_config row."""
     return {
         "domain_id": domain_id,
@@ -5495,6 +5496,7 @@ def _make_module_config(*, domain_id, applies_to="senior", mcq_count=0,
         "hands_on_enabled": hands_on_enabled,
         "hands_on_count": hands_on_count,
         "hands_on_additional_minutes": hands_on_additional_minutes,
+        "hands_on_module": hands_on_module,
     }
 
 
@@ -5552,7 +5554,11 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
         ]
     if hands_on_available is None:
         hands_on_available = [
-            {"id": MOCK_HANDS_ID, "domain_ids": [MOCK_DOMAIN_1_ID]},
+            {
+                "id": MOCK_HANDS_ID,
+                "domain_ids": [MOCK_DOMAIN_1_ID],
+                "challenge_type": "sql_injection_employee_portal",
+            },
         ]
 
     chains = mock_sb._table_chains
@@ -5601,8 +5607,22 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
         if program.get("scope") == "organizational"
         else 0
     )
-    effective_hands_on = sum(
-        c.get("hands_on_count", 0) for c in module_configs if c.get("hands_on_enabled")
+    # Mirror the planner's hands-on rule: domains sharing a module
+    # (assessment_module_config.hands_on_module) form ONE requirement group
+    # whose total is the LARGEST member count, never the sum. Rows without
+    # a module declaration count per-domain (legacy).
+    hands_groups = {}
+    for c in module_configs:
+        if not c.get("hands_on_enabled"):
+            continue
+        module = c.get("hands_on_module") or f"domain:{c['domain_id']}"
+        hands_groups.setdefault(module, []).append(c.get("hands_on_count", 0))
+    effective_hands_on = sum(max(counts) for counts in hands_groups.values())
+    echo_hands_ids = (
+        [MOCK_HANDS_ID]
+        + ([MOCK_HANDS_ID_2] if effective_hands_on > 1 else [])
+        if effective_hands_on
+        else []
     )
     attempts_chain.insert.return_value.execute.return_value = (
         _make_mock_response([{
@@ -5611,9 +5631,7 @@ def _configure_start_mocks(mock_sb, descriptive_count=1, descriptive_available=N
             "total_coding_problems": 0,
             "total_descriptive_questions": effective_descriptive,
             "total_hands_on_questions": effective_hands_on,
-            "selected_hands_on_question_ids": (
-                [MOCK_HANDS_ID] if effective_hands_on else []
-            ),
+            "selected_hands_on_question_ids": echo_hands_ids,
             "duration_minutes": 20,
             "expires_at": "2025-01-01T00:20:00Z",
         }])
