@@ -16,12 +16,32 @@ vi.mock('../components/CodeEditor', () => ({
 
 // The WASM challenge editors boot a real WASM runtime; the workspace behavior
 // under test here is the header/navigation around them, so they are stubbed
-// (same convention as MCQTest.wasm-submit.test.jsx).
+// (same convention as MCQTest.wasm-submit.test.jsx). The stubs expose the
+// draft props (initialCode / onDraftChange) so the split-layout tests can
+// verify the workspace hands each question its own preserved code.
 vi.mock('../components/SqlWasmChallenge', () => ({
-  default: ({ problem }) => <div data-testid="sql-wasm-stub">{problem.id}</div>,
+  default: ({ problem, initialCode, onDraftChange }) => (
+    <button
+      type="button"
+      data-testid="sql-wasm-stub"
+      data-initial-code={initialCode ?? ''}
+      onClick={() => onDraftChange?.(`code-for-${problem.id}`)}
+    >
+      {problem.id}
+    </button>
+  ),
 }));
 vi.mock('../components/PandasWasmChallenge', () => ({
-  default: ({ problem }) => <div data-testid="pandas-wasm-stub">{problem.id}</div>,
+  default: ({ problem, initialCode, onDraftChange }) => (
+    <button
+      type="button"
+      data-testid="pandas-wasm-stub"
+      data-initial-code={initialCode ?? ''}
+      onClick={() => onDraftChange?.(`code-for-${problem.id}`)}
+    >
+      {problem.id}
+    </button>
+  ),
 }));
 
 const FUTURE = new Date(Date.now() + 3600_000).toISOString();
@@ -372,4 +392,133 @@ describe('MCQTest — Hands-On header shows only question information', () => {
       expect(screen.queryByText('Pandas WASM')).not.toBeInTheDocument();
     });
   }
+});
+
+// ============================================================
+// WASM hands-on split layout — question left, editor right.
+// The SQL/Pandas challenges must be structurally identical to the Coding
+// section: a flex-row split with an independently scrollable question pane
+// and a right pane holding the challenge (editor/actions/results).
+// ============================================================
+
+const WASM_DATASET = [
+  {
+    table: 'employees',
+    columns: ['id', 'name', 'department', 'salary'],
+    rows: [[1, 'Alice', 'Engineering', 95000]],
+  },
+];
+
+function wasmChallenge(type, id) {
+  return {
+    ...HANDS_ON_CHALLENGE,
+    id,
+    title: `Analytics ${type}`,
+    description: `Solve the ${type} challenge with the provided employees table.`,
+    challenge_type: type,
+    schema_sql: 'CREATE TABLE employees (id INTEGER);',
+    dataset_json: WASM_DATASET,
+    starter_code: 'starter code',
+    validation_spec: {},
+  };
+}
+
+/**
+ * The split contract the WASM challenges share with CodingSection: a
+ * flex-row split whose left pane scrolls independently and whose right pane
+ * (the `w-[50%]` editor side) contains the challenge component.
+ */
+function assertWasmSplitStructure(container, stubTestId) {
+  const stub = screen.getByTestId(stubTestId);
+  const rightPane = stub.closest('div.w-\\[50\\%\\]');
+  expect(rightPane).not.toBeNull();
+  expect(rightPane.className).toContain('flex-col');
+
+  const split = rightPane.parentElement;
+  expect(split.className).toContain('flex');
+  expect(split.className).toContain('min-h-0');
+
+  const leftPane = split.querySelector('div.flex-1');
+  expect(leftPane).not.toBeNull();
+  // Independently scrollable question pane with the question inside.
+  const scroller = leftPane.querySelector('div.overflow-y-auto');
+  expect(scroller).not.toBeNull();
+  expect(scroller.textContent).toContain('Solve the');
+  // The challenge itself must NOT live inside the scrollable question pane.
+  expect(scroller.contains(stub)).toBe(false);
+}
+
+describe('MCQTest — WASM hands-on split layout (question left / editor right)', () => {
+  for (const [type, stubTestId] of [
+    ['sql_wasm', 'sql-wasm-stub'],
+    ['pandas_wasm', 'pandas-wasm-stub'],
+  ]) {
+    it(`renders ${type} as a side-by-side split, not a stacked full-width header`, async () => {
+      const challenge = wasmChallenge(type, `wasm-${type}`);
+      const { container } = renderWorkspace(mockFetch({ handsOn: [challenge] }));
+
+      fireEvent.click(await screen.findByRole('button', { name: /Hands-On \(1\)/i }));
+      await screen.findByTestId(stubTestId);
+
+      assertWasmSplitStructure(container, stubTestId);
+
+      // Question content lives in the left pane, exactly once.
+      expect(screen.getAllByText(new RegExp(`^Analytics ${type}$`))).toHaveLength(1);
+    });
+  }
+
+  it('shows the provided dataset preview in the question pane', async () => {
+    const challenge = wasmChallenge('sql_wasm', 'wasm-dataset');
+    renderWorkspace(mockFetch({ handsOn: [challenge] }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /Hands-On \(1\)/i }));
+    await screen.findByTestId('sql-wasm-stub');
+
+    expect(screen.getByText('Provided Data')).toBeInTheDocument();
+    expect(screen.getByText('employees')).toBeInTheDocument();
+  });
+
+  it('hands each question its own code draft across switches (WASM challenges)', async () => {
+    renderWorkspace(mockFetch({
+      handsOn: [
+        wasmChallenge('sql_wasm', 'wasm-two-sql'),
+        wasmChallenge('pandas_wasm', 'wasm-two-pandas'),
+      ],
+    }));
+    fireEvent.click(await screen.findByRole('button', { name: /Hands-On \(2\)/i }));
+    await screen.findByTestId('sql-wasm-stub');
+
+    const sqlStub = screen.getByTestId('sql-wasm-stub');
+    // Draft restored from the parent (empty until typed).
+    expect(sqlStub).toHaveAttribute('data-initial-code', '');
+    fireEvent.click(sqlStub);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next question' }));
+    await screen.findByTestId('pandas-wasm-stub');
+    expect(screen.getByTestId('pandas-wasm-stub')).toHaveAttribute('data-initial-code', '');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous question' }));
+    await screen.findByTestId('sql-wasm-stub');
+    // Question 1's typed draft survived the round trip.
+    expect(screen.getByTestId('sql-wasm-stub')).toHaveAttribute('data-initial-code', 'code-for-wasm-two-sql');
+  });
+
+  it('keeps the Submitted badge on the question title, not on editor metadata', async () => {
+    renderWorkspace(mockFetch({
+      handsOn: [wasmChallenge('sql_wasm', 'wasm-submitted')],
+      priorResult: {
+        question_id: 'wasm-submitted',
+        submitted_input: 'SELECT 1;',
+        submitted_flag: '',
+      },
+    }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /Hands-On \(1\)/i }));
+    await screen.findByTestId('sql-wasm-stub');
+
+    expect(screen.getByText('Submitted')).toBeInTheDocument();
+    // No metadata badges are introduced by the new layout.
+    expect(screen.queryByText(/pts/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('medium')).not.toBeInTheDocument();
+  });
 });

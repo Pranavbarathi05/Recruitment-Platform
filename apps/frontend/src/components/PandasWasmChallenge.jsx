@@ -110,7 +110,7 @@ const PandasWasmChallenge = ({ problem, onSubmit, submitted, initialCode, onDraf
 
   if (initializing) {
     return (
-      <div className="flex flex-col items-center justify-center py-12">
+      <div className="h-full flex flex-col items-center justify-center py-12">
         <div className="animate-spin rounded-full h-12 w-12 border-t-4 border-b-4 border-blue-500 mb-4" />
         <p className="text-blue-300 text-sm">Preparing Python/Pandas environment...</p>
         <p className="text-theme-muted text-xs mt-1">Loading Pyodide runtime (this may take a moment)</p>

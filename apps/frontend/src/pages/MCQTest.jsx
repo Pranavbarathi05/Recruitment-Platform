@@ -1405,65 +1405,36 @@ function HandsOnSection({
     </div>
   );
 
-  // WASM challenge types: delegate to specialized components
+  // WASM challenge types: delegate to specialized components.
+  // Both share the CodingSection split — question on the left, editor on the
+  // right — so the presentation lives in one place. The challenge components
+  // keep owning the editor, run/submit actions, results and the WASM runtime
+  // lifecycle; the split is layout-only.
   const challengeType = q.challenge_type;
-  if (challengeType === 'sql_wasm') {
+  if (challengeType === 'sql_wasm' || challengeType === 'pandas_wasm') {
+    const WasmChallenge = challengeType === 'sql_wasm' ? SqlWasmChallenge : PandasWasmChallenge;
     return (
       <div className="h-full flex flex-col">
         {navBar}
-        {/* Challenge header — question information only. Difficulty, points
-            and internal runtime labels are admin metadata and are never
-            shown to the candidate. */}
-        <div className="shrink-0 bg-theme-secondary px-6 py-3 border-b border-theme-border">
-          <div className="flex items-center gap-3">
-            <h2 className="text-lg font-bold text-theme-primary">{q.title}</h2>
-            {submitted && <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>}
-          </div>
-          <p className="text-theme-muted text-sm mt-1 line-clamp-2">{q.description}</p>
-        </div>
-        {/* Editor + Runner */}
         <div className="flex-1 min-h-0">
-          <SqlWasmChallenge
-            key={q.id}
-            problem={q}
-            initialCode={draft.code}
-            onDraftChange={(code) => setDraft(q.id, { code })}
-            onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
-              await onSubmit(questionId, submittedCode, '', validationPassed);
-              markSubmitted(questionId);
-            }}
+          <WasmHandsOnSplit
+            title={q.title}
+            description={q.description}
+            datasetJson={q.dataset_json}
             submitted={submitted}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  if (challengeType === 'pandas_wasm') {
-    return (
-      <div className="h-full flex flex-col">
-        {navBar}
-        {/* Challenge header — question information only (see above). */}
-        <div className="shrink-0 bg-theme-secondary px-6 py-3 border-b border-theme-border">
-          <div className="flex items-center gap-3">
-            <h2 className="text-lg font-bold text-theme-primary">{q.title}</h2>
-            {submitted && <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>}
-          </div>
-          <p className="text-theme-muted text-sm mt-1 line-clamp-2">{q.description}</p>
-        </div>
-        {/* Editor + Runner */}
-        <div className="flex-1 min-h-0">
-          <PandasWasmChallenge
-            key={q.id}
-            problem={q}
-            initialCode={draft.code}
-            onDraftChange={(code) => setDraft(q.id, { code })}
-            onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
-              await onSubmit(questionId, submittedCode, '', validationPassed);
-              markSubmitted(questionId);
-            }}
-            submitted={submitted}
-          />
+          >
+            <WasmChallenge
+              key={q.id}
+              problem={q}
+              initialCode={draft.code}
+              onDraftChange={(code) => setDraft(q.id, { code })}
+              onSubmit={async ({ questionId, submittedCode, validationPassed }) => {
+                await onSubmit(questionId, submittedCode, '', validationPassed);
+                markSubmitted(questionId);
+              }}
+              submitted={submitted}
+            />
+          </WasmHandsOnSplit>
         </div>
       </div>
     );
@@ -1582,6 +1553,87 @@ function HandsOnSection({
             </button>
           )}
         </form>
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// WASM HANDS-ON SPLIT LAYOUT
+// Presentational-only split pane mirroring CodingSection: the question lives
+// in a left pane that scrolls independently; the editor (owned by the child
+// WASM challenge component) fills the right pane. Layout-only — the child
+// keeps its editor, run/submit actions, results and WASM runtime lifecycle.
+// Question metadata badges (difficulty/points) are intentionally absent: the
+// candidate-facing pane shows only question information.
+// ============================================================
+
+function WasmHandsOnSplit({ title, description, datasetJson, submitted, children }) {
+  // Dataset preview rows (schema/table specs), when the dataset is the
+  // canonical array form. A raw bootstrap string is not previewable.
+  const datasetTables = Array.isArray(datasetJson)
+    ? datasetJson.filter((t) => t && typeof t === 'object' && Array.isArray(t.columns))
+    : [];
+
+  return (
+    /* Full height, no overflow, horizontal split — same skeleton as CodingSection */
+    <div className="h-full flex min-h-0 overflow-hidden">
+      {/* ===== LEFT PANE: Question Statement (scrolls independently) ===== */}
+      <div className="flex-1 min-w-0 flex flex-col min-h-0 border-r border-theme-border">
+        {/* Question title bar */}
+        <div className="shrink-0 px-6 py-3 bg-theme-secondary border-b border-theme-border">
+          <div className="flex items-center gap-3">
+            <h2 className="text-xl font-bold text-theme-primary">{title}</h2>
+            {submitted && (
+              <span className="text-xs px-2 py-0.5 rounded font-semibold bg-green-900/50 text-green-300">Submitted</span>
+            )}
+          </div>
+        </div>
+
+        {/* Scrollable question content */}
+        <div className="flex-1 min-h-0 overflow-y-auto p-6">
+          <div className="space-y-4">
+            <div className="bg-theme-secondary rounded-lg p-4">
+              <h3 className="font-semibold text-theme-primary mb-2">Description</h3>
+              <div className="text-theme-secondary text-sm whitespace-pre-wrap">{description}</div>
+            </div>
+
+            {datasetTables.length > 0 && (
+              <div className="bg-theme-secondary rounded-lg p-4">
+                <h3 className="font-semibold text-theme-primary mb-2">Provided Data</h3>
+                {datasetTables.map((t, idx) => (
+                  <div key={t.table || t.name || idx} className="mb-3 last:mb-0">
+                    <div className="text-xs text-theme-muted mb-1">{t.table || t.name || `Dataset ${idx + 1}`}</div>
+                    <div className="bg-theme-primary rounded p-3 font-mono text-sm">
+                      <div>
+                        <span className="text-theme-muted">Columns:</span>
+                        <pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{t.columns.join(', ')}</pre>
+                      </div>
+                      {Array.isArray(t.rows) && t.rows.length > 0 && (
+                        <div className="mt-2">
+                          <span className="text-theme-muted">Sample rows:</span>
+                          <pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{JSON.stringify(t.rows.slice(0, 3))}</pre>
+                        </div>
+                      )}
+                      {Array.isArray(t.data) && t.data.length > 0 && (
+                        <div className="mt-2">
+                          <span className="text-theme-muted">Sample rows:</span>
+                          <pre className="text-theme-secondary mt-1 whitespace-pre-wrap">{JSON.stringify(t.data.slice(0, 3))}</pre>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* ===== RIGHT PANE: Editor + actions + results (owned by the challenge) ===== */}
+      <div className="w-[50%] min-w-[320px] flex flex-col min-h-0">
+        <div className="flex-1 min-h-0 relative">{children}</div>
       </div>
     </div>
   );
