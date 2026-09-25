@@ -79,6 +79,30 @@ async function getDb() {
   }
 }
 
+/**
+ * Convert a DuckDB/Arrow result value into a plain JS primitive.
+ *
+ * `BIGINT` columns already arrive as a JS `bigint` and are narrowed to a
+ * number. `HUGEINT` columns (e.g. `SUM()` over integers) instead arrive as a
+ * `DecimalBigNum` — a `Uint32Array` view holding the decimal limbs — so the
+ * BigInt branch misses it and the raw typed array leaked into the results
+ * table and into the validator (which only compares primitives, so a SUM-based
+ * `expected_rows` check could never match). Render it as the primitive a
+ * BIGINT column yields: a number when it is exactly representable, otherwise
+ * the exact decimal string so no precision is silently lost.
+ */
+function normalizeResultValue(val) {
+  if (typeof val === 'bigint') return Number(val);
+  if (val instanceof Uint32Array) {
+    const text = val.toString();
+    if (/^-?\d+$/.test(text)) {
+      const n = Number(text);
+      return Number.isSafeInteger(n) ? n : text;
+    }
+  }
+  return val;
+}
+
 export class SqlWasmRunner {
   constructor() {
     this._conn = null;
@@ -143,12 +167,7 @@ export class SqlWasmRunner {
       // Extract rows as arrays of JS values
       const arrowRows = result.toArray();
       const rows = arrowRows.map((row) => {
-        return columns.map((col) => {
-          const val = row[col];
-          // Convert BigInt to Number for JSON serialization
-          if (typeof val === 'bigint') return Number(val);
-          return val;
-        });
+        return columns.map((col) => normalizeResultValue(row[col]));
       });
 
       return { columns, rows, duration: Math.round(duration * 100) / 100, error: null };

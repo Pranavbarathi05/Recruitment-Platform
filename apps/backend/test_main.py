@@ -6725,7 +6725,7 @@ class TestHandsOnQuestionsEndpoint:
         self._set_auth_override()
         ho_q = {
             "id": MOCK_HANDS_ID, "title": "SQL Injection — Employee Portal",
-            "description": "desc", "difficulty": "medium", "points": 100,
+            "description": "desc", "difficulty": "medium", "points": 10,
             "challenge_type": "sql_injection_employee_portal",
             "challenge_url": "http://127.0.0.1:8080",
             # expected_flag present on the row but must NOT leak into response
@@ -6739,7 +6739,7 @@ class TestHandsOnQuestionsEndpoint:
             hq = data["hands_on_questions"][0]
             assert hq["title"] == "SQL Injection — Employee Portal"
             assert hq["challenge_url"] == "http://127.0.0.1:8080"
-            assert hq["points"] == 100
+            assert hq["points"] == 10
             assert "expected_flag" not in hq
             assert "FLAG" not in json.dumps(data)
         finally:
@@ -7107,21 +7107,21 @@ class TestHandsOnScoring:
         # Hands-On scoring
         hq = chains.setdefault("hands_on_questions", MagicMock())
         hq.select.return_value.in_.return_value.execute.return_value = (
-            _make_mock_response([{"id": MOCK_HANDS_ID, "points": 100}])
+            _make_mock_response([{"id": MOCK_HANDS_ID, "points": 10}])
         )
         hr = chains.setdefault("assessment_hands_on_results", MagicMock())
         hr.select.return_value.eq.return_value.execute.return_value = (
-            _make_mock_response([{"question_id": MOCK_HANDS_ID, "verified": True, "score": 100}])
+            _make_mock_response([{"question_id": MOCK_HANDS_ID, "verified": True, "score": 10}])
         )
 
         result = _score_attempt(MOCK_ATTEMPT_ID)
-        assert result["hands_on_score"] == 100
-        assert result["hands_on_max_score"] == 100
-        assert result["score"] == 1 + 0 + 100  # mcq + coding + hands-on
+        assert result["hands_on_score"] == 10
+        assert result["hands_on_max_score"] == 10
+        assert result["score"] == 1 + 0 + 10  # mcq + coding + hands-on
 
         update_call = att.update.call_args.args[0]
-        assert update_call["hands_on_score"] == 100
-        assert update_call["hands_on_max_score"] == 100
+        assert update_call["hands_on_score"] == 10
+        assert update_call["hands_on_max_score"] == 10
 
 
 class TestHandsOnAdminAPI:
@@ -7173,12 +7173,44 @@ class TestHandsOnAdminAPI:
                 "domain_ids": [MOCK_DOMAIN_1_ID],
                 "challenge_url": "http://127.0.0.1:8080",
                 "expected_flag": f"  FLAG{{x}}  ",
-                "points": 100,
+                "points": 10,
             })
             assert r.status_code == 201
             assert r.json()["id"] == MOCK_HANDS_ID
             insert_payload = chains["hands_on_questions"].insert.call_args.args[0]
             assert insert_payload["expected_flag"] == "FLAG{x}"  # trimmed
+        finally:
+            client.app.dependency_overrides.clear()
+
+    def test_hands_on_create_schema_defaults_to_ten_points(self):
+        """Source of truth: HandsOnCreate mirrors the column DEFAULT of 10.
+
+        Migration 022 set ``hands_on_questions.points`` DEFAULT 10 and
+        backfilled every existing 100. The request schema must agree, or an
+        admin-created challenge with no explicit points would still be
+        accepted as 100 before ever reaching the database.
+        """
+        from schemas.assessment import HandsOnCreate
+
+        assert HandsOnCreate(title="t", description="d").points == 10
+
+    def test_admin_create_defaults_to_ten_points(self, client, mock_supabase):
+        """Omitting points on create persists 10, never the old 100."""
+        self._set_admin_override()
+        chains = self._configure_admin_mocks(mock_supabase)
+        ins = chains["hands_on_questions"].insert.return_value
+        ins.execute.return_value = _make_mock_response([{"id": MOCK_HANDS_ID}])
+        try:
+            r = client.post("/admin/hands-on-questions", json={
+                "title": "Employee Analytics — SQL",
+                "description": "Average salary by department.",
+                "domain_ids": [MOCK_DOMAIN_1_ID],
+                "challenge_url": "http://127.0.0.1:8080",
+                # points deliberately omitted -> schema/column default applies
+            })
+            assert r.status_code == 201
+            payload = chains["hands_on_questions"].insert.call_args.args[0]
+            assert payload["points"] == 10
         finally:
             client.app.dependency_overrides.clear()
 
@@ -9114,7 +9146,11 @@ class TestHandsOnWasmSubmitScoring:
         failed -> 0. A client-supplied point value is never trusted.
     """
 
-    WASM_POINTS = 100
+    # Hands-On challenges are worth 10 points. Migration 022 set the column
+    # DEFAULT (and backfilled every existing row) to 10, so this constant is
+    # both the mock challenge's configured points and the expected default;
+    # the assertions below therefore pin the award to 10.
+    WASM_POINTS = 10
     SQL_CODE = (
         "SELECT department, AVG(salary) AS avg_salary\n"
         "FROM employees\nGROUP BY department;"

@@ -1851,6 +1851,35 @@ class TestPlanPersistence:
         assert "backendDevelopment" not in statements
         assert "userInterface" not in statements
 
+    def test_migration_022_makes_hands_on_worth_ten_points(self):
+        """Static guard: migration 022 lowers the Hands-On default to 10.
+
+        Hands-On scoring reads ``hands_on_questions.points`` verbatim, so the
+        column DEFAULT is the source of truth for a newly created challenge and
+        the backfill is what removes the old 100 from existing rows. The
+        migration must not touch any other scoring surface: MCQ and coding
+        points live in their own tables/columns.
+        """
+        migrations = Path(__file__).resolve().parent / "migrations"
+        m022 = migrations / "022_hands_on_points_10.sql"
+        assert m022.exists()
+        content = m022.read_text(encoding="utf-8")
+        statements = "\n".join(
+            ln for ln in content.splitlines()
+            if not ln.strip().startswith("--")
+        )
+        # Lower the column default to 10 ...
+        assert "ALTER TABLE public.hands_on_questions" in statements
+        assert "ALTER COLUMN points SET DEFAULT 10" in statements
+        # ... and backfill every pre-existing row.
+        assert "UPDATE public.hands_on_questions" in statements
+        assert "SET points = 10" in statements
+        # Hands-On only, and non-destructive.
+        assert "mcq_questions" not in statements
+        assert "coding_problems" not in statements
+        assert "DROP" not in statements.upper()
+        assert "DELETE" not in statements.upper()
+
     def test_plan_persistence_flag_has_been_removed(self):
         """Phase 5's temporary rollout flag is gone.
 
